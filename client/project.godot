@@ -1,0 +1,24 @@
+config_version=5
+
+[application]
+config/name="Super Simple Chat in VR"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7", "Mobile")
+
+[display]
+window/size/viewport_width=1280
+window/size/viewport_height=800
+
+[rendering]
+renderer/rendering_method="mobile"
+renderer/rendering_method.mobile="mobile"
+textures/default_filters/use_nearest_mipmap_filter=false
+environment/defaults/default_clear_color=Color(0.035, 0.05, 0.08, 1)
+
+[xr]
+openxr/enabled=true
+shaders/enabled=true
+
+[audio]
+driver/enable_input=true
+driver/mix_rate=48000

@@ -1,0 +1,11 @@
+[workspace]
+members = ["server", "native"]
+default-members = ["server"]
+resolver = "2"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = true

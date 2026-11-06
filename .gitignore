@@ -1,0 +1,7 @@
+/target/
+/result*
+/data/
+/.env
+/client/.godot/
+*.uid
+*.import

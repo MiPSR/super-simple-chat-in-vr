@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Super Simple Chat in VR</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><header><h1>Super Simple Chat in VR</h1><p>A private place to spend time together.</p><a href="/api/v1/auth/discord">Sign in with Discord</a> <button id="logout">Sign out</button></header>
+<main><p id="status" role="status">Connecting…</p>
+<details><summary>Protected administrator access</summary><form id="admin-login"><label>Administrator secret <input id="admin-secret" type="password" autocomplete="off" required minlength="32"></label><button>Unlock this tab</button></form><p>Use HTTPS outside loopback development. The secret is kept in this tab's memory only.</p></details>
+<section id="account" hidden><h2>Your space</h2><p id="identity"></p>
+<form id="preferences">
+<label><input type="checkbox" name="can_touch_me"> Allow others to touch me</label>
+<label><input type="checkbox" name="can_touch_others"> Allow my touches</label>
+<label>Material tier <select name="quality"><option value="0">Ultra / Potato</option><option value="1">Standard</option><option value="2">Advanced</option></select></label>
+<label>Send rate <select name="send_divisor"><option value="1">Full</option><option value="2">Half</option><option value="4">Quarter</option></select></label>
+<label>Receive rate <select name="receive_divisor"><option value="1">Full</option><option value="2">Half</option><option value="4">Quarter</option></select></label>
+<label>Phone hand <select name="phone_hand"><option>left</option><option>right</option></select></label>
+<label>Private-call routing <select name="call_mode"><option value="automatic">Spatial when nearby, private otherwise</option><option value="private">Always non-positional</option><option value="spatial">Proximity only</option></select></label>
+<label>Microphone device name <input name="input_device" maxlength="256" placeholder="Default"></label>
+<label>Output device name <input name="output_device" maxlength="256" placeholder="Default"></label>
+<label>Voice playback gain <input name="voice_volume" type="number" min="0" max="1" step="0.05"></label>
+<label>Microphone gain (does not unmute) <input name="microphone_gain" type="number" min="0" max="2" step="0.05"></label>
+<label>3D resolution scale <input name="resolution_scale" type="number" min="0.5" max="1.5" step="0.05"></label>
+<label>Antialiasing <select name="antialiasing"><option value="off">Off</option><option value="msaa_2x">MSAA 2×</option><option value="msaa_4x">MSAA 4×</option><option value="msaa_8x">MSAA 8×</option></select></label>
+<label>Upscaler <select name="upscaler"><option value="bilinear">Bilinear</option><option value="fsr1">FSR 1 (supported desktop renderers only)</option></select></label>
+<label>Texture LOD bias (not VRAM reduction) <input name="texture_lod_bias" type="number" min="0" max="3" step="0.5"></label>
+<label>Texture dimensions (next world/avatar load) <select name="texture_reduction"><option value="0">Original</option><option value="1">Half</option><option value="2">Quarter</option><option value="3">Eighth</option></select></label>
+<label>Preferred radio preset <select name="radio_preset"><option>standard</option><option>narrow</option><option>weak</option></select></label>
+<label><input name="sleeping" type="checkbox"> Sleeping pose</label><button>Save preferences</button></form>
+<h2>Worlds & your avatars</h2><form id="search"><input id="query" placeholder="Search worlds and your avatars" maxlength="120"><button>Search</button></form><div id="assets"></div>
+<h3>Upload or replace</h3><form id="upload"><label>Kind <select id="kind"><option>world</option><option>avatar</option></select></label><label>Package <input id="package" type="file" accept=".zip" required></label><label>Replace asset ID (blank for a new slot) <input id="replace"></label><button>Validate & publish</button></form><p>ZIP packages use manifest schema 1. Avatars must contain VRM 1.0. Uploads do not execute scripts.</p>
+<h2>Live instances</h2><button id="refresh">Refresh</button><div id="instances"></div>
+<h2>Privacy</h2><form id="blocks"><label>Discord user ID <input name="target" required></label><label><input type="checkbox" name="voice" value="1"> Mute voice</label><label><input type="checkbox" name="text" value="2"> Hide text</label><label><input type="checkbox" name="touch" value="4"> Prohibit contact</label><label><input type="checkbox" name="avatar" value="8"> Hide avatar</label><label><input type="checkbox" name="complete" value="16"> Complete block</label><button>Save block levels</button></form>
+<h2>Connect the client</h2><p>Create a connection grant from a world or instance below, then paste the JSON into the client's phone. A grant expires in 60 seconds and can be used only once. Treat its secret as a password.</p><textarea id="grant" readonly rows="6" aria-label="One-use connection grant"></textarea></section>
+<section id="admin" hidden><h2>Administration</h2><form id="allow"><label>Discord user ID <input id="discord-id" required pattern="[0-9]{5,24}"></label><button>Allow account</button></form><div id="users"></div><pre id="health"></pre></section>
+</main><footer>Development build — see docs/status.md for unimplemented release requirements.</footer></body></html>

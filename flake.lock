@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793726008,
+        "narHash": "sha256-jQp1wKvbwWdLBASTXkSi/VYmDJ5AbBi1WvcMt9HWJC8=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1d060086d60cb76a40cf37109f979d88a5bd6396",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "vrm": "vrm"
+      }
+    },
+    "vrm": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783531141,
+        "narHash": "sha256-TsqoA3TgXM0p3oOoOuKU/v5UkdcROH9ZVDg1hU7R53o=",
+        "owner": "V-Sekai",
+        "repo": "godot-vrm",
+        "rev": "e15199f980064028bfa4fbee5e70dddb82dd55c3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "V-Sekai",
+        "repo": "godot-vrm",
+        "rev": "e15199f980064028bfa4fbee5e70dddb82dd55c3",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
