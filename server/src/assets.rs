@@ -122,6 +122,8 @@ fn capacity() -> usize {
 pub struct Object {
     pub id: String,
     pub component: String,
+    #[serde(default, deserialize_with = "deserialize_tags")]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub position: [f32; 3],
     #[serde(default)]
@@ -136,8 +138,34 @@ pub struct Object {
 pub struct Prefab {
     pub scene: String,
     pub component: String,
+    #[serde(default, deserialize_with = "deserialize_tags")]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub physics: Physics,
+}
+pub(crate) fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 32
+        && tag
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+}
+pub(crate) const MAX_ENTITY_TAG_BYTES: usize = 65536;
+pub(crate) fn tag_bytes(tags: &[String]) -> usize {
+    // Tags are ASCII without JSON escaping. Include separators/quotes and brackets.
+    tags.iter().map(|tag| tag.len() + 3).sum::<usize>() + 2
+}
+fn deserialize_tags<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let tags = Vec::<String>::deserialize(deserializer)?;
+    let unique: HashSet<_> = tags.iter().collect();
+    if tags.len() > 16 || unique.len() != tags.len() || !tags.iter().all(|tag| valid_tag(tag)) {
+        return Err(serde::de::Error::custom(
+            "At most 16 unique tags, each 1..32 ASCII letters/digits or _-.",
+        ));
+    }
+    Ok(tags)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -315,6 +343,30 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
         }
     };
     require(&manifest.scene)?;
+    let authored_tag_bytes: usize = manifest
+        .objects
+        .iter()
+        .map(|object| {
+            tag_bytes(&object.tags)
+                + object
+                    .prefab
+                    .as_ref()
+                    .and_then(|id| manifest.prefabs.get(id))
+                    .map_or(0, |prefab| tag_bytes(&prefab.tags))
+        })
+        .sum();
+    if authored_tag_bytes > MAX_ENTITY_TAG_BYTES
+        || manifest
+            .prefabs
+            .values()
+            .map(|prefab| tag_bytes(&prefab.tags))
+            .sum::<usize>()
+            > MAX_ENTITY_TAG_BYTES
+    {
+        return Err(ApiError::bad(
+            "Authored/inherited or prefab tag declarations exceed 64 KiB",
+        ));
+    }
     if !manifest.scene.ends_with(".glb") && !(kind == "avatar" && manifest.scene.ends_with(".vrm"))
     {
         return Err(ApiError::bad("Scene must be an embedded GLB/VRM file"));
@@ -1009,6 +1061,66 @@ fn validate_accessor_range(
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+    #[test]
+    fn object_and_prefab_tags_are_bounded_unique_and_optional() {
+        let mut object = serde_json::json!({"id":"switch","component":"switch"});
+        assert!(
+            serde_json::from_value::<Object>(object.clone())
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        object["tags"] = serde_json::json!(["game.switch", "Red-Team_1"]);
+        assert_eq!(
+            serde_json::from_value::<Object>(object.clone())
+                .unwrap()
+                .tags
+                .len(),
+            2
+        );
+        for invalid in [
+            serde_json::json!([""]),
+            serde_json::json!(["a", "a"]),
+            serde_json::json!(["bad/tag"]),
+            serde_json::json!(["x".repeat(33)]),
+            serde_json::json!((0..17).map(|i| format!("tag{i}")).collect::<Vec<_>>()),
+        ] {
+            object["tags"] = invalid.clone();
+            assert!(serde_json::from_value::<Object>(object.clone()).is_err());
+            assert!(
+                serde_json::from_value::<Prefab>(
+                    serde_json::json!({"scene":"prefab.glb","component":"prop","tags":invalid})
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn publication_bounds_aggregate_tag_declarations() {
+        let tags: Vec<_> = (0..16)
+            .map(|i| format!("tag{i:02}{}", "x".repeat(27)))
+            .collect();
+        let objects: Vec<_> = (0..200)
+            .map(
+                |i| serde_json::json!({"id":format!("object{i}"),"component":"static","tags":tags}),
+            )
+            .collect();
+        let manifest = serde_json::json!({"schema":1,"kind":"world","name":"Tags","scene":"world.glb","objects":objects});
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        zip.start_file("world.glb", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let error = validate(
+            Cursor::new(zip.finish().unwrap().into_inner()),
+            "world",
+            1_000_000,
+        )
+        .unwrap_err();
+        assert!(error.1.contains("tag declarations exceed"), "{}", error.1);
+    }
     #[test]
     fn radio_object_presets_are_typed_and_backwards_compatible() {
         let mut declaration = serde_json::json!({"id":"desk","position":[0,1,0],"channel":1});

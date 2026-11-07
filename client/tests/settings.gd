@@ -8,6 +8,8 @@ func _initialize() -> void:
 	call_deferred("_run")
 
 func _run() -> void:
+	preload("res://tests/cache.gd").run()
+	preload("res://tests/contacts.gd").run()
 	preload("res://tests/textures.gd").run()
 	assert(Settings.upscalers("mobile", false) == ["bilinear"])
 	assert(Settings.upscalers("forward_plus", true) == ["bilinear"])
@@ -30,6 +32,17 @@ func _run() -> void:
 	panel.configure(preferences)
 	assert(not panel.controls.has("can_touch_me"))
 	assert(panel.controls.quality.get_item_metadata(panel.controls.quality.selected) == 2)
+	assert(panel.controls.radial_action_0.get_item_metadata(panel.controls.radial_action_0.selected) == "microphone")
+	assert(is_equal_approx(panel.controls.radial_hold_seconds.value, 0.45))
+	var edited := {"value":{}}
+	panel.changed.connect(func(updates: Dictionary): edited.value = updates)
+	panel.controls.radial_action_0.select(panel.controls.radial_action_0.item_count - 1)
+	panel.controls.radial_hold_seconds.value = 0.7
+	for child in panel.get_children():
+		if child is Button and child.text.begins_with("Apply and save"):
+			child.pressed.emit()
+	assert(edited.value.radial_actions.size() == 8 and edited.value.radial_actions[0] == "none")
+	assert(not edited.value.has("radial_action_0") and is_equal_approx(float(edited.value.radial_hold_seconds), 0.7))
 	var notices := Settings.apply_local(preferences, viewport, voice, radio)
 	assert(notices.size() >= 2)
 	assert(AudioServer.input_device == "Default" and AudioServer.output_device == "Default")

@@ -58,6 +58,11 @@ tests seed their own isolated temporary database sessions.
   Full local regression tests verify actual texture dimensions, all material
   tiers and account persistence; Nix client/server checks pass. Existing content
   needs reloading; physical GPU memory and visual-quality acceptance remain.
+  Persistent eight-sector action bindings and long-press timing now have phone/
+  website controls, allowlisted actions, a disabled-slot option and per-gesture
+  policy snapshots. Full local workspace/Clippy checks, targeted phone-control
+  emission tests and website JavaScript syntax checks pass. Combined Nix client/
+  server checks also pass.
 - Voice capture/playback and local jitter buffers need real microphone/audio
   device and long-session tests. Named source zones now route voice/video
   through native Godot reverb, delay, distortion, compression and limiter buses,
@@ -78,7 +83,20 @@ tests seed their own isolated temporary database sessions.
   timer-only server scripts, cancellation, shared CPU budgets and teardown.
   Authoritative damage/destruction callbacks are now wired through a bounded
   deferred queue instead of being accepted but never dispatched; regression
-  verification is running. This does not complete all creator event/API gaps.
+  and Nix package checks pass. Automatic avatar-contact cleanup/disconnect
+  release callbacks now use that queue and pass local workspace regression.
+  Client snapshot-derived releases and explicit-packet deduplication pass targeted
+  and full local/Nix package tests. Avatar-change cleanup now removes grabs tied
+  to the previous skeleton; unit/real-peer tests and combined Nix client/server
+  checks pass. This does not complete
+  all creator event/API gaps.
+  Bounded object/prefab tags and paginated authoritative `world.find_tag` queries
+  now pass local integration, including detached data and inheritance,
+  publication/live tag-byte budgets and budget release. Prop/vehicle control
+  events now cover acquisition, explicit release, handoff, expiry, destruction
+  and disconnect, with a hand-constraint cleanup fix. Their full local/Nix package
+  checks pass, including omitted inapplicable hand fields so Lua sees `nil`.
+  client query API parity and complete object/light/material APIs remain.
 
 ## Not yet complete
 
@@ -92,14 +110,18 @@ tests seed their own isolated temporary database sessions.
   the same router/cooldowns; local cross-instance tests pass. Per-object named
   speaker presets now have typed publication declarations, independent filter
   buses and administrator-allowlist fallback; full local workspace regression
-  and Clippy pass. Combined package verification is running. Real headset/audio
-  checks remain.
+  and Clippy pass. The combined package check passed after an earlier intermittent
+  synthetic tracker assertion, whose fixture initialization is now corrected.
+  Real headset/audio checks remain.
 - Video acceptance: server-owned media timelines, owner/public controls,
   world-space textures, positional PCM, drift correction and the packaged
   yt-dlp hook are implemented. A single headless client passed decode,
   pause/seek/resume and clean teardown against both a public direct MP4 and
   live YouTube and public HLS. Restricted/removed-source cases and long-session
-  testing remain. Two actual Godot peers also passed public MP4 and YouTube
+  testing remain. Offline HTTP 404/403/unsupported-container failure messages,
+  stopped failed generations, actual decode/PCM recovery and teardown pass full
+  local/Nix integration; they do not establish live YouTube restriction handling.
+  Two actual Godot peers also passed public MP4 and YouTube
   decode/PCM convergence, pause/seek, late join and resume against authoritative
   encrypted server timelines. Public-only media enforcement uses a checked
   client-local relay and decoder-thread Linux socket guard. Offline thread/exec
@@ -107,8 +129,12 @@ tests seed their own isolated temporary database sessions.
   Async DNS cancellation and joined worker shutdown are added; media-hardening
   Nix client/server package checks pass. This is not a general process sandbox
   or complete decoder/resolver memory budget; see [media-security.md](media-security.md).
-- Full administration/settings acceptance, rate adaptation/aggregation policy, complete
-  resource budgets, asset cache eviction and immutable-version garbage collection.
+- Full administration/settings acceptance, rate adaptation/aggregation policy,
+  complete resource budgets and immutable-version garbage collection. Completed
+  client ZIP-cache eviction now has 1 GiB/128-file limits, in-memory recency,
+  import pins, safe filename/symlink handling and focused tests; real-import and
+  full regression/package verification is running. Partial-file crash cleanup
+  and cross-process coordination remain; see [asset-cache.md](asset-cache.md).
 - Extended VR/sleeping sessions, repeated avatar/world/media changes, leak and
   interruption testing, full NixOS deployment acceptance and external OAuth.
 
@@ -133,7 +159,7 @@ No row below waives any part of the corresponding scenario.
 | 13 | Opus, text and private calls tested; native zones/effects added; noise/occlusion, radio and full policy coverage incomplete. |
 | 14 | Cross-instance Opus/SSTV/FT8-style routing, blocking, channel denial and no-radio opt-out tested; client-world creator requests/presets locally tested; complete policy and real-audio checks remain. |
 | 15 | Two real peers decode public MP4/YouTube, converge to server time, pause/seek, late join and resume; long sessions, failure cases and package revalidation remain. |
-| 16 | Hand-switchable phone and eight-sector long-press radial menu exist; XR usability remains. |
+| 16 | Hand-switchable phone and configurable eight-sector long-press radial menu have local persistence/gesture tests; XR usability remains. |
 | 17 | Persistent scale/MSAA and conservative upscaler fallback tested; import-time texture reduction has targeted tests; full advanced schema and visual/GPU/XR checks remain. |
 | 18 | Voice/contact blocks tested; complete block/script capability matrix remains. |
 | 19 | Bounded queues and repeated decoder shutdown tests; long-session/leak/interruption testing remains. |
@@ -154,6 +180,16 @@ The native package checks passed, including isolated VM-limit/shutdown probes.
 GLB structural/accessor checks also passed a subsequent Nix client/server build.
 Image-decoder checks, including duplicate-view budget charging, passed full
 local workspace integration, Clippy and exact-snapshot Nix client/server builds.
+Import-time texture reduction, object radio speaker presets and deferred
+damage/destruction events also passed combined Nix client/server checks. Newer
+synthetic tracker fixture initialization and automatic server/client contact-
+release callbacks and avatar-change cleanup also passed combined package checks.
+Configurable radial-menu preferences/gestures also pass local workspace checks,
+Clippy and combined Nix client/server package checks.
+Radio/video test predicates now consistently compare Godot-round-tripped numeric
+values numerically, with scenario-specific radio errors. A preceding loaded
+local run timed out during radio; local regression passes with those predicates,
+but broader packet-loss/load acceptance remains outstanding.
 The check hook supplies temporary writable HOME/XDG directories; nonfatal
 missing-default-fontconfig warnings remain in the sandbox. Checked packages do
 not establish deployed NixOS or real PCVR acceptance.
@@ -177,6 +213,12 @@ driver now queues immutable, numbered commands rather than overwriting one
 shared command file, and reports precise call/voice failure context. Regression
 checks passed after fixing an initial reader-sequence off-by-one. Broader loaded
 and packet-loss testing is still needed; retries alone do not establish reliability.
+An intermittent packaged avatar test saw unexpected synthetic tracker joints.
+The Godot tracker constructor does not initialize each joint flag, so the test
+now publishes zero validity for every joint before enabling its single tracked
+foot. It also checks the exact input joint set and fails immediately with source
+diagnostics. This is a fixture correction, not evidence of physical tracker
+driver behavior or completion of hardware acceptance.
 
 ## Dependencies and isolation decisions
 

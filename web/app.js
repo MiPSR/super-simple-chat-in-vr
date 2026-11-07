@@ -3,6 +3,17 @@ let adminSecret = "";
 let me;
 const $ = id => document.getElementById(id);
 const status = message => { $("status").textContent = message; };
+const radialActions = {microphone:"Mute / microphone",sleep:"Sleep",phone_hand:"Phone hand",interact:"Interact",avatar_action:"Avatar action",video_pause:"Video pause",phone:"Phone controls",leave:"Leave",none:"Disabled"};
+for (let index = 0; index < 8; index++) {
+  const label = document.createElement("label");
+  label.textContent = `Quick menu sector ${index + 1} `;
+  const select = document.createElement("select");
+  select.name = `radial_action_${index}`;
+  for (const [value, text] of Object.entries(radialActions)) {
+    const option = document.createElement("option"); option.value = value; option.textContent = text; select.append(option);
+  }
+  label.append(select); $("radial-actions").append(label);
+}
 async function api(path, options = {}) {
   const headers = { ...options.headers };
   if (adminSecret) headers.Authorization = `Bearer ${adminSecret}`;
@@ -76,6 +87,7 @@ async function load() {
   $("account").hidden = false; $("admin").hidden = !me.user.admin;
   $("identity").textContent = `Signed in as ${me.user.id}`;
   for (const [key,value] of Object.entries(me.preferences)) {
+    if (key === "radial_actions") { value.forEach((action, index) => { $("preferences").elements.namedItem(`radial_action_${index}`).value = action; }); continue; }
     const input = $("preferences").elements.namedItem(key);
     if (input) { if (input.type === "checkbox") input.checked = value; else input.value = value; }
   }
@@ -85,7 +97,8 @@ action("admin-login", async () => { adminSecret = $("admin-secret").value; $("ad
 action("search", refresh);
 action("preferences", async () => {
   const p = { ...me.preferences };
-  for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "texture_lod_bias", "texture_reduction"].includes(key) ? Number(el.value) : el.value; }
+  for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "texture_lod_bias", "texture_reduction", "radial_hold_seconds"].includes(key) ? Number(el.value) : el.value; }
+  p.radial_actions = Array.from({length:8}, (_, index) => $("preferences").elements.namedItem(`radial_action_${index}`).value);
   await api("/preferences", {method:"PUT",body:p}); me.preferences = p; status("Preferences saved.");
 });
 action("upload", async () => {

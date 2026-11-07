@@ -23,6 +23,8 @@ func _run() -> void:
 	app.preferences.voice_volume = 0.3
 	app.preferences.send_divisor = 4
 	app.preferences.texture_reduction = 2
+	app.preferences.radial_hold_seconds = 0.7
+	app.preferences.radial_actions = ["phone","none","phone_hand","interact","avatar_action","video_pause","sleep","leave"]
 	app._save_preferences()
 	app.preferences.voice_volume = 0.4
 	app._save_preferences() # Coalesce rapid edits; persist only the newest state.
@@ -36,9 +38,20 @@ func _run() -> void:
 	assert(is_equal_approx(float(app.preferences.voice_volume), 0.4))
 	assert(int(app.preferences.send_divisor) == 4)
 	assert(int(app.preferences.texture_reduction) == 2 and app.loader.texture_reduction == 2)
+	assert(is_equal_approx(float(app.preferences.radial_hold_seconds), 0.7))
+	assert(app.preferences.radial_actions[0] == "phone" and app.preferences.radial_actions[1] == "none")
 	assert(is_equal_approx(root.scaling_3d_scale, 0.75))
 	assert(root.msaa_3d == Viewport.MSAA_4X)
 	assert(not app.voice.microphone_enabled)
+	app._controller_pressed(&"menu_button")
+	assert(is_equal_approx(app.menu_hold_delay, 0.7))
+	app.preferences.radial_hold_seconds = 0.15
+	app.preferences.radial_actions[0] = "leave"
+	app.radial.selected = 0
+	assert(app.radial.selected_action() == "phone", "An active gesture must keep its captured bindings")
+	app.menu_held = 0.71
+	app._controller_released(&"menu_button")
+	assert(app.phone.visible and not app.voice.microphone_enabled)
 	app.free()
 	await process_frame
 	print("PASS real client account-preference load, coalesced HTTP save, integer normalization, reload and microphone privacy")

@@ -54,6 +54,25 @@ func _initialize() -> void:
 	assert(RadialMenu.sector(Vector2(1,0)) == 2)
 	assert(RadialMenu.sector(Vector2(0,-1)) == 4)
 	assert(RadialMenu.sector(Vector2(-1,0)) == 6)
+	var radial := RadialMenu.new()
+	var bindings: Array = RadialMenu.DEFAULT_ACTIONS.duplicate()
+	bindings[0] = "phone"
+	bindings[1] = "none"
+	assert(radial.configure_actions(bindings))
+	radial.selected = 0
+	assert(radial.selected_action() == "phone")
+	bindings[0] = "leave"
+	assert(radial.selected_action() == "phone", "Active bindings must be detached from preference edits")
+	radial.selected = 1
+	assert(radial.selected_action() == "none")
+	radial.selected = -1
+	assert(radial.selected_action() == "none")
+	assert(not radial.configure_actions(["leave"]))
+	bindings[0] = "arbitrary-script"
+	assert(not radial.configure_actions(bindings))
+	assert(is_equal_approx(RadialMenu.hold_delay(0.7), 0.7))
+	assert(is_equal_approx(RadialMenu.hold_delay(NAN), 0.45))
+	radial.free()
 	var grayscale := PackedByteArray()
 	grayscale.resize(64*48)
 	grayscale.fill(160)

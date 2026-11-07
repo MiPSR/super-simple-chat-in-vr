@@ -1,4 +1,5 @@
 extends VBoxContainer
+const RadialMenu = preload("res://scripts/radial_menu.gd")
 ## Account preferences only. No creator script can change these controls.
 signal changed(updates: Dictionary)
 var controls: Dictionary = {}
@@ -30,17 +31,27 @@ func configure(preferences: Dictionary) -> void:
 	_choices("texture_reduction", "Texture dimensions (next world/avatar load)", [0,1,2,3], preferences, ["Original", "Half", "Quarter", "Eighth"])
 	_choices("send_divisor", "Network send divisor (next grant)", [1,2,4], preferences)
 	_choices("receive_divisor", "Network receive divisor (next grant)", [1,2,4], preferences)
+	_number("radial_hold_seconds", "Quick menu hold time (seconds)", 0.15, 1.5, 0.05, preferences, 0.45)
+	var bindings: Array = preferences.get("radial_actions", RadialMenu.DEFAULT_ACTIONS)
+	for index in 8:
+		var key := "radial_action_" + str(index)
+		_choices(key, "Quick menu sector " + str(index + 1), RadialMenu.ACTION_LABELS.keys(), {key:bindings[index]}, RadialMenu.ACTION_LABELS.values())
 	var apply := Button.new()
 	apply.text = "Apply and save audio/rendering preferences"
 	apply.disabled = preferences.is_empty()
 	apply.pressed.connect(func():
 		var updates: Dictionary = {}
+		var actions: Array = []
 		for key in controls:
 			var control: Control = controls[key]
+			if str(key).begins_with("radial_action_"):
+				actions.append(control.get_item_metadata(control.selected))
+				continue
 			if control is OptionButton:
 				updates[key] = control.get_item_metadata(control.selected)
 			elif control is SpinBox:
 				updates[key] = control.value
+		updates.radial_actions = actions
 		changed.emit(updates)
 	)
 	add_child(apply)

@@ -14,12 +14,17 @@ func _initialize() -> void:
 	started = Time.get_ticks_msec()
 	runtime = Runtime.new()
 	var tracker := XRBodyTracker.new()
+	# XRBodyTracker does not initialize every joint flag in its constructor.
+	# Synthetic fixtures, like a tracker driver, must explicitly publish validity.
+	for joint in XRBodyTracker.JOINT_MAX:
+		tracker.set_joint_flags(joint, 0)
 	tracker.has_tracking_data = true
 	var flags := XRBodyTracker.JOINT_FLAG_POSITION_VALID | XRBodyTracker.JOINT_FLAG_ORIENTATION_VALID | XRBodyTracker.JOINT_FLAG_POSITION_TRACKED | XRBodyTracker.JOINT_FLAG_ORIENTATION_TRACKED
 	tracker.set_joint_flags(XRBodyTracker.JOINT_LEFT_FOOT, flags)
 	tracker.set_joint_transform(XRBodyTracker.JOINT_LEFT_FOOT, Transform3D(Basis.IDENTITY, Vector3(-0.2,0.1,0)))
 	tracking = BodyTracking.new().from_tracker(tracker, Transform3D.IDENTITY)
 	assert(tracking.has("LeftFoot") and tracking.LeftFoot.source == "tracked")
+	assert(tracking.size() == 1, "Unconfigured synthetic joints appeared valid: " + str(tracking))
 	var config: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_environment("SSC_TEST_CONFIG")))
 	loader = Loader.new()
 	root.add_child.call_deferred(loader)
@@ -55,7 +60,10 @@ func _process(delta: float) -> bool:
 		var poses: Array[Transform3D] = [Transform3D(Basis.IDENTITY,Vector3(0,1.65,0)),Transform3D(Basis.IDENTITY,Vector3(-0.4,1.2,-0.3)),Transform3D(Basis.IDENTITY,Vector3(0.4,1.2,-0.3))]
 		avatar.local_pose(delta,poses,Time.get_ticks_msec()-started>100,tracking)
 		assert(avatar.model.global_position.is_finite())
-		assert(avatar.model.sources.LeftFoot == "tracked" and avatar.model.sources.RightFoot == "estimated")
+		if avatar.model.sources.get("LeftFoot") != "tracked" or avatar.model.sources.get("RightFoot") != "estimated":
+			push_error("Tracker/fallback sources differ: " + str(avatar.model.sources) + " inputs: " + str(tracking))
+			quit(1)
+			return false
 		if Time.get_ticks_msec() - started > 300:
 			print("PASS VRM 1.0, expressions, spring bones, native limb IK, body-tracker inputs/fallback, and local/sleeping poses")
 			runtime.close()

@@ -14,6 +14,7 @@ const SettingsPanel = preload("res://scripts/settings_panel.gd")
 const Acoustics = preload("res://scripts/acoustics.gd")
 const RadialMenu = preload("res://scripts/radial_menu.gd")
 const Radio = preload("res://scripts/radio.gd")
+const ContactEvents = preload("res://scripts/contact_events.gd")
 var network: Node
 var loader: Node
 var origin: XROrigin3D
@@ -34,6 +35,7 @@ var phone_hand := 0
 var quality := 1
 var xr_active := false
 var menu_held := 0.0
+var menu_hold_delay := 0.45
 var menu_pressed := false
 var sleeping := false
 var entity_nodes: Dictionary = {}
@@ -51,6 +53,7 @@ var voice: Node3D
 var avatar_action_input: LineEdit
 var body_tracking := BodyTracking.new()
 var interactions: Dictionary = {}
+var contact_events := ContactEvents.new()
 var preferences: Dictionary = {}
 var preferences_request: HTTPRequest
 var touch_elapsed := 0.0
@@ -97,6 +100,7 @@ func _ready() -> void:
 	add_child(creator)
 	creator.script_error.connect(_status)
 	loader.failed.connect(_status)
+	loader.cache_notice.connect(_status)
 	loader.loaded.connect(func(root: Node3D):
 		if world_root:
 			if world_root.has_meta("ssc_audio"):
@@ -332,12 +336,7 @@ func _build_phone() -> void:
 	column.add_child(avatar_action_input)
 	_button(column, "Apply avatar action", func(): network.command(13, {"name":avatar_action_input.text, "weight":1.0}))
 	_button(column, "Reset avatar action", func(): network.command(13, {"name":avatar_action_input.text, "weight":0.0}))
-	_button(column, "Switch phone hand", func():
-		phone_hand = 1 - phone_hand
-		if not preferences.is_empty():
-			preferences.phone_hand = "left" if phone_hand == 0 else "right"
-			_save_preferences()
-	)
+	_button(column, "Switch phone hand", _switch_phone_hand)
 	_button(column, "Toggle sleeping pose", _sleep)
 	settings_panel = SettingsPanel.new()
 	column.add_child(settings_panel)
@@ -410,6 +409,7 @@ func _clear_instance() -> void:
 	acoustics.clear()
 	radios.clear()
 	interactions.clear()
+	contact_events.clear()
 	selected_entity = ""
 	loader.prefabs.clear()
 	creator.close()
@@ -447,7 +447,13 @@ func _message(kind: int, data: Dictionary) -> void:
 		_update_players(snapshot.players.values(), int(snapshot.tick), true)
 		latest_tick = int(snapshot.tick)
 		entity_data = snapshot.entities
-		interactions = snapshot.get("interactions", {})
+		var next_contacts: Dictionary = snapshot.get("interactions", {})
+		for event in contact_events.replace(next_contacts):
+			event.snapshot_tick = int(snapshot.tick)
+			if avatars.has(str(event.target)):
+				avatars[str(event.target)].contact(event)
+			creator.dispatch("release", event)
+		interactions = next_contacts
 		_update_media(snapshot.get("media", {}))
 		creator.dispatch("state", snapshot.get("variables", {}))
 		for id in entity_nodes.keys():
@@ -467,8 +473,10 @@ func _message(kind: int, data: Dictionary) -> void:
 			avatars[str(data.user)].chat(str(data.text))
 		_status("%s: %s" % [data.user, data.text])
 	elif kind == 6:
+		contact_events.acknowledge(data)
 		if avatars.has(str(data.target)):
 			avatars[str(data.target)].contact(data)
+		creator.dispatch(str(data.get("action", "touch")), data)
 	elif kind == 21:
 		if data.get("event") == "invite":
 			last_call_invitation = str(data.call)
@@ -652,7 +660,7 @@ func _process(delta: float) -> void:
 				network.input_action({"action":"drive", "target":selected_entity, "throttle":throttle, "turn":turn})
 	if menu_pressed:
 		menu_held += delta
-		radial.visible = menu_held >= 0.45
+		radial.visible = menu_held >= menu_hold_delay
 		if radial.visible:
 			phone.visible = true
 			radial.point(controllers[1 - phone_hand].get_vector2("primary"))
@@ -661,6 +669,8 @@ func _controller_pressed(action: StringName) -> void:
 	if action == &"menu_button" or action == &"ax_button":
 		menu_pressed = true
 		menu_held = 0
+		menu_hold_delay = RadialMenu.hold_delay(float(preferences.get("radial_hold_seconds", 0.45)))
+		radial.configure_actions(preferences.get("radial_actions", RadialMenu.DEFAULT_ACTIONS))
 		phone_before_radial = phone.visible
 	elif action == &"trigger_click":
 		if not _point_phone(true):
@@ -668,17 +678,19 @@ func _controller_pressed(action: StringName) -> void:
 
 func _controller_released(action: StringName) -> void:
 	if action == &"menu_button" or action == &"ax_button":
-		if menu_held >= 0.45:
+		if not menu_pressed:
+			return
+		if menu_held >= menu_hold_delay:
 			phone.visible = phone_before_radial
-			match radial.selected:
-				0: voice.set_microphone(not voice.microphone_enabled)
-				1: _sleep()
-				2: phone_hand = 1 - phone_hand
-				3: _interact()
-				4: network.command(13, {"name":avatar_action_input.text, "weight":1.0})
-				5: _media_command("pause")
-				6: phone.visible = true
-				7:
+			match radial.selected_action():
+				"microphone": voice.set_microphone(not voice.microphone_enabled)
+				"sleep": _sleep()
+				"phone_hand": _switch_phone_hand()
+				"interact": _interact()
+				"avatar_action": network.command(13, {"name":avatar_action_input.text, "weight":1.0})
+				"video_pause": _media_command("pause")
+				"phone": phone.visible = true
+				"leave":
 					network.close()
 					_clear_instance()
 		else:
@@ -687,6 +699,12 @@ func _controller_released(action: StringName) -> void:
 		radial.visible = false
 	elif action == &"trigger_click":
 		_point_phone(false)
+
+func _switch_phone_hand() -> void:
+	phone_hand = 1 - phone_hand
+	if not preferences.is_empty():
+		preferences.phone_hand = "left" if phone_hand == 0 else "right"
+		_save_preferences()
 
 func _point_phone(pressed: bool) -> bool:
 	if not phone.visible:
@@ -778,6 +796,7 @@ func _load_next_avatar() -> void:
 	avatar_loader.credentials = loader.credentials
 	avatar_loader.base_url = loader.base_url
 	avatar_loader.quality = quality
+	avatar_loader.cache_notice.connect(_status)
 	avatar_loader.texture_reduction = int(preferences.get("texture_reduction", 0))
 	avatar_loader.local_avatar = item.player == network.user
 	add_child(avatar_loader)

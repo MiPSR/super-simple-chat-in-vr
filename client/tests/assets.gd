@@ -2,6 +2,7 @@ extends SceneTree
 const Runtime = preload("res://scripts/vrm_runtime.gd")
 const Loader = preload("res://scripts/package_loader.gd")
 const Entity = preload("res://scripts/entity.gd")
+const Cache = preload("res://scripts/asset_cache.gd")
 var runtime: RefCounted
 var loader: Node
 var entity: Node3D
@@ -13,12 +14,17 @@ func _initialize() -> void:
 	assert(runtime.available(), "Pinned VRM importer is missing from the Nix client project")
 	var config: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_environment("SSC_TEST_CONFIG")))
 	loader = Loader.new()
+	loader.cache_directory = "user://import-cache-test-%s-%s" % [OS.get_process_id(),Time.get_ticks_usec()]
 	root.add_child.call_deferred(loader)
-	loader.staging = str(config.package)
+	assert(DirAccess.make_dir_recursive_absolute(loader.cache_directory) == OK)
+	loader.staging = loader.cache_directory.path_join(str(config.hash) + ".zip")
+	assert(DirAccess.copy_absolute(str(config.package), loader.staging) == OK)
 	loader.expected = str(config.hash)
 	loader.manifest = config.manifest
 	loader.failed.connect(func(message: String): push_error(message); quit(1))
 	loader.loaded.connect(func(model: Node3D):
+		assert(Cache.active.has(loader.staging), "Importer pin retired before loaded listeners")
+		assert(Cache.trim(loader.cache_directory, 0, 0).over_budget and FileAccess.file_exists(loader.staging))
 		root.add_child(model)
 		assert(not model.find_children("*", "MeshInstance3D", true, false).is_empty(), "World mesh did not import")
 		assert(loader.prefabs.has("tank") and loader.prefabs.has("shell"), "Packaged prefabs did not import")
@@ -34,6 +40,10 @@ func _initialize() -> void:
 
 func _process(_delta: float) -> bool:
 	if received and Time.get_ticks_msec() - started > 300:
+		assert(not Cache.active.has(loader.staging))
+		assert(not Cache.trim(loader.cache_directory, 0, 0).over_budget)
+		assert(not FileAccess.file_exists(loader.staging))
+		assert(DirAccess.remove_absolute(loader.cache_directory) == OK)
 		assert(entity.position.distance_to(Vector3(0,1,0)) < 0.001, "Entity extrapolated beyond the last known sample")
 		print("PASS world GLB, packaged prefab meshes, pinned VRM importer, and hold-last-sample presentation")
 		runtime.close()

@@ -21,6 +21,8 @@
 <label>Upscaler <select name="upscaler"><option value="bilinear">Bilinear</option><option value="fsr1">FSR 1 (supported desktop renderers only)</option></select></label>
 <label>Texture LOD bias (not VRAM reduction) <input name="texture_lod_bias" type="number" min="0" max="3" step="0.5"></label>
 <label>Texture dimensions (next world/avatar load) <select name="texture_reduction"><option value="0">Original</option><option value="1">Half</option><option value="2">Quarter</option><option value="3">Eighth</option></select></label>
+<label>Quick menu hold time (seconds) <input name="radial_hold_seconds" type="number" min="0.15" max="1.5" step="0.05"></label>
+<div id="radial-actions"></div>
 <label>Preferred radio preset <select name="radio_preset"><option>standard</option><option>narrow</option><option>weak</option></select></label>
 <label><input name="sleeping" type="checkbox"> Sleeping pose</label><button>Save preferences</button></form>
 <h2>Worlds & your avatars</h2><form id="search"><input id="query" placeholder="Search worlds and your avatars" maxlength="120"><button>Search</button></form><div id="assets"></div>

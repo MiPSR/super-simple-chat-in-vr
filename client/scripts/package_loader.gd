@@ -1,7 +1,9 @@
 extends Node
 signal loaded(root: Node3D)
 signal failed(message: String)
+signal cache_notice(message: String)
 const Materials = preload("res://scripts/materials.gd")
+const Cache = preload("res://scripts/asset_cache.gd")
 var request: HTTPRequest
 var credentials := ""
 var base_url := ""
@@ -16,6 +18,8 @@ var staging := ""
 var prefabs: Dictionary = {}
 var asset_id := ""
 var local_avatar := false
+var pinned_cache_path := ""
+var cache_directory := "user://cache"
 
 func _ready() -> void:
 	request = HTTPRequest.new()
@@ -23,7 +27,7 @@ func _ready() -> void:
 	request.timeout = 120
 	add_child(request)
 	request.request_completed.connect(_downloaded)
-	DirAccess.make_dir_recursive_absolute("user://cache")
+	DirAccess.make_dir_recursive_absolute(cache_directory)
 
 func load_world(snapshot: Dictionary) -> void:
 	_load_asset(str(snapshot.world), str(snapshot.version), snapshot.manifest)
@@ -33,13 +37,16 @@ func load_avatar(id: String, version: String) -> void:
 	_load_asset(id, version, {})
 
 func _load_asset(id: String, version: String, metadata: Dictionary) -> void:
+	if not Cache.valid_hash(version):
+		failed.emit("Invalid immutable package hash")
+		return
 	if worker or request.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		failed.emit("Another package is loading; wait before switching worlds.")
 		return
 	asset_id = id
 	expected = version
 	manifest = metadata
-	staging = "user://cache/%s.zip" % expected
+	staging = cache_directory.path_join(expected + ".zip")
 	if FileAccess.file_exists(staging):
 		_start_import()
 		return
@@ -58,9 +65,22 @@ func _downloaded(result: int, code: int, _headers: PackedStringArray, _body: Pac
 		return
 	_start_import()
 
+func _trim_cache() -> void:
+	var summary := Cache.trim(cache_directory)
+	if summary.over_budget or int(summary.errors) > 0:
+		cache_notice.emit("Asset cache eviction deferred: active imports or filesystem errors")
+
 func _start_import() -> void:
+	pinned_cache_path = staging
+	Cache.acquire(pinned_cache_path)
+	_trim_cache()
 	worker = Thread.new()
-	worker.start(_import.bind(staging, expected, str(manifest.get("scene", "")), manifest.get("prefabs", {}).duplicate(true), local_avatar, texture_reduction))
+	var error := worker.start(_import.bind(staging, expected, str(manifest.get("scene", "")), manifest.get("prefabs", {}).duplicate(true), local_avatar, texture_reduction))
+	if error != OK:
+		worker = null
+		Cache.release(pinned_cache_path)
+		pinned_cache_path = ""
+		failed.emit("Could not start package importer")
 
 func _import(path: String, hash: String, scene: String, definitions: Dictionary, first_person: bool, reduction: int = 0) -> void:
 	var result: Dictionary = {}
@@ -103,6 +123,8 @@ func _process(_delta: float) -> void:
 	if worker and not worker.is_alive():
 		worker.wait_to_finish()
 		worker = null
+		var imported_path := pinned_cache_path
+		pinned_cache_path = ""
 		result_mutex.lock()
 		var result := pending_result
 		pending_result = {}
@@ -130,7 +152,19 @@ func _process(_delta: float) -> void:
 				loaded.emit(root)
 			else:
 				failed.emit("GLB scene construction failed")
+		# Loaded listeners synchronously read Luau/Opus before this pin retires.
+		Cache.release(imported_path)
+		_trim_cache()
 
 func _exit_tree() -> void:
+	if request:
+		request.cancel_request()
+		if not request.download_file.is_empty():
+			DirAccess.remove_absolute(request.download_file)
 	if worker:
 		worker.wait_to_finish()
+	var was_pinned := not pinned_cache_path.is_empty()
+	Cache.release(pinned_cache_path)
+	pinned_cache_path = ""
+	if was_pinned:
+		Cache.trim(cache_directory)

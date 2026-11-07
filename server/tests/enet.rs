@@ -132,20 +132,28 @@ impl Peer {
             self.command(json!({"action":"video_probe"}))?;
             let serial = self.serial;
             let report = self
-                .wait(|e| e["kind"] == 250 && e["data"]["serial"] == serial)
+                .wait(|e| {
+                    e["kind"].as_f64() == Some(250.0)
+                        && e["data"]["serial"].as_f64() == Some(f64::from(serial))
+                })
                 .await?;
             self.drain();
             ensure!(
-                !self.events.iter().any(|e| e["kind"] == 251),
+                !self
+                    .events
+                    .iter()
+                    .any(|e| e["kind"].as_f64() == Some(251.0)),
                 "Decoded video failed: {:?}",
-                self.events.iter().find(|e| e["kind"] == 251)
+                self.events
+                    .iter()
+                    .find(|e| e["kind"].as_f64() == Some(251.0))
             );
             let data = &report["data"];
             if data["ready"] == true
                 && data["playing"] == playing
                 && (playing || data["expected"].as_f64() == Some(2.0))
-                && data["frames"].as_u64().unwrap_or(0) > 0
-                && (!playing || data["pcm"].as_u64().unwrap_or(0) > 0)
+                && data["frames"].as_f64().unwrap_or(0.0) > 0.0
+                && (!playing || data["pcm"].as_f64().unwrap_or(0.0) > 0.0)
                 && data["position"]
                     .as_f64()
                     .zip(data["expected"].as_f64())
@@ -529,27 +537,69 @@ async fn encrypted_godot_enet() -> Result<()> {
     let media = std::fs::read(media_file)?;
     let media_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let media_url = format!("http://{}/video.mkv", media_listener.local_addr()?);
+    let media_origin = format!("http://{}", media_listener.local_addr()?);
     let media_server = tokio::spawn(async move {
         axum::serve(
             media_listener,
-            axum::Router::new().route(
-                "/video.mkv",
-                axum::routing::get(move || {
-                    let media = media.clone();
-                    async move { ([("content-type", "video/x-matroska")], media) }
-                }),
-            ),
+            axum::Router::new()
+                .route(
+                    "/video.mkv",
+                    axum::routing::get(move || {
+                        let media = media.clone();
+                        async move { ([("content-type", "video/x-matroska")], media) }
+                    }),
+                )
+                .route(
+                    "/restricted.mkv",
+                    axum::routing::get(|| async { axum::http::StatusCode::FORBIDDEN }),
+                )
+                .route(
+                    "/unsupported.mkv",
+                    axum::routing::get(|| async { "This is not a supported media container" }),
+                ),
         )
         .await
     });
     // Don't block the async executor that serves the test's media source.
     let video_project = project.clone();
+    let video_url = media_url.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new("timeout")
             .args(["25", "godot4"])
             .args(["--headless", "--xr-mode", "off", "--path"])
             .arg(video_project)
             .args(["--script", "res://tests/video.gd"])
+            .env("SSC_TEST_VIDEO", &video_url)
+            .env("SSC_TEST_MEDIA_ORIGIN", &video_url)
+            .env_remove("no_proxy")
+            .env_remove("NO_PROXY")
+            .output()
+    })
+    .await??;
+    ensure!(
+        output.status.success()
+            && !String::from_utf8_lossy(&output.stderr).contains("ERROR")
+            && !String::from_utf8_lossy(&output.stderr).contains("leaked"),
+        "Video surface test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    let video_project = project.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("timeout")
+            .args(["50", "godot4", "--headless", "--xr-mode", "off", "--path"])
+            .arg(video_project)
+            .args(["--script", "res://tests/video_failures.gd"])
+            .env(
+                "SSC_TEST_VIDEO_FAILURES",
+                serde_json::to_string(&[
+                    format!("{media_origin}/removed.mkv"),
+                    format!("{media_origin}/restricted.mkv"),
+                    format!("{media_origin}/unsupported.mkv"),
+                ])
+                .unwrap(),
+            )
             .env("SSC_TEST_VIDEO", &media_url)
             .env("SSC_TEST_MEDIA_ORIGIN", &media_url)
             .env_remove("no_proxy")
@@ -562,7 +612,7 @@ async fn encrypted_godot_enet() -> Result<()> {
         output.status.success()
             && !String::from_utf8_lossy(&output.stderr).contains("ERROR")
             && !String::from_utf8_lossy(&output.stderr).contains("leaked"),
-        "Video surface test failed: {}\n{}",
+        "Video failure/recovery test failed: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -672,7 +722,7 @@ async fn encrypted_godot_enet() -> Result<()> {
         "Voice leaked through a mute rule"
     );
     b.wait(|e| {
-        e["kind"] == 3
+        e["kind"].as_f64() == Some(3.0)
             && e["data"]["players"].as_array().is_some_and(|players| {
                 players
                     .iter()
@@ -681,7 +731,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     })
     .await?;
     a.wait(|e| {
-        e["kind"] == 3
+        e["kind"].as_f64() == Some(3.0)
             && e["data"]["players"].as_array().is_some_and(|players| {
                 players
                     .iter()
@@ -755,7 +805,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     let muted_tick = b
         .events
         .iter()
-        .filter(|e| e["kind"] == 3)
+        .filter(|e| e["kind"].as_f64() == Some(3.0))
         .filter_map(|e| e["data"]["tick"].as_f64())
         .fold(0.0f64, f64::max);
     api.client
@@ -766,7 +816,7 @@ async fn encrypted_godot_enet() -> Result<()> {
         .await?
         .error_for_status()?;
     b.wait(|e| {
-        e["kind"] == 3
+        e["kind"].as_f64() == Some(3.0)
             && e["data"]["tick"]
                 .as_f64()
                 .is_some_and(|tick| tick > muted_tick)
@@ -838,7 +888,10 @@ async fn encrypted_godot_enet() -> Result<()> {
         )
         .await?;
     let mut remote = Peer::start(directory.path(), "radio-remote", grant)?;
-    let joined = remote.wait(|e| e["data"]["user"].is_string()).await?;
+    let joined = remote
+        .wait(|e| e["data"]["user"].is_string())
+        .await
+        .context("Cross-instance radio join")?;
     ensure!(joined["data"]["radio_policy"]["presets"] == json!(["standard", "narrow", "weak"]));
     ensure!(
         joined["data"]["radio_policy"]["ft8_interval"].as_f64() == Some(2.0)
@@ -850,6 +903,58 @@ async fn encrypted_godot_enet() -> Result<()> {
         snapshot(&joined)["instance"] != instance,
         "Radio fixture must use a separate instance"
     );
+    let denied_grant = api
+        .json(
+            "/api/v1/game-grants",
+            Some(json!({"instance":snapshot(&joined)["instance"]})),
+            &tokens[0],
+        )
+        .await?;
+    let mut denied = Peer::start(directory.path(), "denied-private-transition", denied_grant)?;
+    denied
+        .wait(|e| e["kind"].as_f64() == Some(255.0) && e["data"]["error"] == "Invitation required")
+        .await
+        .context("Uninvited private transition must be rejected")?;
+    denied.stop().await?;
+    a.command(
+        json!({"action":"command","kind":4,"data":{"text":"OLD SESSION SURVIVED REJECTION"}}),
+    )?;
+    b.wait(|e| {
+        e["kind"].as_f64() == Some(4.0) && e["data"]["text"] == "OLD SESSION SURVIVED REJECTION"
+    })
+    .await
+    .context("Rejected transition removed the old authenticated connection")?;
+    let reconnect_grant = api
+        .json(
+            "/api/v1/game-grants",
+            Some(json!({"instance":instance})),
+            &tokens[0],
+        )
+        .await?;
+    let mut replacement = Peer::start(directory.path(), "a-live-reconnect", reconnect_grant)?;
+    let resumed = replacement
+        .wait(|e| e["data"]["user"] == users[0])
+        .await
+        .context("Live same-instance reconnect")?;
+    ensure!(
+        snapshot(&resumed)["instance"] == instance
+            && snapshot(&resumed)["players"].get(users[1]).is_some(),
+        "Reconnect replaced the instance instead of resnapshotting it"
+    );
+    a.stop().await?;
+    a = replacement;
+    a.command(
+        json!({"action":"command","kind":4,"data":{"text":"NEW SESSION SURVIVED OLD DISCONNECT"}}),
+    )?;
+    b.wait(|e| {
+        e["kind"].as_f64() == Some(4.0)
+            && e["data"]["text"] == "NEW SESSION SURVIVED OLD DISCONNECT"
+    })
+    .await
+    .context("Stale disconnect removed new membership")?;
+    println!(
+        "PASS failed private transition preserves the old session; live reconnect resnapshots and survives stale disconnect"
+    );
     a.command(json!({"action":"command","kind":25,"data":{"target":"desk_radio","mode":"ft8","data":"CQ CROSS WORLD"}}))?;
     remote
         .wait(|e| {
@@ -857,22 +962,27 @@ async fn encrypted_godot_enet() -> Result<()> {
                 && e["data"]["mode"] == "ft8"
                 && e["data"]["data"] == "CQ CROSS WORLD"
         })
-        .await?;
+        .await
+        .context("Cross-instance direct FT8 delivery")?;
     a.command(json!({"action":"command","kind":5,"data":{"target":"radio_send"}}))?;
     a.wait(|e| {
-        e["kind"] == 255
+        e["kind"].as_f64() == Some(255.0)
             && e["data"]["error"]
                 .as_str()
                 .is_some_and(|s| s.contains("Radio transmission rate exceeded"))
     })
-    .await?;
+    .await
+    .context("Scripted radio must share the direct-message cooldown")?;
     tokio::time::sleep(Duration::from_millis(2100)).await;
     a.command(json!({"action":"command","kind":5,"data":{"target":"radio_send"}}))?;
     remote
         .wait(|e| {
-            e["kind"] == 25 && e["data"]["data"] == "CQ CREATOR" && e["data"]["sender"] == users[0]
+            e["kind"].as_f64() == Some(25.0)
+                && e["data"]["data"] == "CQ CREATOR"
+                && e["data"]["sender"] == users[0]
         })
-        .await?;
+        .await
+        .context("Authenticated server-scripted cross-instance FT8 delivery")?;
     let grayscale = "a0".repeat(64 * 48);
     a.command(json!({"action":"command","kind":25,"data":{"target":"desk_radio","mode":"sstv","data":grayscale}}))?;
     remote
@@ -883,7 +993,8 @@ async fn encrypted_godot_enet() -> Result<()> {
                     .as_str()
                     .is_some_and(|s| s.len() == 64 * 48 * 2)
         })
-        .await?;
+        .await
+        .context("Cross-instance SSTV delivery")?;
     a.command(json!({"action":"radio_voice","target":"desk_radio"}))?;
     remote
         .wait(|e| {
@@ -891,7 +1002,8 @@ async fn encrypted_godot_enet() -> Result<()> {
                 && e["data"]["sender"] == users[0]
                 && e["data"]["radio"] == "desk_radio"
         })
-        .await?;
+        .await
+        .context("Cross-instance Opus radio delivery")?;
     api.client
         .put(format!("{}/api/v1/blocks/{}", api.base, users[0]))
         .bearer_auth(&tokens[2])
@@ -1021,7 +1133,63 @@ async fn encrypted_godot_enet() -> Result<()> {
             })
         })
         .await?;
-    let grabbed_revision = snapshot(&grabbed)["revision"].as_f64().unwrap();
+    let first_grab_revision = snapshot(&grabbed)["revision"].as_f64().unwrap();
+    b.command(json!({"action":"command","kind":8,"data":{"avatar":avatar_asset["id"]}}))?;
+    let same_avatar = a
+        .wait(|e| {
+            snapshot(e)["revision"]
+                .as_f64()
+                .is_some_and(|r| r > first_grab_revision)
+                && snapshot(e)["players"][users[1]]["avatar_actions"]
+                    .as_object()
+                    .is_some_and(|actions| actions.is_empty())
+                && snapshot(e)["interactions"]
+                    .as_object()
+                    .is_some_and(|grabs| !grabs.is_empty())
+        })
+        .await
+        .context("Same immutable avatar selection must retain grabs")?;
+    let same_revision = snapshot(&same_avatar)["revision"].as_f64().unwrap();
+    b.command(json!({"action":"command","kind":8,"data":{"avatar":""}}))?;
+    let removed = a
+        .wait(|e| {
+            snapshot(e)["revision"]
+                .as_f64()
+                .is_some_and(|r| r > same_revision)
+                && snapshot(e)["players"][users[1]]["avatar"].is_null()
+                && snapshot(e)["interactions"]
+                    .as_object()
+                    .is_some_and(|grabs| grabs.is_empty())
+        })
+        .await
+        .context("Removing an avatar must release old-bone grabs")?;
+    let removed_revision = snapshot(&removed)["revision"].as_f64().unwrap();
+    b.command(json!({"action":"command","kind":8,"data":{"avatar":avatar_asset["id"]}}))?;
+    let equipped = a
+        .wait(|e| {
+            snapshot(e)["revision"]
+                .as_f64()
+                .is_some_and(|r| r > removed_revision)
+                && snapshot(e)["players"][users[1]]["avatar"] == avatar_asset["id"]
+        })
+        .await?;
+    let equipped_revision = snapshot(&equipped)["revision"].as_f64().unwrap();
+    a.command(json!({"action":"command","kind":6,"data":{"target":users[1],"action":"grab","segment":"hair","hand":0}}))?;
+    let grabbed_again = b
+        .wait(|e| {
+            snapshot(e)["revision"]
+                .as_f64()
+                .is_some_and(|r| r > equipped_revision)
+                && snapshot(e)["interactions"]
+                    .as_object()
+                    .is_some_and(|grabs| {
+                        grabs
+                            .values()
+                            .any(|g| g["actor"] == users[0] && g["bone"] == "HairRoot")
+                    })
+        })
+        .await?;
+    let grabbed_revision = snapshot(&grabbed_again)["revision"].as_f64().unwrap();
     api.client
         .put(format!("{}/api/v1/blocks/{}", api.base, users[0]))
         .bearer_auth(&tokens[1])
@@ -1039,7 +1207,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     })
     .await?;
     println!(
-        "PASS owner avatar selection, replicated actions, bilateral touch opt-in, hair-grab ownership and block-driven release"
+        "PASS owner avatar selection, replicated actions, bilateral touch opt-in, hair-grab ownership and avatar-change/block release"
     );
     // Actual server collision results, not client-declared damage or scores.
     a.command(json!({"action":"command","kind":12,"data":{"action":"lease","target":"tank_a"}}))?;

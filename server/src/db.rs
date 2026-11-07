@@ -45,6 +45,8 @@ pub struct Preferences {
     pub texture_lod_bias: f32,
     pub texture_reduction: u8,
     pub radio_preset: String,
+    pub radial_hold_seconds: f32,
+    pub radial_actions: Vec<String>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -67,6 +69,20 @@ impl Default for Preferences {
             texture_lod_bias: 0.0,
             texture_reduction: 0,
             radio_preset: "standard".into(),
+            radial_hold_seconds: 0.45,
+            radial_actions: [
+                "microphone",
+                "sleep",
+                "phone_hand",
+                "interact",
+                "avatar_action",
+                "video_pause",
+                "phone",
+                "leave",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         }
     }
 }
@@ -97,6 +113,23 @@ impl Preferences {
             && (0.0..=3.0).contains(&self.texture_lod_bias)
             && self.texture_reduction <= 3
             && matches!(self.radio_preset.as_str(), "standard" | "narrow" | "weak")
+            && self.radial_hold_seconds.is_finite()
+            && (0.15..=1.5).contains(&self.radial_hold_seconds)
+            && self.radial_actions.len() == 8
+            && self.radial_actions.iter().all(|action| {
+                matches!(
+                    action.as_str(),
+                    "microphone"
+                        | "sleep"
+                        | "phone_hand"
+                        | "interact"
+                        | "avatar_action"
+                        | "video_pause"
+                        | "phone"
+                        | "leave"
+                        | "none"
+                )
+            })
     }
 }
 pub fn preferences(db: &Connection, id: &str) -> Preferences {
@@ -128,6 +161,8 @@ mod tests {
         assert!(old.valid() && old.can_touch_me && old.quality == 2);
         assert_eq!(old.input_device, "Default");
         assert_eq!(old.texture_reduction, 0);
+        assert_eq!(old.radial_actions.len(), 8);
+        assert_eq!(old.radial_hold_seconds, 0.45);
         let defaults = serde_json::to_value(Preferences::default()).unwrap();
         for (key, value) in [
             ("resolution_scale", json!(0.49)),
@@ -136,6 +171,11 @@ mod tests {
             ("microphone_gain", json!(-1)),
             ("texture_lod_bias", json!(4)),
             ("texture_reduction", json!(4)),
+            ("radial_hold_seconds", json!(0.1)),
+            ("radial_hold_seconds", json!(1.6)),
+            ("radial_actions", json!(["none"])),
+            ("radial_actions", json!(vec!["unknown"; 8])),
+            ("radial_actions", json!(vec!["none"; 9])),
             ("antialiasing", json!("unknown")),
             ("upscaler", json!("unimplemented")),
             ("radio_preset", json!("ultra")),

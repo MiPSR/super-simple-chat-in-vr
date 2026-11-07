@@ -137,11 +137,14 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                             let mut cipher=crypto::Cipher::new(g.secret.clone());
                             if !matches!(cipher.open(0,0,&data[64..]),Ok((1,_))) {peer.disconnect_now(1);continue;}
                             app.grants.lock().unwrap().remove(ticket);
-                            // One live game connection per account; old connection cannot remove new membership.
+                            // Retire an old connection only after admission succeeds.
+                            // A rejected transition must leave its session/world intact.
                             let old:Vec<_>=sessions.iter().filter(|(_,s)|s.user==g.user).map(|(id,_)|*id).collect();
-                            for old in old {sessions.remove(&old);app.worlds.lock().unwrap().leave(&g.user);pending.insert(old,Instant::now()-Duration::from_secs(6));}
                             let result=app.worlds.lock().unwrap().admit(&g.join,&g.user,&g.name,&g.version,g.manifest,g.sources);
                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,send_divisor:1,receive_divisor:1,last_input:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
+                            // No leave here: admit already transitioned or resnapshotted
+                            // membership, so a stale disconnect cannot remove the new one.
+                            for old in old {sessions.remove(&old);pending.insert(old,Instant::now()-Duration::from_secs(6));}
                             let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,send_divisor:g.join.send_divisor,receive_divisor:g.join.receive_divisor,last_input:Instant::now()-step,last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0};
                             let worlds=app.worlds.lock().unwrap();
                             let mut snapshot=worlds.instances[&instance].snapshot(worlds.tick);
@@ -225,7 +228,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                         if let Some(event)=event {for (other,s) in &mut sessions {if s.instance==instance && !db::blocked(&app.db.lock().unwrap(),&s.user,&sender,16) && !db::blocked(&app.db.lock().unwrap(),&s.user,event["target"].as_str().unwrap_or(""),16) {send(host.peer_mut(*other),s,0,6,&event);}}}
                                     }
                                     7=>{let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.sleeping=value["sleeping"].as_bool().unwrap_or(false);i.revision+=1;}}
-                                    8=>{let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.avatar=valid.as_ref().map(|a|a.0.clone());p.avatar_version=valid.map(|a|a.1);p.avatar_actions.clear();i.revision+=1;}}
+                                    8=>{let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) {let _=i.set_avatar(&session.user,valid);}}
                                     9=>{peer.disconnect_later(0);}
                                     12=>{if let Ok(action)=serde_json::from_value::<crate::world::Action>(value)
                                         && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance)

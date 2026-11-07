@@ -77,6 +77,7 @@ pub fn valid_tracking(joints: &BTreeMap<String, TrackedJoint>) -> bool {
 pub struct Entity {
     pub id: String,
     pub component: String,
+    pub tags: Vec<String>,
     pub position: [f32; 3],
     pub visible: bool,
     pub active: bool,
@@ -101,6 +102,19 @@ pub struct Entity {
     #[serde(skip)]
     expires: Option<u64>,
 }
+impl Entity {
+    fn control_event(&self, event: &str, reason: &str, clock: u64) -> Option<Value> {
+        self.controller.as_ref().map(|actor| {
+            let mut event = json!({"event":event,"kind":"object","actor":actor,
+                "target":self.id,"mode":if self.held_hand.is_some() {"grab"} else {"lease"},
+                "reason":reason,"clock":clock});
+            if let Some(hand) = self.held_hand {
+                event["hand"] = json!(hand);
+            }
+            event
+        })
+    }
+}
 pub struct Instance {
     pub media: BTreeMap<String, media::Session>,
     pub id: String,
@@ -111,6 +125,7 @@ pub struct Instance {
     pub capacity: usize,
     pub players: BTreeMap<String, Player>,
     pub entities: BTreeMap<String, Entity>,
+    tag_bytes: usize,
     pub variables: Arc<Mutex<BTreeMap<String, Value>>>,
     pub revision: u64,
     pub invitations: HashMap<String, (String, i64)>,
@@ -344,6 +359,7 @@ impl Instance {
             capacity: manifest.capacity,
             players: BTreeMap::new(),
             entities: BTreeMap::new(),
+            tag_bytes: 0,
             variables: Arc::new(Mutex::new(
                 manifest
                     .variables
@@ -369,6 +385,21 @@ impl Instance {
             media: BTreeMap::new(),
         };
         for object in instance.manifest.objects.clone() {
+            let mut tags = object.tags.clone();
+            if let Some(prefab) = object
+                .prefab
+                .as_ref()
+                .and_then(|id| instance.manifest.prefabs.get(id))
+            {
+                tags.extend(prefab.tags.iter().cloned());
+            }
+            tags.sort();
+            tags.dedup();
+            instance.tag_bytes += crate::assets::tag_bytes(&tags);
+            anyhow::ensure!(
+                instance.tag_bytes <= crate::assets::MAX_ENTITY_TAG_BYTES,
+                "Live entity tags exceed 64 KiB"
+            );
             let spec = object
                 .physics
                 .or_else(|| {
@@ -411,6 +442,7 @@ impl Instance {
                 Entity {
                     id: object.id,
                     component: object.component,
+                    tags,
                     position: object.position,
                     rotation: [0.0, 0.0, 0.0, 1.0],
                     size,
@@ -549,12 +581,7 @@ impl Instance {
                         }
                     }
                     Command::Lease(id, user) => {
-                        anyhow::ensure!(self.players.contains_key(&user), "Unknown controller");
-                        if let Some(e) = self.entities.get_mut(&id) {
-                            e.controller = Some(user);
-                            e.lease_until = self.clock + self.tps as u64 * 2;
-                            self.revision += 1;
-                        }
+                        self.set_control(&id, &user, None, "script")?;
                     }
                 }
                 Ok(())
@@ -605,6 +632,13 @@ impl Instance {
             .get(prefab)
             .ok_or_else(|| anyhow::anyhow!("Prefab is not packaged"))?;
         let spec = prefab_def.physics.clone();
+        let mut tags = prefab_def.tags.clone();
+        tags.sort();
+        let tag_bytes = crate::assets::tag_bytes(&tags);
+        anyhow::ensure!(
+            self.tag_bytes + tag_bytes <= crate::assets::MAX_ENTITY_TAG_BYTES,
+            "Live entity tags exceed 64 KiB"
+        );
         self.scene.insert(
             &id,
             options.position,
@@ -622,6 +656,7 @@ impl Instance {
             Entity {
                 id: id.clone(),
                 component: prefab_def.component.clone(),
+                tags,
                 position: options.position,
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 size: spec.size,
@@ -642,6 +677,7 @@ impl Instance {
         );
         self.events
             .push(json!({"event":"spawn","entity":self.entities[&id],"clock":self.clock}));
+        self.tag_bytes += tag_bytes;
         self.revision += 1;
         Ok(())
     }
@@ -658,6 +694,22 @@ impl Instance {
             self.creator_events.push_back(event);
         } else {
             self.creator_event_overflow = true;
+        }
+    }
+    pub(crate) fn release_contacts(&mut self, ids: Vec<String>, reason: &str) {
+        let mut changed = false;
+        for id in ids {
+            if let Some(grab) = self.interactions.remove(&id) {
+                changed = true;
+                self.queue_creator_event(
+                    json!({"event":"release","action":"release","kind":"avatar",
+                    "actor":grab.actor,"target":grab.target,"segment":grab.segment,
+                    "bone":grab.bone,"hand":grab.hand,"reason":reason,"clock":self.clock}),
+                );
+            }
+        }
+        if changed {
+            self.revision += 1;
         }
     }
     fn flush_creator_events(&mut self) {
@@ -681,7 +733,11 @@ impl Instance {
         }
     }
     fn destroy(&mut self, id: &str) {
-        if self.entities.remove(id).is_some() {
+        if let Some(entity) = self.entities.remove(id) {
+            self.tag_bytes -= crate::assets::tag_bytes(&entity.tags);
+            if let Some(event) = entity.control_event("release", "destroy", self.clock) {
+                self.queue_creator_event(event);
+            }
             self.scene.remove(id);
             self.revision += 1;
             let event = json!({"event":"destroy","target":id,"clock":self.clock});
@@ -709,6 +765,114 @@ impl Instance {
             }
             self.destroy(id);
         }
+    }
+    pub(crate) fn set_avatar(
+        &mut self,
+        user: &str,
+        selected: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
+        // The realtime handler performs the owner/enabled-version database check
+        // before passing a selection here. Keep lifecycle cleanup in one place.
+        let player = self
+            .players
+            .get_mut(user)
+            .ok_or_else(|| anyhow::anyhow!("Not joined"))?;
+        let (avatar, version) =
+            selected.map_or((None, None), |(id, version)| (Some(id), Some(version)));
+        let changed = player.avatar != avatar || player.avatar_version != version;
+        player.avatar = avatar;
+        player.avatar_version = version;
+        player.avatar_actions.clear();
+        self.revision += 1;
+        if changed {
+            let released = self
+                .interactions
+                .iter()
+                .filter(|(_, grab)| grab.target == user)
+                .map(|(id, _)| id.clone())
+                .collect();
+            self.release_contacts(released, "avatar_change");
+        }
+        Ok(())
+    }
+    fn reconnect(&mut self, user: &str, name: &str) {
+        let controlled: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|(_, entity)| entity.controller.as_deref() == Some(user))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in controlled {
+            self.release_control(&id, "reconnect");
+        }
+        let contacts = self
+            .interactions
+            .iter()
+            .filter(|(_, grab)| grab.actor == user || grab.target == user)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.release_contacts(contacts, "reconnect");
+        if let Some(player) = self.players.get_mut(user)
+            && player.name != name
+        {
+            player.name = name.into();
+            self.revision += 1;
+        }
+    }
+    fn release_control(&mut self, id: &str, reason: &str) {
+        let Some(entity) = self.entities.get_mut(id) else {
+            return;
+        };
+        let Some(event) = entity.control_event("release", reason, self.clock) else {
+            return;
+        };
+        entity.controller = None;
+        entity.held_hand = None;
+        entity.controls = [0.0; 2];
+        self.scene.release(id);
+        self.revision += 1;
+        self.queue_creator_event(event);
+    }
+    fn set_control(
+        &mut self,
+        id: &str,
+        user: &str,
+        hand: Option<usize>,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.players.contains_key(user), "Unknown controller");
+        let entity = self
+            .entities
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown entity"))?;
+        anyhow::ensure!(
+            entity.spec.as_ref().is_some_and(|spec| spec.dynamic),
+            "Entity cannot be controlled"
+        );
+        anyhow::ensure!(
+            hand.is_none_or(|hand| hand < 2 && entity.component == "prop"),
+            "Invalid prop/hand"
+        );
+        let renewed = entity.controller.as_deref() == Some(user) && entity.held_hand == hand;
+        if !renewed {
+            self.release_control(id, "handoff");
+        }
+        let entity = self.entities.get_mut(id).unwrap();
+        entity.controller = Some(user.into());
+        entity.held_hand = hand;
+        entity.lease_until = self.clock + self.tps as u64 * 2;
+        if !renewed {
+            let event = entity
+                .control_event(
+                    if hand.is_some() { "grab" } else { "lease" },
+                    reason,
+                    self.clock,
+                )
+                .unwrap();
+            self.revision += 1;
+            self.queue_creator_event(event);
+        }
+        Ok(())
     }
     pub fn action(&mut self, user: &str, action: Action) -> anyhow::Result<()> {
         let (Action::Lease { target }
@@ -742,23 +906,19 @@ impl Instance {
                 if let Action::Grab { hand, .. } = action {
                     anyhow::ensure!(hand < 2 && entity.component == "prop", "Invalid prop/hand");
                 }
-                entity.controller = Some(user.into());
-                entity.lease_until = self.clock + self.tps as u64 * 2;
-                if let Action::Grab { hand, .. } = action {
-                    entity.held_hand = Some(hand as usize);
-                }
-                self.revision += 1;
+                let hand = if let Action::Grab { hand, .. } = action {
+                    Some(hand as usize)
+                } else {
+                    None
+                };
+                self.set_control(&target, user, hand, "explicit")?;
             }
             Action::Release { .. } => {
                 anyhow::ensure!(
                     entity.controller.as_deref() == Some(user),
                     "Not the controller"
                 );
-                entity.controller = None;
-                entity.held_hand = None;
-                entity.controls = [0.0; 2];
-                self.scene.release(&target);
-                self.revision += 1;
+                self.release_control(&target, "explicit");
             }
             Action::Drive { throttle, turn, .. } => {
                 anyhow::ensure!(
@@ -830,14 +990,16 @@ impl Instance {
     }
     fn tick(&mut self) {
         self.clock += 1;
+        let expired: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|(_, entity)| entity.controller.is_some() && entity.lease_until <= self.clock)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.release_control(&id, "lease_expired");
+        }
         for (id, entity) in &mut self.entities {
-            if entity.controller.is_some() && entity.lease_until <= self.clock {
-                entity.controller = None;
-                entity.held_hand = None;
-                entity.controls = [0.0; 2];
-                self.scene.release(id);
-                self.revision += 1;
-            }
             if let Some(hand) = entity.held_hand {
                 if let Some(player) = entity.controller.as_ref().and_then(|u| self.players.get(u)) {
                     let i = 7 * (hand + 1);
@@ -1027,11 +1189,11 @@ impl Registry {
                 .instances
                 .get(&join.instance)
                 .ok_or_else(|| anyhow::anyhow!("Instance no longer exists"))?;
-            anyhow::ensure!(
-                !instance.players.contains_key(user),
-                "Already joined; disconnect before reconnecting"
-            );
-            anyhow::ensure!(instance.players.len() < instance.capacity, "Instance full");
+            if instance.players.contains_key(user) {
+                let id = join.instance.clone();
+                self.instances.get_mut(&id).unwrap().reconnect(user, name);
+                return Ok(id);
+            }
             if instance.private && instance.owner != user {
                 anyhow::ensure!(
                     instance
@@ -1041,11 +1203,26 @@ impl Registry {
                     "Invitation required"
                 );
             }
+            anyhow::ensure!(instance.players.len() < instance.capacity, "Instance full");
         }
-        self.leave(user);
-        let id = if join.instance.is_empty() {
-            anyhow::ensure!(self.instances.len() < 64, "Instance limit reached");
-            let id = db::token()[..16].to_string();
+        let created = if join.instance.is_empty() {
+            let vacated = self
+                .instances
+                .values()
+                .filter(|instance| {
+                    instance.players.len() == 1 && instance.players.contains_key(user)
+                })
+                .count();
+            anyhow::ensure!(
+                self.instances.len().saturating_sub(vacated) < 64,
+                "Instance limit reached"
+            );
+            let id = loop {
+                let candidate = db::token()[..16].to_string();
+                if !self.instances.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
             let instance = Instance::create(
                 id.clone(),
                 join,
@@ -1055,6 +1232,14 @@ impl Registry {
                 sources,
                 self.tps,
             )?;
+            Some((id, instance))
+        } else {
+            None
+        };
+        // Admission checks and new-instance construction must succeed before
+        // removing the user's existing membership or its ephemeral state.
+        self.leave(user);
+        let id = if let Some((id, instance)) = created {
             self.instances.insert(id.clone(), instance);
             id
         } else {
@@ -1109,18 +1294,25 @@ impl Registry {
         self.instances.retain(|_, i| {
             if i.players.remove(user).is_some() {
                 i.revision += 1;
-                for e in i.entities.values_mut() {
-                    if e.controller.as_deref() == Some(user) {
-                        e.controller = None;
-                        e.held_hand = None;
-                        e.controls = [0.0; 2];
-                        i.scene.release(&e.id);
-                    }
+                let controlled: Vec<_> = i
+                    .entities
+                    .iter()
+                    .filter(|(_, entity)| entity.controller.as_deref() == Some(user))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in controlled {
+                    i.release_control(&id, "disconnect");
                 }
                 i.dispatch("leave", json!({"id":user}));
-                i.interactions.retain(|_, interaction| {
-                    interaction.actor != user && interaction.target != user
-                });
+                let released = i
+                    .interactions
+                    .iter()
+                    .filter(|(_, interaction)| {
+                        interaction.actor == user || interaction.target == user
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                i.release_contacts(released, "disconnect");
             }
             !i.players.is_empty()
         });
@@ -1149,6 +1341,667 @@ mod tests {
     fn manifest() -> Manifest {
         serde_json::from_value(json!({"schema":1,"kind":"world","name":"Test","scene":"world.glb"}))
             .unwrap()
+    }
+    #[test]
+    fn private_invitation_identity_expiry_consumption_and_visibility() {
+        let mut registry = Registry::default();
+        let base = Join {
+            world: "world".into(),
+            send_divisor: 1,
+            receive_divisor: 1,
+            ..Join::default()
+        };
+        let mut definition = manifest();
+        definition.capacity = 2;
+        let private = registry
+            .admit(
+                &Join {
+                    private: true,
+                    ..base.clone()
+                },
+                "a",
+                "A",
+                "v1",
+                definition.clone(),
+                vec![],
+            )
+            .unwrap();
+        let public = registry
+            .admit(&base, "c", "C", "public", manifest(), vec![])
+            .unwrap();
+        assert!(
+            !registry
+                .list("b")
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["id"] == private)
+        );
+        assert!(
+            registry
+                .list("a")
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["id"] == private)
+        );
+        registry
+            .instances
+            .get_mut(&private)
+            .unwrap()
+            .invitations
+            .insert("valid".into(), ("b".into(), db::now() + 300));
+        registry
+            .instances
+            .get_mut(&private)
+            .unwrap()
+            .invitations
+            .insert("expired".into(), ("b".into(), db::now() - 1));
+        let request = Join {
+            instance: private.clone(),
+            invitation: "valid".into(),
+            ..base.clone()
+        };
+        assert!(
+            registry
+                .admit(&request, "c", "C", "ignored", manifest(), vec![])
+                .is_err()
+        );
+        assert!(registry.instances[&public].players.contains_key("c"));
+        assert!(
+            registry.instances[&private]
+                .invitations
+                .contains_key("valid")
+        );
+        assert!(
+            registry
+                .admit(
+                    &Join {
+                        invitation: "expired".into(),
+                        ..request.clone()
+                    },
+                    "b",
+                    "B",
+                    "ignored",
+                    manifest(),
+                    vec![]
+                )
+                .is_err()
+        );
+        let mut changed = manifest();
+        changed.name = "Changed publication".into();
+        registry
+            .admit(&request, "b", "B", "v2", changed, vec![])
+            .unwrap();
+        assert!(
+            !registry.instances[&private]
+                .invitations
+                .contains_key("valid")
+        );
+        assert_eq!(registry.instances[&private].version, "v1");
+        assert_eq!(registry.instances[&private].manifest.name, definition.name);
+        assert!(
+            registry
+                .list("b")
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["id"] == private)
+        );
+        registry
+            .instances
+            .get_mut(&private)
+            .unwrap()
+            .invitations
+            .insert("for-c".into(), ("c".into(), db::now() + 300));
+        assert!(
+            registry
+                .admit(
+                    &Join {
+                        invitation: "for-c".into(),
+                        ..request.clone()
+                    },
+                    "c",
+                    "C",
+                    "ignored",
+                    manifest(),
+                    vec![]
+                )
+                .is_err()
+        );
+        assert!(
+            registry.instances[&private]
+                .invitations
+                .contains_key("for-c")
+        );
+        assert!(registry.instances[&public].players.contains_key("c"));
+        registry.leave("a");
+        registry
+            .admit(
+                &Join {
+                    invitation: String::new(),
+                    ..request.clone()
+                },
+                "a",
+                "A",
+                "ignored",
+                manifest(),
+                vec![],
+            )
+            .unwrap();
+        registry
+            .admit(
+                &Join {
+                    instance: public.clone(),
+                    ..base
+                },
+                "b",
+                "B",
+                "ignored",
+                manifest(),
+                vec![],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .admit(&request, "b", "B", "ignored", manifest(), vec![])
+                .is_err(),
+            "Invitation reuse must fail after leaving"
+        );
+        assert!(registry.instances[&public].players.contains_key("b"));
+        registry.leave("a");
+        assert!(!registry.instances.contains_key(&private));
+        assert!(
+            registry
+                .admit(
+                    &Join {
+                        invitation: "for-c".into(),
+                        ..request
+                    },
+                    "c",
+                    "C",
+                    "ignored",
+                    manifest(),
+                    vec![]
+                )
+                .is_err()
+        );
+        assert!(registry.instances[&public].players.contains_key("c"));
+    }
+    #[test]
+    fn failed_instance_transition_preserves_existing_membership_and_state() {
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            send_divisor: 1,
+            receive_divisor: 1,
+            ..Join::default()
+        };
+        let shared = registry
+            .admit(&join, "a", "A", "v1", manifest(), vec![])
+            .unwrap();
+        registry
+            .admit(
+                &Join {
+                    instance: shared.clone(),
+                    ..join.clone()
+                },
+                "b",
+                "B",
+                "ignored",
+                manifest(),
+                vec![],
+            )
+            .unwrap();
+        let mut solo = String::new();
+        for index in 0..63 {
+            let id = registry
+                .admit(
+                    &join,
+                    &format!("solo{index}"),
+                    "Solo",
+                    "v1",
+                    manifest(),
+                    vec![],
+                )
+                .unwrap();
+            if index == 0 {
+                solo = id;
+            }
+        }
+        let revision = registry.instances[&shared].revision;
+        assert!(
+            registry
+                .admit(&join, "a", "A", "v2", manifest(), vec![])
+                .is_err()
+        );
+        assert!(registry.instances[&shared].players.contains_key("a"));
+        assert_eq!(registry.instances[&shared].revision, revision);
+        let replacement = registry
+            .admit(&join, "solo0", "Solo", "v2", manifest(), vec![])
+            .unwrap();
+        assert!(!registry.instances.contains_key(&solo));
+        assert_eq!(registry.instances.len(), 64);
+        assert_eq!(registry.instances[&replacement].version, "v2");
+        registry.leave("solo1");
+        let tags: Vec<_> = (0..16)
+            .map(|i| format!("tag{i:02}{}", "x".repeat(27)))
+            .collect();
+        let invalid: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"Oversized tags","scene":"world.glb",
+            "objects":(0..200).map(|i| json!({"id":format!("object{i}"),"component":"static","tags":tags})).collect::<Vec<_>>() })).unwrap();
+        assert!(
+            registry
+                .admit(&join, "a", "A", "invalid", invalid, vec![])
+                .is_err()
+        );
+        assert!(registry.instances[&shared].players.contains_key("a"));
+        assert_eq!(registry.instances[&shared].revision, revision);
+    }
+    #[test]
+    fn live_reconnect_preserves_state_and_releases_old_constraints() {
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            private: true,
+            send_divisor: 1,
+            receive_divisor: 1,
+            ..Join::default()
+        };
+        let definition: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"Reconnect","scene":"world.glb","capacity":2,
+            "objects":[{"id":"prop","component":"prop","position":[-1,1,0],"physics":{"size":[0.2,0.2,0.2]}}]})).unwrap();
+        let id = registry
+            .admit(&join, "a", "A", "v1", definition.clone(), vec![])
+            .unwrap();
+        registry
+            .instances
+            .get_mut(&id)
+            .unwrap()
+            .invitations
+            .insert("invite".into(), ("b".into(), db::now() + 300));
+        registry
+            .admit(
+                &Join {
+                    instance: id.clone(),
+                    invitation: "invite".into(),
+                    ..join.clone()
+                },
+                "b",
+                "B",
+                "ignored",
+                definition,
+                vec![],
+            )
+            .unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance.scores.insert("a".into(), 37);
+        instance
+            .set_avatar("a", Some(("avatar".into(), "avatar-version".into())))
+            .unwrap();
+        instance
+            .players
+            .get_mut("a")
+            .unwrap()
+            .avatar_actions
+            .insert("happy".into(), 1.0);
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        instance.tick();
+        instance.interactions.insert(
+            "a:0".into(),
+            Interaction {
+                actor: "a".into(),
+                target: "b".into(),
+                bone: "Hair".into(),
+                segment: "hair".into(),
+                hand: 0,
+            },
+        );
+        let pose = instance.players["a"].pose.clone();
+        let resumed = registry
+            .admit(
+                &Join {
+                    instance: id.clone(),
+                    invitation: String::new(),
+                    ..join.clone()
+                },
+                "a",
+                "A renamed",
+                "ignored",
+                manifest(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(resumed, id);
+        let instance = registry.instances.get_mut(&id).unwrap();
+        assert_eq!(instance.players.len(), 2);
+        assert_eq!(instance.scores["a"], 37);
+        assert_eq!(instance.players["a"].pose, pose);
+        assert_eq!(
+            instance.players["a"].avatar_version.as_deref(),
+            Some("avatar-version")
+        );
+        assert_eq!(instance.players["a"].avatar_actions["happy"], 1.0);
+        assert_eq!(instance.players["a"].name, "A renamed");
+        assert!(instance.entities["prop"].controller.is_none() && instance.interactions.is_empty());
+        assert_eq!(
+            instance.scene.body_mut("prop").unwrap().body_type(),
+            rapier3d::prelude::RigidBodyType::Dynamic
+        );
+        assert_eq!(
+            registry
+                .admit(
+                    &Join {
+                        instance: id.clone(),
+                        invitation: String::new(),
+                        ..join
+                    },
+                    "b",
+                    "B",
+                    "ignored",
+                    manifest(),
+                    vec![]
+                )
+                .unwrap(),
+            id,
+            "An existing invited member can reconnect to a full private instance without reusing its consumed invitation"
+        );
+    }
+    #[test]
+    fn tag_queries_are_paginated_stable_and_detached() {
+        let mut context = Context::default();
+        for index in 0..600 {
+            let id = format!("obj{index:04}");
+            context.objects.insert(
+                id.clone(),
+                json!({"id":id,"tags":["game.enemy"],"visible":true}),
+            );
+        }
+        let source = r#"
+            local page, cursor = 0, nil
+            world.on('tick', function()
+                page += 1
+                if page <= 3 then
+                    local ids, next = world.find_tag('game.enemy', cursor)
+                    if page == 1 then assert(#ids == 256 and ids[1] == 'obj0000' and next == 'obj0255') end
+                    if page == 2 then assert(#ids == 256 and ids[1] == 'obj0256' and next == 'obj0511') end
+                    if page == 3 then assert(#ids == 88 and ids[88] == 'obj0599' and next == nil) end
+                    cursor = next
+                else
+                    local missing, done = world.find_tag('missing')
+                    assert(#missing == 0 and done == nil)
+                    local object = world.object('obj0000'); object.visible = false; object.tags[1] = 'changed'
+                    assert(world.object('obj0000').visible == true and world.object('obj0000').tags[1] == 'game.enemy')
+                    assert(not pcall(function() world.find_tag('bad/tag') end))
+                    assert(not pcall(function() world.find_tag('game.enemy', string.rep('x',65)) end))
+                end
+            end)
+        "#;
+        let script = Sandbox::with_context(
+            source,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            &[],
+            Arc::new(Mutex::new(context)),
+            Arc::new(BTreeMap::new()),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            script.event("tick", &json!({"dt":1.0/60.0})).unwrap();
+        }
+    }
+    #[test]
+    fn entity_tags_inherit_from_packaged_prefabs_and_refresh_after_destroy() {
+        let definition: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"Tags","scene":"world.glb",
+            "prefabs":{"crate":{"scene":"crate.glb","component":"prop","tags":["shared","base"],"physics":{"size":[1,1,1]}}},
+            "objects":[{"id":"authored","component":"prop","prefab":"crate","tags":["shared","switch"]}]})).unwrap();
+        let mut instance = Instance::create(
+            "tags".into(),
+            &Join::default(),
+            "hash".into(),
+            "owner".into(),
+            definition,
+            vec![],
+            60,
+        )
+        .unwrap();
+        assert_eq!(
+            instance.entities["authored"].tags,
+            ["base", "shared", "switch"]
+        );
+        instance
+            .spawn("spawned".into(), "crate", Spawn::default())
+            .unwrap();
+        assert_eq!(instance.entities["spawned"].tags, ["base", "shared"]);
+        instance.refresh_context();
+        assert_eq!(
+            instance.context.lock().unwrap().objects["spawned"]["tags"],
+            json!(["base", "shared"])
+        );
+        instance.destroy("spawned");
+        instance.refresh_context();
+        assert!(
+            !instance
+                .context
+                .lock()
+                .unwrap()
+                .objects
+                .contains_key("spawned")
+        );
+    }
+    #[test]
+    fn spawning_cannot_expand_tags_past_the_live_budget() {
+        let tags: Vec<_> = (0..16)
+            .map(|i| format!("tag{i:02}{}", "x".repeat(27)))
+            .collect();
+        let definition: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"Tags","scene":"world.glb",
+            "prefabs":{"crate":{"scene":"crate.glb","component":"prop","tags":tags,"physics":{"dynamic":false,"size":[1,1,1]}}}})).unwrap();
+        let cost = crate::assets::tag_bytes(&tags);
+        let mut instance = Instance::create(
+            "tags".into(),
+            &Join::default(),
+            "hash".into(),
+            "owner".into(),
+            definition,
+            vec![],
+            60,
+        )
+        .unwrap();
+        let count = crate::assets::MAX_ENTITY_TAG_BYTES / cost;
+        for i in 0..count {
+            instance
+                .spawn(format!("tag-{i}"), "crate", Spawn::default())
+                .unwrap();
+        }
+        assert_eq!(instance.tag_bytes, count * cost);
+        assert!(
+            instance
+                .spawn("overflow".into(), "crate", Spawn::default())
+                .is_err()
+        );
+        assert!(!instance.entities.contains_key("overflow"));
+        assert!(instance.scene.body_mut("overflow").is_none());
+        instance.destroy("tag-0");
+        assert_eq!(instance.tag_bytes, (count - 1) * cost);
+        instance
+            .spawn("recovered".into(), "crate", Spawn::default())
+            .unwrap();
+        assert_eq!(instance.tag_bytes, count * cost);
+    }
+    #[test]
+    fn control_events_cover_renewal_handoff_expiry_destruction_and_disconnect() {
+        let definition: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"Control events","scene":"world.glb",
+            "variables":{"history":{"type":"string","default":"","max_bytes":4096}},
+            "objects":[{"id":"car","component":"vehicle","position":[1,0.5,-1],"physics":{"size":[1,1,1]}},
+                {"id":"prop","component":"prop","position":[-1,1,0],"physics":{"size":[0.2,0.2,0.2]}},
+                {"id":"fixed","component":"static","position":[0,-0.1,0],"size":[20,0.2,20]},
+                {"id":"handoff","component":"switch","position":[0,1.2,-1]}],
+            "scripts":[{"path":"events.luau","side":"server","attachment":"world","capabilities":["state","objects"]}]})).unwrap();
+        let source = r#"
+            for _, name in ipairs({'grab','lease','release'}) do
+                world.on(name, function(e)
+                    assert(e.kind == 'object' and e.event == name)
+                    world.state.set('history', world.state.get('history') .. name .. ':' .. e.reason .. ':' .. e.actor .. ':' .. e.mode .. ';')
+                end)
+            end
+            world.on_interact('handoff', function() world.lease('prop','b') end)
+        "#;
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            send_divisor: 1,
+            receive_divisor: 1,
+            ..Join::default()
+        };
+        let id = registry
+            .admit(
+                &join,
+                "a",
+                "A",
+                "hash",
+                definition.clone(),
+                vec![source.into()],
+            )
+            .unwrap();
+        registry
+            .admit(
+                &Join {
+                    instance: id.clone(),
+                    ..join
+                },
+                "b",
+                "B",
+                "hash",
+                definition,
+                vec![],
+            )
+            .unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            instance
+                .action(
+                    "b",
+                    Action::Grab {
+                        target: "prop".into(),
+                        hand: 0
+                    }
+                )
+                .is_err()
+        );
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            instance.creator_events.len(),
+            1,
+            "Lease renewal must not duplicate acquisition events"
+        );
+        instance.tick();
+        assert_eq!(
+            instance.variables.lock().unwrap()["history"],
+            "grab:explicit:a:grab;"
+        );
+        instance
+            .action(
+                "a",
+                Action::Release {
+                    target: "prop".into(),
+                },
+            )
+            .unwrap();
+        instance.tick();
+        instance
+            .action(
+                "a",
+                Action::Lease {
+                    target: "car".into(),
+                },
+            )
+            .unwrap();
+        instance.tick();
+        instance.entities.get_mut("car").unwrap().lease_until = instance.clock + 1;
+        instance.tick();
+        assert!(instance.entities["car"].controller.is_none());
+        assert!(
+            instance.variables.lock().unwrap()["history"]
+                .as_str()
+                .unwrap()
+                .ends_with("release:lease_expired:a:lease;")
+        );
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        instance.interact("a", "handoff").unwrap();
+        assert_eq!(instance.entities["prop"].controller.as_deref(), Some("b"));
+        assert!(
+            instance.entities["prop"].held_hand.is_none(),
+            "Script handoff must release the previous hand constraint"
+        );
+        assert_eq!(
+            instance.scene.body_mut("prop").unwrap().body_type(),
+            rapier3d::prelude::RigidBodyType::Dynamic
+        );
+        instance.tick();
+        assert!(
+            instance.variables.lock().unwrap()["history"]
+                .as_str()
+                .unwrap()
+                .ends_with("release:handoff:a:grab;lease:script:b:lease;")
+        );
+        assert!(instance.set_control("fixed", "a", None, "script").is_err());
+        instance.destroy("prop");
+        instance.tick();
+        assert!(
+            instance.variables.lock().unwrap()["history"]
+                .as_str()
+                .unwrap()
+                .ends_with("release:destroy:b:lease;")
+        );
+        instance
+            .action(
+                "a",
+                Action::Lease {
+                    target: "car".into(),
+                },
+            )
+            .unwrap();
+        registry.leave("a");
+        registry.step();
+        let instance = &registry.instances[&id];
+        assert!(instance.entities["car"].controller.is_none());
+        assert!(
+            instance.variables.lock().unwrap()["history"]
+                .as_str()
+                .unwrap()
+                .ends_with("release:disconnect:a:lease;")
+        );
+        assert!(instance.context.lock().unwrap().interaction_actor.is_none());
     }
     #[test]
     fn damage_destroy_events_are_deferred_bounded_and_nonrecursive() {
@@ -1220,6 +2073,126 @@ mod tests {
             r.admit(&other, "a", "A", "hash", manifest(), vec![])
                 .is_err()
         );
+    }
+    #[test]
+    fn automatic_contact_release_notifies_scripts_after_disconnect() {
+        let mut definition = manifest();
+        definition.variables.insert(
+            "released".into(),
+            crate::assets::StateVariable::Boolean { default: false },
+        );
+        definition.scripts = serde_json::from_value(json!([{"path":"release.luau","side":"server","attachment":"world","capabilities":["state"]}])).unwrap();
+        let source = "world.on('release', function(e) assert(e.actor == 'a' and e.target == 'b' and e.segment == 'hair' and e.hand == 0 and (e.reason == 'disconnect' or e.reason == 'policy' or e.reason == 'avatar_change')); world.state.set('released', true) end)";
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            send_divisor: 1,
+            receive_divisor: 1,
+            ..Join::default()
+        };
+        let id = registry
+            .admit(
+                &join,
+                "a",
+                "A",
+                "hash",
+                definition.clone(),
+                vec![source.into()],
+            )
+            .unwrap();
+        registry
+            .admit(
+                &Join {
+                    instance: id.clone(),
+                    ..join
+                },
+                "b",
+                "B",
+                "hash",
+                definition,
+                vec![],
+            )
+            .unwrap();
+        registry
+            .instances
+            .get_mut(&id)
+            .unwrap()
+            .interactions
+            .insert(
+                "a:0".into(),
+                Interaction {
+                    actor: "a".into(),
+                    target: "b".into(),
+                    segment: "hair".into(),
+                    bone: "Hair".into(),
+                    hand: 0,
+                },
+            );
+        registry.leave("a");
+        let instance = &registry.instances[&id];
+        assert!(instance.interactions.is_empty());
+        assert_eq!(instance.creator_events[0]["reason"], "disconnect");
+        assert_eq!(instance.variables.lock().unwrap()["released"], false);
+        registry.step();
+        assert_eq!(
+            registry.instances[&id].variables.lock().unwrap()["released"],
+            true
+        );
+        assert!(
+            registry.instances[&id]
+                .context
+                .lock()
+                .unwrap()
+                .interaction_actor
+                .is_none()
+        );
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance
+            .variables
+            .lock()
+            .unwrap()
+            .insert("released".into(), json!(false));
+        instance.interactions.insert(
+            "a:0".into(),
+            Interaction {
+                actor: "a".into(),
+                target: "b".into(),
+                segment: "hair".into(),
+                bone: "Hair".into(),
+                hand: 0,
+            },
+        );
+        instance.release_contacts(vec!["missing".into(), "a:0".into(), "a:0".into()], "policy");
+        assert_eq!(instance.creator_events.len(), 1);
+        assert_eq!(instance.creator_events[0]["reason"], "policy");
+        instance.tick();
+        assert_eq!(instance.variables.lock().unwrap()["released"], true);
+        let grab = Interaction {
+            actor: "a".into(),
+            target: "b".into(),
+            segment: "hair".into(),
+            bone: "Hair".into(),
+            hand: 0,
+        };
+        instance.interactions.insert("a:0".into(), grab.clone());
+        instance
+            .set_avatar("b", Some(("avatar".into(), "version".into())))
+            .unwrap();
+        assert!(instance.interactions.is_empty());
+        assert_eq!(instance.creator_events[0]["reason"], "avatar_change");
+        instance.tick();
+        instance.interactions.insert("a:0".into(), grab);
+        instance
+            .set_avatar("b", Some(("avatar".into(), "version".into())))
+            .unwrap();
+        assert_eq!(
+            instance.interactions.len(),
+            1,
+            "Reselecting the same immutable avatar must not release grabs"
+        );
+        assert!(instance.creator_events.is_empty());
+        instance.set_avatar("b", None).unwrap();
+        assert!(instance.interactions.is_empty());
     }
     #[test]
     fn sandbox_budget_and_state() {

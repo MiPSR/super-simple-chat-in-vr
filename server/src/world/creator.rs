@@ -82,6 +82,7 @@ pub fn install(
                     | "collision"
                     | "touch"
                     | "grab"
+                    | "lease"
                     | "release"
                     | "damage"
                     | "destroy"
@@ -105,6 +106,38 @@ pub fn install(
                     .cloned()
                     .unwrap_or(Value::Null),
             )
+        })?,
+    )?;
+    let scene = context.clone();
+    world.set(
+        "find_tag",
+        lua.create_function(move |lua, (tag, after): (String, Option<String>)| {
+            if !crate::assets::valid_tag(&tag) || after.as_ref().is_some_and(|id| id.len() > 64) {
+                return Err(mlua::Error::RuntimeError(
+                    "Invalid object tag/query cursor".into(),
+                ));
+            }
+            let context = scene.lock().unwrap();
+            let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+            let mut ids: Vec<String> = context
+                .objects
+                .range((start, std::ops::Bound::Unbounded))
+                .filter(|(_, object)| {
+                    object["tags"].as_array().is_some_and(|tags| {
+                        tags.iter()
+                            .any(|value| value.as_str() == Some(tag.as_str()))
+                    })
+                })
+                .take(257)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let next = if ids.len() > 256 {
+                ids.pop();
+                ids.last().cloned()
+            } else {
+                None
+            };
+            Ok((lua.to_value(&ids)?, next))
         })?,
     )?;
     if capabilities.iter().any(|c| c == "media") {

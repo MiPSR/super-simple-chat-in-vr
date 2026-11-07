@@ -48,10 +48,11 @@ pub fn apply(
                 .is_some_and(|g| g.actor == actor && g.target == request.target),
             "No owned grab"
         );
-        instance.interactions.remove(&id);
+        let grab = instance.interactions.remove(&id).unwrap();
         instance.revision += 1;
         return Ok(
-            json!({"action":"release","actor":actor,"target":request.target,"hand":request.hand}),
+            json!({"action":"release","kind":"avatar","actor":actor,"target":request.target,"hand":request.hand,
+                "segment":grab.segment,"bone":grab.bone,"reason":"explicit","clock":instance.clock}),
         );
     }
     anyhow::ensure!(
@@ -156,7 +157,7 @@ pub fn apply(
         instance.revision += 1;
     }
     Ok(
-        json!({"action":request.action,"actor":actor,"target":request.target,"segment":request.segment,"bone":collider.bone,"hand":request.hand}),
+        json!({"action":request.action,"kind":"avatar","actor":actor,"target":request.target,"segment":request.segment,"bone":collider.bone,"hand":request.hand}),
     )
 }
 pub fn prune(app: &App, instance: &mut Instance) {
@@ -164,13 +165,16 @@ pub fn prune(app: &App, instance: &mut Instance) {
         return;
     }
     let db = app.db.lock().unwrap();
-    let before = instance.interactions.len();
-    instance.interactions.retain(|_, g| {
-        allowed(&db, &g.actor, &g.target)
-            && instance.players.contains_key(&g.actor)
-            && instance.players.contains_key(&g.target)
-    });
-    if instance.interactions.len() != before {
-        instance.revision += 1;
-    }
+    let released = instance
+        .interactions
+        .iter()
+        .filter(|(_, g)| {
+            !allowed(&db, &g.actor, &g.target)
+                || !instance.players.contains_key(&g.actor)
+                || !instance.players.contains_key(&g.target)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    drop(db);
+    instance.release_contacts(released, "policy");
 }

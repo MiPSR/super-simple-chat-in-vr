@@ -110,8 +110,8 @@ Common APIs:
   the authenticated initiator. The server checks membership and reach first.
 - `world.on(event, function(data) ... end)` currently dispatches `join`, `leave`,
   `tick` (`dt`, `clock`), `collision` (`a`, `b`, `clock`), and authorized avatar
-  `touch`/`grab`/explicit `release` requests. Automatic contact cleanup is not
-  yet a corresponding script notification.
+  `touch`/`grab`/explicit `release` requests. Explicit release includes the held
+  segment/bone and `reason="explicit"`.
 - Authoritative `damage` (`target`, `amount`, `health`, `actor`, `clock`) and
   `destroy` (`target`, `clock`) notifications are queued rather than recursively
   calling scripts while applying commands. Damage precedes destruction for a
@@ -121,6 +121,27 @@ Common APIs:
   yield between dispatches in addition to each VM's CPU watchdog. Overload drops
   newest notifications with a bounded diagnostic, not authoritative state changes.
   These callbacks do not grant an authenticated radio-transmission identity.
+- Automatic avatar-contact release on disconnect or permission/block cleanup
+  uses the same bounded deferred queue, with `reason="disconnect"` or `"policy"`
+  and the original actor/target/segment/bone/hand. Constraints are removed before
+  notification. Changing/removing the target's immutable equipped avatar also
+  releases old-bone grabs with `reason="avatar_change"`; reselecting the same
+  version keeps them. Client avatar/world scripts also receive releases when an
+  authenticated viewer-filtered snapshot removes or replaces an existing grab,
+  with `reason="snapshot"` and `snapshot_tick` (not an invented server clock or
+  policy reason). Explicit release packets are deduplicated against subsequent
+  snapshots. Callbacks cannot revive constraints or bypass permissions. Unloaded/
+  blocked avatar VMs are torn down rather than kept alive for notifications.
+- Server prop/vehicle control emits deferred `grab`, `lease` and `release`
+  callbacks through the same bounded queue. Object events have `kind="object"`,
+  `target`, `actor`, `clock`, `mode="grab"|"lease"`, and a hand index or `nil`.
+  Avatar contact events have `kind="avatar"`. Acquisition reasons are `explicit`
+  or `script`; release reasons are `explicit`, `handoff`, `lease_expired`,
+  `disconnect` or `destroy`. Renewing the same holder/mode does not duplicate an
+  acquisition notification. Scripted handoff first releases the old hand/physics
+  constraint, then acquires the new lease. Static entities cannot be leased.
+  Events describe committed outcomes; by callback time the current holder may
+  already differ. Client Lua object-control event parity remains unfinished.
 - Both hosts expose `world.after(seconds, function() ... end)` and
   `world.cancel_timer(id)`; client avatar scripts can use the `avatar` alias.
   Timers are VM-local one-shots, at most 64 pending, with finite delays in
@@ -132,6 +153,22 @@ Common APIs:
   a timer from an interaction does not preserve an authenticated radio identity.
 - `world.object(id)` returns a detached read-only-in-effect snapshot: editing the
   returned table cannot change the world.
+- Server-world `world.find_tag(tag, after_id?)` returns two values: up to 256
+  matching stable object IDs in lexical order, and a continuation ID or `nil`.
+  Pass the continuation into the next call to enumerate larger matches. Queries
+  within one dispatch see the same snapshot; queued commands become visible on
+  a subsequent dispatch. Queries consume the existing CPU watchdog budget;
+  large enumerations can page across ticks, but those pages are not an atomic
+  multi-tick snapshot. Returned IDs/tables cannot change shared state.
+  Object and prefab declarations accept optional `tags` arrays, at most 16 unique
+  case-sensitive names each, using 1–32 ASCII letters/digits or `_-.`. Authored
+  objects inherit their prefab's tags; spawned entities inherit packaged prefab
+  tags. Merged entity tags are sorted/deduplicated. Publication caps authored/
+  inherited declarations and prefab declarations at 64 KiB each; each instance
+  also enforces a 64 KiB live serialized-tag budget, including dynamic spawns.
+  Destruction releases that budget. This does not bound complete snapshots or
+  replace broader entity/importer/network allocation limits. Client Lua query
+  context/API parity remains unfinished.
 - With `state`: `world.state.get(key)` / `world.state.set(key,value)` read/write
   explicitly declared, typed instance variables. Undeclared keys, incompatible
   types and out-of-range values error without changing the variable. Clients

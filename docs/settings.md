@@ -15,6 +15,8 @@ defaults for newly introduced fields. The server rejects invalid ranges/options.
 | `upscaler` | `bilinear`, `fsr1`; bilinear |
 | `texture_lod_bias` | Coarser texture sampling bias 0–3; 0 |
 | `texture_reduction` | Original/half/quarter/eighth dimensions as 0/1/2/3; 0; next package load |
+| `radial_hold_seconds` | Quick-menu long-press threshold 0.15–1.5 seconds; 0.45 |
+| `radial_actions` | Eight action IDs in clockwise stick-sector order; original eight bindings by default |
 | `radio_preset` | `standard`, `narrow`, `weak`; standard, subject to admin allowlist |
 | `quality` | Existing basic/standard/advanced material tiers 0/1/2; 1 |
 | `send_divisor`, `receive_divisor` | Independent 1/2/4 divisors; 1 |
@@ -41,6 +43,19 @@ defaults for newly introduced fields. The server rejects invalid ranges/options.
   does not implement live rate adaptation, administrator rate ceilings or tick
   aggregation. An already open website may need refreshing to load newer account
   preferences before generating its next grant.
+
+## Quick-menu bindings
+
+Phone and website controls configure all eight radial sectors and the hold delay.
+Allowed action IDs are `microphone`, `sleep`, `phone_hand`, `interact`,
+`avatar_action`, `video_pause`, `phone`, `leave`, and `none` (disabled). Repeated
+bindings are allowed. Unknown actions or arrays other than eight slots are
+rejected. Creators cannot supply arbitrary commands or replace these bindings.
+The central dead zone still cancels; a short press still toggles the phone.
+Bindings and timing are captured at button press so a preference update cannot
+change an active gesture. The phone-hand quick action now saves the preference
+through the same path as the phone button. Loading these settings never enables
+microphone capture. Tests use synthetic button events; XR usability remains open.
 
 ## Rendering limits and acceptance
 
