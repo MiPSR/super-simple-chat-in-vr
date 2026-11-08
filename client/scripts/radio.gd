@@ -174,7 +174,7 @@ func receive(event: Dictionary) -> void:
 		var key := id + ":" + str(event.sender)
 		if not receiver.streams.has(key) and receiver.streams.size() >= 32:
 			return
-		receiver._receive(key,int(event.sequence),0,str(event.data).hex_decode(),0)
+		receiver._receive(key,int(event.sequence),0,str(event.data).hex_decode(),0,int(event.get("epoch",0)))
 		if receiver.streams.has(key):
 			var state: Dictionary = receiver.streams[key]
 			state.player.global_position = device.node.global_position

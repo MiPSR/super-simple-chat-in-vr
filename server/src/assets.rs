@@ -1,3 +1,5 @@
+use crate::creator_objects::valid_tag;
+pub(crate) use crate::creator_objects::{MAX_TAG_BYTES as MAX_ENTITY_TAG_BYTES, tag_bytes};
 use crate::http::{ApiError, ApiResult};
 use serde::{Deserialize, Serialize};
 mod state;
@@ -142,18 +144,6 @@ pub struct Prefab {
     pub tags: Vec<String>,
     #[serde(default)]
     pub physics: Physics,
-}
-pub(crate) fn valid_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= 32
-        && tag
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
-}
-pub(crate) const MAX_ENTITY_TAG_BYTES: usize = 65536;
-pub(crate) fn tag_bytes(tags: &[String]) -> usize {
-    // Tags are ASCII without JSON escaping. Include separators/quotes and brackets.
-    tags.iter().map(|tag| tag.len() + 3).sum::<usize>() + 2
 }
 fn deserialize_tags<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -397,14 +387,10 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
             .map(|(key, value)| key.len() + value.default_value().to_string().len() + 4)
             .sum::<usize>()
             > REPLICATED_STATE_BYTES
-        || manifest.variables.iter().any(|(key, value)| {
-            key.is_empty()
-                || key.len() > 64
-                || !key
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-                || !value.valid()
-        })
+        || manifest
+            .variables
+            .iter()
+            .any(|(key, value)| !crate::creator_state::valid_key(key) || !value.valid())
     {
         return Err(ApiError::bad("Invalid replicated variable declaration"));
     }

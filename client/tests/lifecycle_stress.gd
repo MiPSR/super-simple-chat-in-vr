@@ -19,10 +19,10 @@ func _run() -> void:
 	zip.write_file(FileAccess.get_file_as_bytes(OS.get_environment("SSC_TEST_OPUS")))
 	zip.close_file()
 	zip.start_file("scripts/audio.luau")
-	zip.write_file('avatar.after(600, function() end); avatar.on("action", function() avatar.play_sound("tone") end)'.to_utf8_buffer())
+	zip.write_file('avatar.after(600, function() end); avatar.on("action", function() avatar.play_sound("tone"); avatar.bone_rotation("Head",0,0,0,1) end)'.to_utf8_buffer())
 	zip.close_file()
 	zip.close()
-	var declaration := {"sounds":[{"id":"tone","path":"audio/tone.opus","loop":true}],"scripts":[{"path":"scripts/audio.luau","side":"client","attachment":"avatar","capabilities":["audio"]}]}
+	var declaration := {"sounds":[{"id":"tone","path":"audio/tone.opus","loop":true}],"scripts":[{"path":"scripts/audio.luau","side":"client","attachment":"avatar","capabilities":["audio","visual"]}]}
 	var avatar := Avatar.new()
 	root.add_child(avatar)
 	var failures: Array[String] = []
@@ -31,15 +31,23 @@ func _run() -> void:
 	var baseline_objects := -1
 	for iteration in cycles:
 		var old_decoder: RefCounted
+		var old_modifier: WeakRef
 		if avatar.model:
 			old_decoder = avatar.model.get_meta("ssc_audio").clips.tone.decoder
-		avatar.set_model(Node3D.new(), path, declaration)
+			old_modifier = weakref(avatar.model.bone_modifier)
+		var model := Node3D.new()
+		var skeleton := Skeleton3D.new()
+		skeleton.add_bone("Head")
+		model.add_child(skeleton)
+		avatar.set_model(model, path, declaration)
 		if old_decoder:
 			assert(is_zero_approx(old_decoder.duration()), "Retired avatar retained an Opus decoder")
 		old_decoder = null
 		avatar.creator.dispatch("action", {"name":"play"})
 		await process_frame
 		await process_frame
+		assert(not old_modifier or old_modifier.get_ref() == null, "Retired avatar retained its bone overrides")
+		assert(avatar.model.bone_modifier.rotations.size() == 1)
 		assert(failures.is_empty(), "Repeated load failed: " + str(failures))
 		var audio: Node = avatar.model.get_meta("ssc_audio")
 		assert(audio.clips.size() == 1 and audio.clips.tone.playing)

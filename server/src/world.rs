@@ -682,6 +682,15 @@ impl Instance {
         Ok(())
     }
     fn queue_creator_event(&mut self, event: Value) {
+        // Object-control notifications are committed outcomes, not client requests.
+        // Publish even when no authoritative script subscribes to this event.
+        if event["kind"] == "object" {
+            if self.events.len() < 128 {
+                self.events.push(event.clone());
+            } else {
+                self.creator_event_overflow = true;
+            }
+        }
         let name = event["event"].as_str().unwrap_or("");
         if !self
             .scripts
@@ -1738,6 +1747,7 @@ mod tests {
                     assert(#missing == 0 and done == nil)
                     local object = world.object('obj0000'); object.visible = false; object.tags[1] = 'changed'
                     assert(world.object('obj0000').visible == true and world.object('obj0000').tags[1] == 'game.enemy')
+                    assert(world.object('missing') == nil)
                     assert(not pcall(function() world.find_tag('bad/tag') end))
                     assert(not pcall(function() world.find_tag('game.enemy', string.rep('x',65)) end))
                 end
@@ -1916,6 +1926,14 @@ mod tests {
             1,
             "Lease renewal must not duplicate acquisition events"
         );
+        assert_eq!(
+            instance
+                .events
+                .iter()
+                .filter(|event| event["event"] == "grab")
+                .count(),
+            1
+        );
         instance.tick();
         assert_eq!(
             instance.variables.lock().unwrap()["history"],
@@ -2002,6 +2020,26 @@ mod tests {
                 .ends_with("release:disconnect:a:lease;")
         );
         assert!(instance.context.lock().unwrap().interaction_actor.is_none());
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance.scripts.clear();
+        instance.events.clear();
+        instance.set_control("car", "b", None, "script").unwrap();
+        assert_eq!(
+            instance.events.len(),
+            1,
+            "Client delivery must not require a server subscriber"
+        );
+        assert_eq!(instance.events[0]["event"], "lease");
+        for _ in 0..200 {
+            instance.queue_creator_event(
+                json!({"event":"release","kind":"object","target":"car","actor":"b"}),
+            );
+        }
+        assert_eq!(
+            instance.events.len(),
+            128,
+            "Reliable object-control notifications must be bounded"
+        );
     }
     #[test]
     fn damage_destroy_events_are_deferred_bounded_and_nonrecursive() {

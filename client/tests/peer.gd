@@ -56,9 +56,9 @@ func _initialize() -> void:
 		radio_codec = ClassDB.instantiate("OpusCodec")
 		assert(radio_codec.configure(8000))
 	)
-	network.voice_packet.connect(func(user: String, sequence: int, _time: int, packet: PackedByteArray, route: int):
+	network.voice_packet.connect(func(user: String, sequence: int, _time: int, packet: PackedByteArray, route: int, epoch: int):
 		assert(codec.decode(packet).size() == 960)
-		print("SSCTEST " + JSON.stringify({"kind":20,"data":{"user":user,"sequence":sequence,"bytes":packet.size(),"route":route}}))
+		print("SSCTEST " + JSON.stringify({"kind":20,"data":{"user":user,"sequence":sequence,"bytes":packet.size(),"route":route,"epoch":str(epoch)}}))
 	)
 	network.connect_grant(config.grant)
 	started = Time.get_ticks_msec()

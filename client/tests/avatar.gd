@@ -9,6 +9,7 @@ var loader: Node
 var started := 0
 var loaded := false
 var tracking: Dictionary = {}
+var bone_checks := 0
 
 func _initialize() -> void:
 	started = Time.get_ticks_msec()
@@ -41,6 +42,13 @@ func _initialize() -> void:
 		avatar.set_model(model, loader.staging, loader.manifest)
 		assert(avatar.model.skeleton.get_bone_count() >= 16)
 		assert(avatar.model.solvers.size() == 4, "Native arm/leg IK chains missing")
+		var spring_index := -1
+		for node in avatar.model.skeleton.get_children(true):
+			if node.name == "VRM_internal_skeleton_modifier":
+				spring_index = node.get_index(true)
+		assert(spring_index >= 0, "VRM spring modifier missing")
+		assert(avatar.model.bone_modifier.get_index(true) > spring_index)
+		assert(avatar.model.grab_modifier.get_index(true) > avatar.model.bone_modifier.get_index(true))
 		avatar.set_actions({"happy":1.0})
 		var changed := false
 		var diagnostics: Array = []
@@ -50,6 +58,26 @@ func _initialize() -> void:
 			if index >= 0 and mesh.get_blend_shape_value(index) > 0.5:
 				changed = true
 		assert(changed, "Replicated expression did not reach a blend shape: " + str(diagnostics))
+		var head: int = avatar.model.bone("Head")
+		assert(head >= 0)
+		assert(avatar.model.creator_bone({"action":"bone_rotation","target":"Head","rotation":[0,1,0,0]}).is_empty())
+		avatar.model.bone_modifier._process_modification()
+		assert(avatar.model.skeleton.get_bone_pose_rotation(head).is_equal_approx(Quaternion(0,1,0,0)))
+		assert(avatar.model.creator_bone({"action":"reset_bone","target":"Head"}).is_empty())
+		assert(avatar.model.bone_modifier.rotations.is_empty())
+		avatar.creator._apply({"action":"spring_gravity","value":0.25}, "avatar")
+		assert(is_equal_approx(float(model.get_node("secondary").get("springbone_gravity_multiplier")), 0.25))
+		avatar.creator._apply({"action":"spring_gravity","value":1.0}, "world")
+		assert(is_equal_approx(float(model.get_node("secondary").get("springbone_gravity_multiplier")), 0.25))
+		avatar.creator._apply({"action":"spring_gravity","value":1.0}, "avatar")
+		var hair: int = avatar.model.bone("HairRoot")
+		assert(hair >= 0)
+		assert(avatar.model.creator_bone({"action":"reset_bone","target":"NotAHumanoidBone"}).begins_with("Unknown"))
+		assert(avatar.model.creator_bone({"action":"bone_rotation","target":"HairRoot","rotation":[0,1,0,0]}).is_empty())
+		avatar.model.grab_modifier.modification_processed.connect(func():
+			assert(avatar.model.skeleton.get_bone_pose_rotation(hair).is_equal_approx(Quaternion(0,1,0,0)), "Spring solver overwrote the creator bone rotation")
+			bone_checks += 1
+		)
 		loaded = true
 		started = Time.get_ticks_msec()
 	)
@@ -65,7 +93,8 @@ func _process(delta: float) -> bool:
 			quit(1)
 			return false
 		if Time.get_ticks_msec() - started > 300:
-			print("PASS VRM 1.0, expressions, spring bones, native limb IK, body-tracker inputs/fallback, and local/sleeping poses")
+			assert(bone_checks > 0, "Imported skeleton modifiers never processed")
+			print("PASS VRM expressions/springs, creator bones after springs, native IK, tracker fallback and sleeping poses")
 			runtime.close()
 			quit()
 	elif Time.get_ticks_msec() - started > 5000:

@@ -97,7 +97,10 @@ pub fn install(
     world.set(
         "object",
         lua.create_function(move |lua, id: String| {
-            lua.to_value(
+            if id.is_empty() || id.len() > 64 {
+                return Err(mlua::Error::RuntimeError("Invalid object ID".into()));
+            }
+            lua.to_value_with(
                 &scene
                     .lock()
                     .unwrap()
@@ -105,6 +108,9 @@ pub fn install(
                     .get(&id)
                     .cloned()
                     .unwrap_or(Value::Null),
+                mlua::SerializeOptions::new()
+                    .serialize_unit_to_null(false)
+                    .serialize_none_to_null(false),
             )
         })?,
     )?;
@@ -112,31 +118,9 @@ pub fn install(
     world.set(
         "find_tag",
         lua.create_function(move |lua, (tag, after): (String, Option<String>)| {
-            if !crate::assets::valid_tag(&tag) || after.as_ref().is_some_and(|id| id.len() > 64) {
-                return Err(mlua::Error::RuntimeError(
-                    "Invalid object tag/query cursor".into(),
-                ));
-            }
             let context = scene.lock().unwrap();
-            let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-            let mut ids: Vec<String> = context
-                .objects
-                .range((start, std::ops::Bound::Unbounded))
-                .filter(|(_, object)| {
-                    object["tags"].as_array().is_some_and(|tags| {
-                        tags.iter()
-                            .any(|value| value.as_str() == Some(tag.as_str()))
-                    })
-                })
-                .take(257)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let next = if ids.len() > 256 {
-                ids.pop();
-                ids.last().cloned()
-            } else {
-                None
-            };
+            let (ids, next) = crate::creator_objects::find_tag(&context.objects, &tag, after)
+                .map_err(|error| mlua::Error::RuntimeError(error.into()))?;
             Ok((lua.to_value(&ids)?, next))
         })?,
     )?;

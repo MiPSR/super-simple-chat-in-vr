@@ -63,9 +63,17 @@ func set_microphone(enabled: bool) -> void:
 		microphone.stop()
 	status.emit("Microphone on" if microphone_enabled else "Microphone muted")
 
-func _receive(user: String, serial: int, _timestamp: int, packet: PackedByteArray, route: int) -> void:
+func _receive(user: String, serial: int, _timestamp: int, packet: PackedByteArray, route: int, epoch: int = 0) -> void:
 	if not codec or user == network.user:
 		return
+	if streams.has(user):
+		var previous_epoch := int(streams[user].get("epoch",0))
+		if epoch < previous_epoch:
+			return
+		if epoch > previous_epoch:
+			streams[user].player.stop()
+			streams[user].player.queue_free()
+			streams.erase(user)
 	if not streams.has(user):
 		var decoder = ClassDB.instantiate("OpusCodec")
 		if not decoder.configure(bitrate):
@@ -79,16 +87,19 @@ func _receive(user: String, serial: int, _timestamp: int, packet: PackedByteArra
 		player.unit_size = 2
 		add_child(player)
 		player.play()
-		streams[user] = {"decoder":decoder,"player":player,"queue":[],"sequence":-1,"started":false,"elapsed":0.0,"loss":0}
+		streams[user] = {"decoder":decoder,"player":player,"queue":[],"sequence":-1,"started":false,"elapsed":0.0,"loss":0,"epoch":epoch}
 	var state: Dictionary = streams[user]
+	serial = serial & 0xffffffff
+	if int(state.sequence) >= 0:
+		var advance := (serial - int(state.sequence)) & 0xffffffff
+		if advance == 0 or advance >= 0x80000000:
+			return
+	state.sequence = serial
 	state.route = route
 	state.player.panning_strength = 0.0 if route == 1 else 1.0
 	state.player.max_distance = 0.0 if route == 1 else 30.0
 	state.player.volume_linear = 0.0 if Time.get_ticks_msec() < int(radio_suppressed.get(user,0)) else playback_gain
 	state.player.attenuation_model = AudioStreamPlayer3D.ATTENUATION_DISABLED if route == 1 else AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
-	if serial <= int(state.sequence):
-		return
-	state.sequence = serial
 	var queue: Array = state.queue
 	queue.append(packet)
 	while queue.size() > 6:

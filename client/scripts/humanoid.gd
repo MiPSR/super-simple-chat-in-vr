@@ -1,5 +1,6 @@
 extends Node3D
 const CosmeticGrab = preload("res://scripts/cosmetic_grab.gd")
+const CreatorBones = preload("res://scripts/creator_bones.gd")
 ## Native Godot limb IK over the importer's normalized humanoid bone mapping.
 var skeleton: Skeleton3D
 var targets: Dictionary = {}
@@ -12,6 +13,7 @@ var model_root: Node3D
 var floor_heights: Dictionary = {}
 var limb_solvers: Dictionary = {}
 var grab_modifier: SkeletonModifier3D
+var bone_modifier: SkeletonModifier3D
 
 func setup(model: Node3D) -> void:
 	model_root = model
@@ -29,11 +31,17 @@ func setup(model: Node3D) -> void:
 	for side in ["Left", "Right"]:
 		_limb(side + "UpperArm", side + "Hand")
 		_limb(side + "UpperLeg", side + "Foot")
+	bone_modifier = CreatorBones.new()
+	# The VRM importer places its spring modifier in INTERNAL_MODE_BACK.
+	# Append to that same group so our final constraints really run after it.
+	skeleton.add_child(bone_modifier, false, Node.INTERNAL_MODE_BACK)
 	grab_modifier = CosmeticGrab.new()
-	skeleton.add_child(grab_modifier)
+	skeleton.add_child(grab_modifier, false, Node.INTERNAL_MODE_BACK)
 
 func bone(name: String) -> int:
-	var mapped := bone_map.get_skeleton_bone_name(name) if bone_map else StringName(name)
+	# BoneMap logs an engine error for non-profile bones; ordinary authored
+	# accessories/hair must use the exact-skeleton fallback without that call.
+	var mapped := bone_map.get_skeleton_bone_name(name) if bone_map and bone_map.profile and bone_map.profile.find_bone(name) >= 0 else StringName(name)
 	var index := skeleton.find_bone(mapped)
 	return index if index >= 0 else skeleton.find_bone(name)
 
@@ -144,6 +152,27 @@ func creator_action(action: String, name: String, weight: float) -> void:
 				var index := mesh.find_blend_shape_by_name(path.get_subname(0))
 				if index >= 0:
 					mesh.set_blend_shape_value(index, float(animation.track_get_key_value(track,0)) * weight)
+
+func creator_bone(command: Dictionary) -> String:
+	if not skeleton or not bone_modifier:
+		return "Avatar has no editable skeleton"
+	var index := bone(str(command.target))
+	if index < 0:
+		return "Unknown avatar bone: " + str(command.target)
+	if command.action == "reset_bone":
+		bone_modifier.reset_bone(index)
+		return ""
+	var values: Array = command.rotation
+	return bone_modifier.rotate_bone(index, Quaternion(float(values[0]), float(values[1]), float(values[2]), float(values[3])))
+
+func creator_spring_gravity(multiplier: float) -> String:
+	if not is_finite(multiplier) or multiplier < -2 or multiplier > 2:
+		return "Invalid spring gravity multiplier"
+	var secondary := model_root.get_node_or_null("secondary") if model_root else null
+	if not secondary or secondary.get("springbone_gravity_multiplier") == null:
+		return "Avatar has no supported spring system"
+	secondary.set("springbone_gravity_multiplier", multiplier)
+	return ""
 
 func creator_tracking() -> Dictionary:
 	return sources.duplicate()

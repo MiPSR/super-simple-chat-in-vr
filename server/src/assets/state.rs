@@ -1,7 +1,7 @@
 //! Schema-1 explicitly replicated state; scripts cannot create undeclared keys.
+pub use crate::creator_state::REPLICATED_STATE_BYTES;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub const REPLICATED_STATE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

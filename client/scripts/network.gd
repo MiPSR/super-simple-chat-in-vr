@@ -1,7 +1,7 @@
 extends Node
 signal message(kind: int, data: Dictionary)
 signal status(text: String)
-signal voice_packet(user: String, sequence: int, timestamp: int, packet: PackedByteArray, route: int)
+signal voice_packet(user: String, sequence: int, timestamp: int, packet: PackedByteArray, route: int, epoch: int)
 signal negotiated(bitrate: int)
 const Cipher = preload("res://scripts/cipher.gd")
 var host: ENetConnection
@@ -68,8 +68,10 @@ func _process(delta: float) -> void:
 			ENetConnection.EVENT_NONE:
 				break
 			ENetConnection.EVENT_ERROR, ENetConnection.EVENT_DISCONNECT:
-				status.emit("Disconnected. Obtain a fresh grant; the instance survives only if someone remained.")
+				# service() has already retired the native peer on disconnect.
+				peer = null
 				close()
+				status.emit("Disconnected. Obtain a fresh grant; the instance survives only if someone remained.")
 				return
 			ENetConnection.EVENT_CONNECT:
 				var first: PackedByteArray = str(grant.ticket).to_utf8_buffer()
@@ -83,9 +85,7 @@ func _process(delta: float) -> void:
 					continue
 				since_packet = 0.0
 				if plain[0] == 20:
-					var size := int(plain[2]) if plain.size() > 2 else 0
-					if size > 0 and plain.size() >= 15 + size:
-						voice_packet.emit(plain.slice(3, 3 + size).get_string_from_utf8(), plain.decode_u32(3 + size), plain.decode_u64(7 + size), plain.slice(15 + size), int(plain[1]))
+					_decode_voice(plain)
 					continue
 				_decode(int(plain[0]), plain.slice(1))
 	if since_packet > 12.0:
@@ -93,6 +93,19 @@ func _process(delta: float) -> void:
 		close()
 		return
 	host.flush()
+
+func _decode_voice(plain: PackedByteArray) -> void:
+	# Bit 7 marks the epoch-bearing format; never mistake a legacy sequence or
+	# timestamp for an epoch. Only authenticated server frames reach this method.
+	if plain.size() < 3 or plain[0] != 20 or plain[1] not in [128,129]:
+		return
+	var size := int(plain[2])
+	if size < 1 or size > 64 or plain.size() <= 23 + size:
+		return
+	var epoch := plain.decode_u64(3 + size)
+	if epoch <= 0:
+		return
+	voice_packet.emit(plain.slice(3,3+size).get_string_from_utf8(), plain.decode_u32(11+size), plain.decode_u64(15+size), plain.slice(23+size), int(plain[1]) & 1, epoch)
 
 func _decode(kind: int, bytes: PackedByteArray) -> void:
 	var data = JSON.parse_string(bytes.get_string_from_utf8())

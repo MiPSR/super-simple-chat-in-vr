@@ -117,7 +117,7 @@ func _ready() -> void:
 		audio.load_package(loader.staging, loader.manifest.get("sounds", []))
 		for id in entity_data:
 			entity_nodes[id].configure(entity_data[id], loader.prefabs, quality, latest_tick)
-		creator.load_package(loader.staging, loader.manifest, root)
+		creator.load_package(loader.staging, loader.manifest, root, true)
 		_setup_video(loader.manifest)
 		acoustics.configure(loader.manifest.get("audio_zones", []), audio_effect_max)
 		radios.configure(loader.manifest.get("radios", []),radio_policy)
@@ -447,6 +447,9 @@ func _message(kind: int, data: Dictionary) -> void:
 		_update_players(snapshot.players.values(), int(snapshot.tick), true)
 		latest_tick = int(snapshot.tick)
 		entity_data = snapshot.entities
+		creator.world_queries = snapshot.manifest.get("scripts", []).any(func(s): return s.get("side") == "client")
+		creator.update_objects(entity_data, int(snapshot.tick))
+		creator.update_state(snapshot.get("variables", {}), int(snapshot.tick))
 		var next_contacts: Dictionary = snapshot.get("interactions", {})
 		for event in contact_events.replace(next_contacts):
 			event.snapshot_tick = int(snapshot.tick)
@@ -463,6 +466,7 @@ func _message(kind: int, data: Dictionary) -> void:
 		for id in entity_data:
 			_upsert_entity(entity_data[id], latest_tick)
 	elif kind == 3:
+		creator.update_transforms(data.get("entities", []), int(data.tick))
 		_update_media(data.get("media", {}))
 		_update_players(data.players, int(data.tick), false)
 		for entity in data.get("entities", []):
@@ -505,6 +509,8 @@ func _message(kind: int, data: Dictionary) -> void:
 					entity_nodes[id].queue_free()
 					entity_nodes.erase(id)
 				entity_data.erase(id)
+		creator.update_objects(entity_data, int(data.tick))
+		creator.queue_world_events(data.events)
 
 func _upsert_entity(data: Dictionary, tick: int) -> void:
 	var id := str(data.id)

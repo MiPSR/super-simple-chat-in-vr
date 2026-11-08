@@ -46,7 +46,13 @@ tests seed their own isolated temporary database sessions.
   regression and Clippy. These do not replace index-content validation,
   importer/GPU budgets or aggregate concurrent-upload limits.
 - Private instances/invitations: implemented; the full lifecycle/privacy matrix
-  still needs broader integration coverage.
+  now has registry tests for visibility, invitation identity/expiry/consumption,
+  full-instance rejection, owner/member return and empty-instance destruction.
+  Failed new-instance construction/capacity and private admission now preserve
+  previous membership/connections. Live takeover preserves authoritative state
+   and releases old constraints; real-peer tests pass. Voice epoch restarts and
+   stricter peer-error checks pass full local and combined Nix package checks.
+  Broader deployment/privacy acceptance remains.
 - Native OpenXR rig, smartphone/pointing, and tracker adapter: real hardware,
   focus loss/resume, standing/crouching/sitting/lying and comfort checks remain.
 - Material tiers apply to worlds/avatars, but the complete standardized advanced
@@ -96,7 +102,25 @@ tests seed their own isolated temporary database sessions.
   events now cover acquisition, explicit release, handoff, expiry, destruction
   and disconnect, with a hand-constraint cleanup fix. Their full local/Nix package
   checks pass, including omitted inapplicable hand fields so Lua sees `nil`.
-  client query API parity and complete object/light/material APIs remain.
+   Client-world shared JSON-only object/tag queries now compile cleanly and pass
+   targeted Godot tests for startup availability, detached tables, live poses,
+   stale graphs/deletion, isolation, nil semantics and teardown. Query-only
+   combined Nix packages and full local regression pass. Reliable client
+   control/damage/destruction events now pass local regression and combined Nix
+   package checks, including bounded deferred dispatch and real-peer lease/release
+   delivery. Avatar-local bounded bone rotation/reset and spring-gravity commands
+   pass full local native/Godot/VRM checks; 1000 avatar/audio/Luau replacement
+   cycles with bone overrides pass bounded settled-count/teardown checks.
+   Actual imported-VRM modifier ordering is now checked: bone overrides and
+   cosmetic grabs follow the importer's internal spring modifier. Custom hair
+   bone lookup now bypasses invalid humanoid-profile queries without engine errors.
+   Read-only client-world `world.state.get` now passes full local regression and
+   combined Nix client/server package checks, including startup, detached-vector,
+   false/nil, stale-tick and teardown checks. The subsequent modifier-order and
+   custom-bone lookup fixes pass local integration, another 1000-cycle stress
+   run and combined Nix client/server package checks. Avatar
+   own-node queries and complete
+   object/light/material APIs remain.
 
 ## Not yet complete
 
@@ -132,9 +156,12 @@ tests seed their own isolated temporary database sessions.
 - Full administration/settings acceptance, rate adaptation/aggregation policy,
   complete resource budgets and immutable-version garbage collection. Completed
   client ZIP-cache eviction now has 1 GiB/128-file limits, in-memory recency,
-  import pins, safe filename/symlink handling and focused tests; real-import and
-  full regression/package verification is running. Partial-file crash cleanup
-  and cross-process coordination remain; see [asset-cache.md](asset-cache.md).
+  import pins, safe filename/symlink handling and focused/real-import tests.
+  Full local/Nix package checks pass for completed ZIP eviction. Process-owned
+  random partial filenames and dead-process cleanup pass full local and combined
+  Nix package checks (subsequent stricter filename parsing has targeted coverage).
+  Legacy partial cleanup and
+  cross-process completed-ZIP pins remain; see [asset-cache.md](asset-cache.md).
 - Extended VR/sleeping sessions, repeated avatar/world/media changes, leak and
   interruption testing, full NixOS deployment acceptance and external OAuth.
 

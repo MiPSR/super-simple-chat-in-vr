@@ -1,5 +1,5 @@
 extends RefCounted
-## Only completed, content-addressed ZIPs in the dedicated cache are managed.
+## Completed ZIPs and dead-process-owned partials in the dedicated cache only.
 ## Import pins and recency stay in memory: no per-access metadata SSD writes.
 static var active: Dictionary = {}
 static var recent: Dictionary = {}
@@ -15,6 +15,24 @@ static func valid_hash(value: String) -> bool:
 
 static func managed(name: String) -> bool:
 	return name.ends_with(".zip") and valid_hash(name.trim_suffix(".zip"))
+
+static func partial_path(directory: String, hash: String) -> String:
+	if not valid_hash(hash):
+		return ""
+	var nonce := Crypto.new().generate_random_bytes(16).hex_encode()
+	if nonce.length() != 32:
+		return ""
+	return directory.path_join("%s.zip.part-%s-%s" % [hash, OS.get_process_id(), nonce])
+
+static func partial_owner(name: String) -> int:
+	var parts := name.split(".zip.part-", true)
+	if parts.size() != 2 or not valid_hash(parts[0]):
+		return 0
+	var suffix := parts[1].split("-", true)
+	if suffix.size() != 2 or suffix[1].length() != 32 or not valid_hash(suffix[1] + suffix[1]) or suffix[0].length() > 10 or not suffix[0].is_valid_int():
+		return 0
+	var pid := int(suffix[0])
+	return pid if pid > 0 and pid <= 2147483647 and str(pid) == suffix[0] else 0
 
 static func touch(path: String) -> void:
 	if managed(path.get_file()):
@@ -51,16 +69,26 @@ static func _evict_oldest(candidates: Array[Dictionary], result: Dictionary) -> 
 static func trim(directory: String = "user://cache", max_bytes: int = 1073741824, max_files: int = 128) -> Dictionary:
 	max_bytes = clampi(max_bytes, 0, 1073741824)
 	max_files = clampi(max_files, 0, 128)
-	var result := {"bytes":0,"files":0,"removed":0,"errors":0,"over_budget":false}
+	var result := {"bytes":0,"files":0,"removed":0,"partials_removed":0,"errors":0,"over_budget":false}
 	var dir := DirAccess.open(directory)
 	if not dir:
 		result.errors = 1
 		return result
 	var candidates: Array[Dictionary] = []
+	# Godot's is_process_running() only recognizes children on Unix. The Nix
+	# client instead uses Linux procfs; without it, preserve partials conservatively.
+	var can_check_owners := OS.get_name() == "Linux" and DirAccess.dir_exists_absolute("/proc/%s" % OS.get_process_id())
 	dir.list_dir_begin()
 	var name := dir.get_next()
 	while not name.is_empty():
-		if not dir.current_is_dir() and not dir.is_link(name) and managed(name):
+		if not dir.current_is_dir() and not dir.is_link(name):
+			var owner := partial_owner(name)
+			if owner > 0 and can_check_owners and not DirAccess.dir_exists_absolute("/proc/%s" % owner):
+				if DirAccess.remove_absolute(directory.path_join(name)) == OK:
+					result.partials_removed += 1
+				else:
+					result.errors += 1
+		if managed(name) and not dir.current_is_dir() and not dir.is_link(name):
 			result.files += 1
 			var path := directory.path_join(name)
 			var file := FileAccess.open(path, FileAccess.READ)

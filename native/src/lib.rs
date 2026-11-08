@@ -1,5 +1,5 @@
 //! Only missing engine facilities belong here: bounded Luau and libopus.
-//! No Godot object ever enters a creator VM; the bridge accepts/returns JSON.
+//! No Godot object ever enters a creator VM; snapshots and commands are JSON-only.
 // GodotClass's generated constructors repeat field names.
 #![allow(clippy::redundant_field_names)]
 use godot::{classes::RefCounted, prelude::*};
@@ -9,6 +9,11 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+#[path = "../../shared/creator_objects.rs"]
+mod creator_objects;
+mod creator_scene;
+#[path = "../../shared/creator_state.rs"]
+mod creator_state;
 #[path = "../../shared/creator_timers.rs"]
 mod creator_timers;
 mod media_proxy;
@@ -55,7 +60,15 @@ struct Vm {
     _slot: VmSlot,
 }
 impl Vm {
+    #[cfg(test)]
     fn new(source: &str, capabilities: &[String]) -> mlua::Result<Self> {
+        Self::with_scene(source, capabilities, Default::default())
+    }
+    fn with_scene(
+        source: &str,
+        capabilities: &[String],
+        scene: creator_scene::SharedScene,
+    ) -> mlua::Result<Self> {
         let slot = VmSlot::reserve()?;
         let lua = Lua::new();
         lua.set_memory_limit(8 * 1024 * 1024)?;
@@ -75,6 +88,61 @@ impl Vm {
         });
         let commands = Arc::new(Mutex::new(Vec::new()));
         let api = lua.create_table()?;
+        let state = lua.create_table()?;
+        let state_scene = scene.clone();
+        state.set(
+            "get",
+            lua.create_function(move |lua, key: String| {
+                if !creator_state::valid_key(&key) {
+                    return Err(mlua::Error::RuntimeError("Invalid state key".into()));
+                }
+                let value = state_scene
+                    .lock()
+                    .unwrap()
+                    .variables
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                lua.to_value_with(
+                    &value,
+                    mlua::SerializeOptions::new()
+                        .serialize_unit_to_null(false)
+                        .serialize_none_to_null(false),
+                )
+            })?,
+        )?;
+        api.set("state", state)?;
+        let objects = scene.clone();
+        api.set(
+            "object",
+            lua.create_function(move |lua, id: String| {
+                if id.is_empty() || id.len() > 64 {
+                    return Err(mlua::Error::RuntimeError("Invalid object ID".into()));
+                }
+                let object = objects
+                    .lock()
+                    .unwrap()
+                    .objects
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                lua.to_value_with(
+                    &object,
+                    mlua::SerializeOptions::new()
+                        .serialize_unit_to_null(false)
+                        .serialize_none_to_null(false),
+                )
+            })?,
+        )?;
+        api.set(
+            "find_tag",
+            lua.create_function(move |lua, (tag, after): (String, Option<String>)| {
+                let (ids, next) =
+                    creator_objects::find_tag(&scene.lock().unwrap().objects, &tag, after)
+                        .map_err(|error| mlua::Error::RuntimeError(error.into()))?;
+                Ok((lua.to_value(&ids)?, next))
+            })?,
+        )?;
         let timers = creator_timers::TimerQueue::install(&lua, &api)?;
         let handlers = lua.create_table()?;
         lua.set_named_registry_value("handlers", handlers)?;
@@ -83,7 +151,15 @@ impl Vm {
             lua.create_function(|lua, (event, callback): (String, mlua::Function)| {
                 if !matches!(
                     event.as_str(),
-                    "tick" | "state" | "action" | "touch" | "grab" | "release"
+                    "tick"
+                        | "state"
+                        | "action"
+                        | "touch"
+                        | "grab"
+                        | "lease"
+                        | "release"
+                        | "damage"
+                        | "destroy"
                 ) {
                     return Err(mlua::Error::RuntimeError("Unsupported visual event".into()));
                 }
@@ -92,6 +168,40 @@ impl Vm {
             })?,
         )?;
         if capabilities.iter().any(|c| c == "visual") {
+            let output = commands.clone();
+            api.set(
+                "spring_gravity",
+                lua.create_function(move |_, value: f64| {
+                    if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+                        return Err(mlua::Error::RuntimeError(
+                            "Invalid spring gravity multiplier".into(),
+                        ));
+                    }
+                    push(
+                        &output,
+                        json!({"action":"spring_gravity","target":"avatar","value":value}),
+                    )
+                })?,
+            )?;
+            let output = commands.clone();
+            api.set("bone_rotation", lua.create_function(move |_, (id, x, y, z, w): (String, f64, f64, f64, f64)| {
+                let rotation = [x,y,z,w];
+                let norm = rotation.iter().map(|v| v*v).sum::<f64>().sqrt();
+                if id.is_empty() || id.len() > 64 || rotation.iter().any(|v| !v.is_finite() || v.abs() > 1.0) || norm < 0.001 {
+                    return Err(mlua::Error::RuntimeError("Invalid bone rotation".into()));
+                }
+                push(&output, json!({"action":"bone_rotation","target":id,"rotation":rotation.map(|v|v/norm)}))
+            })?)?;
+            let output = commands.clone();
+            api.set(
+                "reset_bone",
+                lua.create_function(move |_, id: String| {
+                    if id.is_empty() || id.len() > 64 {
+                        return Err(mlua::Error::RuntimeError("Invalid bone ID".into()));
+                    }
+                    push(&output, json!({"action":"reset_bone","target":id}))
+                })?,
+            )?;
             let output = commands.clone();
             api.set(
                 "set_visible",
@@ -241,23 +351,30 @@ fn push(commands: &Arc<Mutex<Vec<Value>>>, value: Value) -> mlua::Result<()> {
 #[class(base=RefCounted, init)]
 struct CreatorVm {
     vm: Option<Vm>,
+    scene: creator_scene::SharedScene,
     base: Base<RefCounted>,
 }
 #[godot_api]
 impl CreatorVm {
+    #[func]
+    fn bind_scene(&mut self, scene: Gd<creator_scene::CreatorScene>) {
+        self.vm = None;
+        self.scene = scene.bind().data.clone();
+    }
     #[func]
     fn load_script(&mut self, source: GString, capabilities: PackedStringArray) -> GString {
         self.vm = None;
         if source.len() > 65536 {
             return "Script exceeds 64 KiB".into();
         }
-        match Vm::new(
+        match Vm::with_scene(
             &source.to_string(),
             &capabilities
                 .as_slice()
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
+            self.scene.clone(),
         ) {
             Ok(vm) => {
                 self.vm = Some(vm);
@@ -289,6 +406,7 @@ impl CreatorVm {
     #[func]
     fn close(&mut self) {
         self.vm = None;
+        self.scene = Default::default();
     }
 }
 
@@ -471,5 +589,97 @@ mod tests {
         );
         assert!(pcm.iter().all(|v| v.is_finite()));
         assert!(pcm.iter().any(|v| v.abs() > 0.01));
+    }
+    #[test]
+    fn avatar_bone_commands_are_capability_gated_normalized_and_bounded() {
+        assert!(
+            Vm::new(
+            "assert(avatar.bone_rotation == nil and avatar.reset_bone == nil and avatar.spring_gravity == nil)",
+                &[]
+            )
+            .is_ok()
+        );
+        for source in [
+            "avatar.bone_rotation('Head', 0,0,0,0)",
+            "avatar.bone_rotation('Head', 0/0,0,0,1)",
+            "avatar.bone_rotation('Head', math.huge,0,0,1)",
+            "avatar.bone_rotation('',0,0,0,1)",
+            "avatar.reset_bone(string.rep('x',65))",
+            "avatar.spring_gravity(3)",
+            "avatar.spring_gravity(0/0)",
+        ] {
+            assert!(Vm::new(source, &["visual".into()]).is_err());
+        }
+        let vm = Vm::new("avatar.on('action',function() avatar.bone_rotation('Head',0,0.5,0,0.5); avatar.reset_bone('Head'); avatar.spring_gravity(-0.5) end)",&["visual".into()]).unwrap();
+        let commands = vm.dispatch("action", json!({})).unwrap();
+        assert_eq!(commands[0]["target"], "Head");
+        let rotation = commands[0]["rotation"].as_array().unwrap();
+        let norm: f64 = rotation
+            .iter()
+            .map(|value| value.as_f64().unwrap().powi(2))
+            .sum();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert_eq!(commands[1]["action"], "reset_bone");
+        assert_eq!(commands[2]["action"], "spring_gravity");
+        assert_eq!(commands[2]["value"], -0.5);
+        let vm = Vm::new("world.on('action',function() for i=1,65 do avatar.bone_rotation('Head',0,0,0,1) end end)",&["visual".into()]).unwrap();
+        assert!(vm.dispatch("action", json!({})).is_err());
+    }
+    #[test]
+    fn client_object_queries_share_detached_live_data_without_ownership_cycles() {
+        let scene: creator_scene::SharedScene = Default::default();
+        scene.lock().unwrap().replace(br#"{"prop":{"position":[0.5,0,0],"visible":true,"tags":["game.prop"],"controller":null}}"#,1).unwrap();
+        scene
+            .lock()
+            .unwrap()
+            .replace_state(br#"{"value":[0.5,0,0],"ready":false}"#, 1)
+            .unwrap();
+        let source = r#"
+            assert(ClassDB == nil and world.spawn == nil and world.move == nil)
+            world.on('action', function(e)
+                local ids, next = world.find_tag('game.prop')
+                assert(#ids == 1 and ids[1] == 'prop' and next == nil)
+                local p = world.object('prop'); assert(type(p) == 'table' and p.get_node == nil and p.controller == nil)
+                assert(p.position[1] == e.expected)
+                p.position[1] = 999
+                assert(world.object('prop').position[1] == e.expected and world.object('missing') == nil)
+                assert(world.state.set == nil and world.state.get('missing') == nil and world.state.get('ready') == false)
+                local value = world.state.get('value'); assert(value[1] == e.expected)
+                value[1] = 999; assert(world.state.get('value')[1] == e.expected)
+                world.set_visible('prop', p.visible)
+            end)
+        "#;
+        let first = Vm::with_scene(source, &["visual".into()], scene.clone()).unwrap();
+        let second = Vm::with_scene(source, &["visual".into()], scene.clone()).unwrap();
+        assert_eq!(
+            first.dispatch("action", json!({"expected":0.5})).unwrap()[0]["value"],
+            true
+        );
+        scene
+            .lock()
+            .unwrap()
+            .replace(
+                br#"{"prop":{"position":[0.25,0,0],"visible":false,"tags":["game.prop"]}}"#,
+                2,
+            )
+            .unwrap();
+        scene
+            .lock()
+            .unwrap()
+            .replace_state(br#"{"value":[0.25,0,0],"ready":false}"#, 2)
+            .unwrap();
+        assert_eq!(
+            second.dispatch("action", json!({"expected":0.25})).unwrap()[0]["value"],
+            false
+        );
+        assert_eq!(
+            first.dispatch("action", json!({"expected":0.25})).unwrap()[0]["value"],
+            false
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(Arc::strong_count(&scene), 1);
+        assert!(Vm::with_scene("while true do end", &[], scene.clone()).is_err());
+        assert_eq!(Arc::strong_count(&scene), 1);
     }
 }

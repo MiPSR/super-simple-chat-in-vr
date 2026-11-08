@@ -40,6 +40,7 @@ struct Session {
     window: Instant,
     messages: u32,
     voice_frames: u32,
+    voice_epoch: u64,
 }
 fn filter_snapshot_players(snapshot: &mut Value, viewer: &str, db: &rusqlite::Connection) {
     if let Some(players) = snapshot["players"].as_object_mut() {
@@ -111,6 +112,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
     let alive = running.clone();
     std::thread::Builder::new().name("authoritative-worlds".into()).spawn(move || {
         let mut sessions:HashMap<PeerID,Session>=HashMap::new();
+        let mut next_voice_epoch=0u64;
         let mut pending:HashMap<PeerID,Instant>=HashMap::new();
         let mut calls=calls::Calls::default();
         let mut radios=radio::Radios::default();
@@ -137,15 +139,17 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                             let mut cipher=crypto::Cipher::new(g.secret.clone());
                             if !matches!(cipher.open(0,0,&data[64..]),Ok((1,_))) {peer.disconnect_now(1);continue;}
                             app.grants.lock().unwrap().remove(ticket);
+                            if next_voice_epoch>=i64::MAX as u64 {peer.disconnect_now(3);continue;}
                             // Retire an old connection only after admission succeeds.
                             // A rejected transition must leave its session/world intact.
                             let old:Vec<_>=sessions.iter().filter(|(_,s)|s.user==g.user).map(|(id,_)|*id).collect();
                             let result=app.worlds.lock().unwrap().admit(&g.join,&g.user,&g.name,&g.version,g.manifest,g.sources);
-                            let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,send_divisor:1,receive_divisor:1,last_input:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
+                            let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,send_divisor:1,receive_divisor:1,last_input:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0,voice_epoch:0};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
                             // No leave here: admit already transitioned or resnapshotted
                             // membership, so a stale disconnect cannot remove the new one.
                             for old in old {sessions.remove(&old);pending.insert(old,Instant::now()-Duration::from_secs(6));}
-                            let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,send_divisor:g.join.send_divisor,receive_divisor:g.join.receive_divisor,last_input:Instant::now()-step,last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0};
+                            next_voice_epoch+=1;
+                            let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,send_divisor:g.join.send_divisor,receive_divisor:g.join.receive_divisor,last_input:Instant::now()-step,last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0,voice_epoch:next_voice_epoch};
                             let worlds=app.worlds.lock().unwrap();
                             let mut snapshot=worlds.instances[&instance].snapshot(worlds.tick);
                             filter_snapshot_players(&mut snapshot, &session.user, &app.db.lock().unwrap());
@@ -158,10 +162,11 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                             if session.messages>app.config.tps*3+100 {peer.disconnect_now(3);continue;}
                             let Ok((kind,payload))=session.cipher.open(channel_id,0,data) else {continue;};
                             session.last_seen=Instant::now();
-                            if (kind==24 && channel_id==2 || kind==25 && channel_id==0) && payload.len()<=8192 {
+                             if (kind==24 && channel_id==2 || kind==25 && channel_id==0) && payload.len()<=8192 {
+                                let epoch=session.voice_epoch;
                                 let deliveries=serde_json::from_slice::<radio::Request>(&payload).ok().filter(|r|r.is_voice()==(kind==24)).map(|request|radios.transmit(&app,&session.instance,&session.user,request));
                                 match deliveries {
-                                    Some(Ok(messages))=>{for (instance,user,value) in messages {for (id,s) in &mut sessions {if s.instance==instance && s.user==user {send(host.peer_mut(*id),s,if kind==24 {2}else{0},kind,&value);}}}},
+                                    Some(Ok(messages))=>{for (instance,user,mut value) in messages {value["epoch"]=json!(epoch.to_string());for (id,s) in &mut sessions {if s.instance==instance && s.user==user {send(host.peer_mut(*id),s,if kind==24 {2}else{0},kind,&value);}}}},
                                     Some(Err(error)) if kind==25=>send(peer,session,0,255,&json!({"error":error.to_string()})),
                                     _=>{},
                                 }
@@ -170,7 +175,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                 session.voice_frames+=1;
                                 let max_bytes=app.config.voice_bitrate as usize/400+64;
                                 if session.voice_frames>55 || payload.len()<13 || payload.len()>12+max_bytes || opus::packet::get_nb_samples(&payload[12..],48000).ok()!=Some(960) {continue;}
-                                let sender=session.user.clone();let instance=session.instance.clone();
+                                let sender=session.user.clone();let instance=session.instance.clone();let epoch=session.voice_epoch;
                                 let recipients={let worlds=app.worlds.lock().unwrap();let db=app.db.lock().unwrap();let mut routes=HashMap::new();
                                     if let Some(i)=worlds.instances.get(&instance) && let Some(origin)=i.players.get(&sender) {
                                         let mode=db::preferences(&db,&sender).call_mode;
@@ -189,7 +194,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                             } else if distance<=900.0 {routes.insert(*other,0);}
                                         }
                                     } routes};
-                                for (other,route) in recipients {if let Some(s)=sessions.get_mut(&other) {let mut frame=vec![route,sender.len() as u8];frame.extend(sender.as_bytes());frame.extend(&payload);send_bytes(host.peer_mut(other),s,2,20,&frame);}}
+                                for (other,route) in recipients {if let Some(s)=sessions.get_mut(&other) {let mut frame=vec![route|0x80,sender.len() as u8];frame.extend(sender.as_bytes());frame.extend(epoch.to_le_bytes());frame.extend(&payload);send_bytes(host.peer_mut(other),s,2,20,&frame);}}
                             } else if kind==14 && channel_id==1 && payload.len()<=4096 {
                                 if let Ok(tracking)=serde_json::from_slice::<std::collections::BTreeMap<String,crate::world::TrackedJoint>>(&payload)
                                     && crate::world::valid_tracking(&tracking)

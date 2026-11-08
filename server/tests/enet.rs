@@ -9,7 +9,10 @@ use std::{
     io::{BufRead, BufReader, Cursor},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant},
 };
 
@@ -75,6 +78,8 @@ struct Peer {
     receiver: Receiver<Value>,
     commands: PathBuf,
     serial: u32,
+    errors: Arc<Mutex<Vec<String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 impl Peer {
     fn start(directory: &Path, name: &str, mut grant: Value) -> Result<Self> {
@@ -96,9 +101,27 @@ impl Peer {
             .env_remove("no_proxy")
             .env_remove("NO_PROXY")
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .context("Start Godot using nix develop or nix-shell")?;
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let captured = errors.clone();
+        let stderr_reader = std::thread::spawn(move || {
+            for line in BufReader::new(stderr)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                eprintln!("{line}");
+                if line.starts_with("ERROR:") || line.starts_with("SCRIPT ERROR:") {
+                    let mut errors = captured.lock().unwrap();
+                    if errors.len() < 64 {
+                        errors.push(line.chars().take(4096).collect());
+                    }
+                }
+            }
+        });
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout)
@@ -119,6 +142,8 @@ impl Peer {
             receiver,
             commands,
             serial: 0,
+            errors,
+            stderr_reader: Some(stderr_reader),
         })
     }
 
@@ -173,6 +198,8 @@ impl Peer {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             self.drain();
+            let errors = self.errors.lock().unwrap().clone();
+            ensure!(errors.is_empty(), "Godot peer reported errors: {errors:?}");
             if let Some(event) = self.events.iter().find(|e| predicate(e)) {
                 return Ok(event.clone());
             }
@@ -218,6 +245,24 @@ impl Peer {
             ensure!(Instant::now() < deadline, "Godot did not stop gracefully");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        if let Some(reader) = self.stderr_reader.take() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !reader.is_finished() {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Godot stderr remained open after process exit"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("Godot stderr reader panicked"))?;
+        }
+        let errors = self.errors.lock().unwrap();
+        ensure!(
+            errors.is_empty(),
+            "Godot peer cleanup reported errors: {errors:?}"
+        );
         Ok(())
     }
 }
@@ -698,12 +743,17 @@ async fn encrypted_godot_enet() -> Result<()> {
     b.wait(|e| snapshot(e)["media"]["screen"]["position"].as_f64() == Some(42.0))
         .await?;
     a.command(json!({"action":"voice","sequence":1}))?;
-    b.wait(|e| {
-        e["kind"].as_f64() == Some(20.0)
-            && e["data"]["user"] == users[0]
-            && e["data"]["sequence"].as_f64() == Some(1.0)
-    })
-    .await?;
+    let old_voice = b
+        .wait(|e| {
+            e["kind"].as_f64() == Some(20.0)
+                && e["data"]["user"] == users[0]
+                && e["data"]["sequence"].as_f64() == Some(1.0)
+        })
+        .await?;
+    let old_voice_epoch = old_voice["data"]["epoch"]
+        .as_str()
+        .context("Missing authoritative voice epoch")?
+        .parse::<u64>()?;
     api.client
         .put(format!("{}/api/v1/blocks/{}", api.base, users[0]))
         .bearer_auth(&tokens[1])
@@ -943,6 +993,24 @@ async fn encrypted_godot_enet() -> Result<()> {
     );
     a.stop().await?;
     a = replacement;
+    a.command(json!({"action":"voice","sequence":1}))?;
+    let restarted_voice = b
+        .wait(|e| {
+            e["kind"].as_f64() == Some(20.0)
+                && e["data"]["sequence"].as_f64() == Some(1.0)
+                && e["data"]["epoch"]
+                    .as_str()
+                    .and_then(|epoch| epoch.parse::<u64>().ok())
+                    .is_some_and(|epoch| epoch > old_voice_epoch)
+        })
+        .await
+        .context(
+            "Reconnected voice must carry a new server epoch despite resetting its sequence",
+        )?;
+    let new_voice_epoch = restarted_voice["data"]["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     a.command(
         json!({"action":"command","kind":4,"data":{"text":"NEW SESSION SURVIVED OLD DISCONNECT"}}),
     )?;
@@ -1001,6 +1069,7 @@ async fn encrypted_godot_enet() -> Result<()> {
             e["kind"].as_f64() == Some(24.0)
                 && e["data"]["sender"] == users[0]
                 && e["data"]["radio"] == "desk_radio"
+                && e["data"]["epoch"] == new_voice_epoch
         })
         .await
         .context("Cross-instance Opus radio delivery")?;
@@ -1213,6 +1282,20 @@ async fn encrypted_godot_enet() -> Result<()> {
     a.command(json!({"action":"command","kind":12,"data":{"action":"lease","target":"tank_a"}}))?;
     b.wait(|e| snapshot(e)["entities"]["tank_a"]["controller"] == users[0])
         .await?;
+    b.wait(|e| {
+        e["kind"].as_f64() == Some(11.0)
+            && e["data"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|event| {
+                    event["event"] == "lease"
+                        && event["kind"] == "object"
+                        && event["target"] == "tank_a"
+                        && event["actor"] == users[0]
+                        && event.get("hand").is_none()
+                })
+            })
+    })
+    .await
+    .context("Committed control acquisition must reach client scripts")?;
     b.command(json!({"action":"command","kind":12,"data":{"action":"fire","target":"tank_a"}}))?;
     b.wait(|e| e["data"]["error"] == "No weapon control lease")
         .await?;
@@ -1266,6 +1349,20 @@ async fn encrypted_godot_enet() -> Result<()> {
     })
     .await?;
     b.command(json!({"action":"command","kind":12,"data":{"action":"lease","target":"tank_a"}}))?;
+    b.wait(|e| {
+        e["kind"].as_f64() == Some(11.0)
+            && e["data"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|event| {
+                    event["event"] == "release"
+                        && event["kind"] == "object"
+                        && event["target"] == "tank_a"
+                        && event["actor"] == users[0]
+                        && event["reason"] == "explicit"
+                })
+            })
+    })
+    .await
+    .context("Committed control release must reach client scripts")?;
     a.wait(|e| snapshot(e)["entities"]["tank_a"]["controller"] == users[1])
         .await?;
     println!(

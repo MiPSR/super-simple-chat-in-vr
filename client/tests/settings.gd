@@ -8,6 +8,9 @@ func _initialize() -> void:
 	call_deferred("_run")
 
 func _run() -> void:
+	preload("res://tests/creator_bones.gd").run()
+	preload("res://tests/creator_queries.gd").run()
+	await preload("res://tests/voice_epochs.gd").run()
 	preload("res://tests/cache.gd").run()
 	preload("res://tests/contacts.gd").run()
 	preload("res://tests/textures.gd").run()

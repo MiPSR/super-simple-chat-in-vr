@@ -132,16 +132,26 @@ Common APIs:
   policy reason). Explicit release packets are deduplicated against subsequent
   snapshots. Callbacks cannot revive constraints or bypass permissions. Unloaded/
   blocked avatar VMs are torn down rather than kept alive for notifications.
+  Live connection takeover also releases old contact constraints with reason
+  `reconnect` while preserving the current player/instance state.
 - Server prop/vehicle control emits deferred `grab`, `lease` and `release`
   callbacks through the same bounded queue. Object events have `kind="object"`,
   `target`, `actor`, `clock`, `mode="grab"|"lease"`, and a hand index or `nil`.
   Avatar contact events have `kind="avatar"`. Acquisition reasons are `explicit`
   or `script`; release reasons are `explicit`, `handoff`, `lease_expired`,
-  `disconnect` or `destroy`. Renewing the same holder/mode does not duplicate an
+  `disconnect`, `reconnect` or `destroy`. Renewing the same holder/mode does not duplicate an
   acquisition notification. Scripted handoff first releases the old hand/physics
   constraint, then acquires the new lease. Static entities cannot be leased.
   Events describe committed outcomes; by callback time the current holder may
-  already differ. Client Lua object-control event parity remains unfinished.
+   already differ. Client-world scripts receive the same committed object-control
+   events over reliable state transport, plus `damage` and `destroy` events.
+   Client dispatch is deferred with at most 128 pending events, at most eight
+   drained per frame and a five-millisecond between-dispatch budget; overflow
+   drops newest notifications and reports an error. Each VM retains its own CPU
+   watchdog. Queries reflect the latest received graph, not necessarily the
+   historical object state when the event was generated. VM/package teardown
+   clears pending notifications. This does not yet supply collision or complete
+   join/leave callback coverage.
 - Both hosts expose `world.after(seconds, function() ... end)` and
   `world.cancel_timer(id)`; client avatar scripts can use the `avatar` alias.
   Timers are VM-local one-shots, at most 64 pending, with finite delays in
@@ -153,7 +163,7 @@ Common APIs:
   a timer from an interaction does not preserve an authenticated radio identity.
 - `world.object(id)` returns a detached read-only-in-effect snapshot: editing the
   returned table cannot change the world.
-- Server-world `world.find_tag(tag, after_id?)` returns two values: up to 256
+- Server-world and client-world `world.find_tag(tag, after_id?)` return two values: up to 256
   matching stable object IDs in lexical order, and a continuation ID or `nil`.
   Pass the continuation into the next call to enumerate larger matches. Queries
   within one dispatch see the same snapshot; queued commands become visible on
@@ -167,12 +177,27 @@ Common APIs:
   inherited declarations and prefab declarations at 64 KiB each; each instance
   also enforces a 64 KiB live serialized-tag budget, including dynamic spawns.
   Destruction releases that budget. This does not bound complete snapshots or
-  replace broader entity/importer/network allocation limits. Client Lua query
-  context/API parity remains unfinished.
+   replace broader entity/importer/network allocation limits.
+   Client-world VMs share a JSON-only scene context, available during script
+   startup even when world loading finishes after network admission. Queries
+   return replicated entity properties, not Godot nodes or mutation handles;
+   absent objects and null references read as Lua `nil`. Newer pose samples
+   survive older reliable graphs; deleted entities cannot be revived by stale
+   graphs or pose packets. Limits are 2 MiB per JSON update, 4096 objects and
+   64 KiB of resolved tags. Invalid updates clear the client context and report
+   an error. Avatar VMs currently have separate empty query contexts; their own
+   bones/nodes are not yet queryable through this API.
 - With `state`: `world.state.get(key)` / `world.state.set(key,value)` read/write
   explicitly declared, typed instance variables. Undeclared keys, incompatible
   types and out-of-range values error without changing the variable. Clients
-  receive snapshots but cannot invoke these authoritative setters directly.
+   receive snapshots but cannot invoke these authoritative setters directly.
+   Client-world scripts expose read-only `world.state.get(key)` from the shared
+   received snapshot, including during startup. Absent keys return `nil`, false
+   remains false, and vectors are detached tables. There is no client setter.
+   State snapshots have at most 128 valid keys, supported scalar/vector values,
+   4096-byte strings and a 32-KiB JSON bridge bound (formatting headroom above
+   the authoritative 16-KiB budget). Older state ticks are ignored; replacement
+   and teardown clear removed keys. Avatar VMs do not inherit world state.
 - With `objects`: `world.spawn(prefab_id,{position={x,y,z}, velocity={x,y,z},
   owner=player.id})` returns a reserved stable ID. Only packaged prefabs can be
   spawned; invalid requests are rejected when applied.
@@ -194,6 +219,35 @@ Snapshots include current objects, transforms, leases, health, variables, and
 scores. Reliable spawn/destruction/damage events accompany state changes;
 unreliable transform streams are independently rate-controlled. All of this is
 discarded when an instance empties.
+
+### Client avatar bone and spring controls
+
+Client avatar scripts with `visual` can call:
+
+```lua
+avatar.bone_rotation('Head', 0, 0.3826834, 0, 0.9238795) -- x,y,z,w
+avatar.reset_bone('Head')
+avatar.spring_gravity(0.5)
+```
+
+Bone IDs use the normalized humanoid mapping when available, with an exact
+own-skeleton bone-name fallback. Quaternions must have finite components in
+`[-1,1]` and nonzero length; the host normalizes them. Overrides are absolute
+local rotations, with at most 64 distinct overridden bones per avatar. They run
+after IK/springs and before authorized cosmetic grab constraints. Reset removes
+the override and returns that bone to its authored rest rotation; ordinary
+animation/tracking can drive it again. A script attached to `avatar` can address
+its own bones; a bone-specific attachment can address only its exact target.
+No paths, Godot handles, other avatars or authoritative collision proxies are
+editable through this API.
+
+`spring_gravity` sets the own avatar's imported VRM secondary-system gravity
+multiplier in `[-2,2]` (default `1`). It changes runtime node state, not shared
+spring resources or collider permission policy. It requires the `avatar`
+attachment. Both effects are local presentation: replicate declared discrete
+actions when all viewers should make the same choice, rather than streaming
+bone transforms. Avatar replacement tears down overrides and spring settings.
+Per-chain spring controls and richer bone/material APIs remain unfinished.
 
 ### Replicated variable declarations
 

@@ -28,6 +28,7 @@ func _ready() -> void:
 	add_child(request)
 	request.request_completed.connect(_downloaded)
 	DirAccess.make_dir_recursive_absolute(cache_directory)
+	_trim_cache()
 
 func load_world(snapshot: Dictionary) -> void:
 	_load_asset(str(snapshot.world), str(snapshot.version), snapshot.manifest)
@@ -50,9 +51,13 @@ func _load_asset(id: String, version: String, metadata: Dictionary) -> void:
 	if FileAccess.file_exists(staging):
 		_start_import()
 		return
-	request.download_file = staging + ".part-%s" % get_instance_id()
+	request.download_file = Cache.partial_path(cache_directory, expected)
+	if request.download_file.is_empty():
+		failed.emit("Could not allocate a unique package download filename")
+		return
 	var error := request.request("%s/api/v1/assets/%s/download?version=%s" % [base_url, asset_id, expected], PackedStringArray(["Authorization: Bearer " + credentials]))
 	if error != OK:
+		DirAccess.remove_absolute(request.download_file)
 		failed.emit("Could not start package download: %s" % error_string(error))
 
 func _downloaded(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
@@ -61,6 +66,7 @@ func _downloaded(result: int, code: int, _headers: PackedStringArray, _body: Pac
 		failed.emit("Package download failed (%s / HTTP %s)" % [result, code])
 		return
 	if DirAccess.rename_absolute(request.download_file, staging) != OK:
+		DirAccess.remove_absolute(request.download_file)
 		failed.emit("Could not publish package cache file")
 		return
 	_start_import()
