@@ -39,7 +39,9 @@ func _initialize() -> void:
 		assert(model.get_node("secondary").get("spring_bones").size() > 0)
 		avatar = Avatar.new()
 		root.add_child(avatar)
+		avatar.runtime_status.connect(func(message: String): push_error(message); quit(1))
 		avatar.set_model(model, loader.staging, loader.manifest)
+		assert(avatar.creator.scripts.size() == 1 and not avatar.creator.scripts[0].failed)
 		assert(avatar.model.skeleton.get_bone_count() >= 16)
 		assert(avatar.model.solvers.size() == 4, "Native arm/leg IK chains missing")
 		var spring_index := -1

@@ -23,6 +23,7 @@ func configure(preferences: Dictionary) -> void:
 	_choices("output_device", "Output device", Array(AudioServer.get_output_device_list()), preferences)
 	_number("voice_volume", "Voice playback gain", 0, 1, 0.05, preferences, 1)
 	_number("microphone_gain", "Microphone gain (does not unmute)", 0, 2, 0.05, preferences, 1)
+	_choices("allow_creator_calls", "Allow world interaction scripts to invite/leave calls", [false,true], preferences, ["No (default)","Allow authenticated interactions"])
 	_choices("quality", "Material tier", [0,1,2], preferences, ["Basic", "Standard", "Advanced"])
 	_number("resolution_scale", "3D resolution scale", 0.5, 1.5, 0.05, preferences, 1)
 	_choices("antialiasing", "Antialiasing", ["off","msaa_2x","msaa_4x","msaa_8x"], preferences)

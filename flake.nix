@@ -21,7 +21,7 @@
       cargoTestFlags = [ "-p" "super-simple-chat-server" ];
       nativeBuildInputs = [ pkgs.pkg-config ];
       buildInputs = [ pkgs.sqlite pkgs.libopus pkgs.opusfile ];
-      nativeCheckInputs = [ pkgs.godot_4 pkgs.ffmpeg ];
+      nativeCheckInputs = [ pkgs.godot_4 pkgs.ffmpeg pkgs.nodejs ];
       SSC_TEST_CLIENT = clientSource;
       doCheck = true;
       preCheck = ''
@@ -91,7 +91,7 @@
       SSC_TEST_CLIENT = clientSource;
       SSC_YTDLP = "${ytResolver}";
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
-      packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config sqlite godot_4 ffmpeg nixfmt ];
+      packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config sqlite godot_4 ffmpeg nixfmt nodejs ];
       shellHook = ''
         export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
         echo "Super Simple Chat in VR: cargo run | godot4 --path client"
@@ -101,7 +101,7 @@
     native = pkgs.mkShell {
       SSC_VRM_SOURCE = vrm;
       SSC_YTDLP = "${ytResolver}";
-      packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config godot_4 ffmpeg ];
+      packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config godot_4 ffmpeg nodejs ];
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
       shellHook = ''export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0'';
     };

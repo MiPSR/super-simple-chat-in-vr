@@ -47,8 +47,8 @@ static func run() -> void:
 		assert(Cache.partial_owner(name) == 0)
 	assert(Cache.partial_owner("a".repeat(64) + ".zip.part-" + "9".repeat(100) + "-" + "c".repeat(32)) == 0)
 	Cache.touch(c)
-	Cache.acquire(a)
-	Cache.acquire(a)
+	assert(Cache.acquire(a))
+	assert(Cache.acquire(a))
 	Cache.release(a)
 	var result := Cache.trim(directory, 20, 2)
 	assert(result.bytes == 20 and result.files == 2 and result.removed == 2)
@@ -56,6 +56,11 @@ static func run() -> void:
 	assert(FileAccess.file_exists(active_partial) and dir.is_link(partial_link))
 	assert(FileAccess.file_exists(a) and FileAccess.file_exists(c) and not FileAccess.file_exists(b))
 	assert(not FileAccess.file_exists(d))
+	var foreign_pin = ClassDB.instantiate("CacheLease")
+	assert(foreign_pin.pin(ProjectSettings.globalize_path(c)).is_empty())
+	result = Cache.trim(directory,10,1)
+	assert(result.over_budget and FileAccess.file_exists(c))
+	foreign_pin = null
 	result = Cache.trim(directory, 10, 1)
 	assert(result.bytes == 10 and result.files == 1 and not FileAccess.file_exists(c))
 	result = Cache.trim(directory, 0, 0)
@@ -65,8 +70,8 @@ static func run() -> void:
 	assert(not result.over_budget and result.files == 0 and not FileAccess.file_exists(a))
 	assert(FileAccess.file_exists(notes) and FileAccess.file_exists(partial) and FileAccess.file_exists(unexpected))
 	assert(dir.dir_exists(nested) and dir.is_link(link))
-	for path in [link,partial,notes,unexpected,nested,active_partial,partial_link]:
+	for path in [link,partial,notes,unexpected,nested,active_partial,partial_link,directory.path_join(".ssc-cache.lock")]:
 		assert(DirAccess.remove_absolute(path) == OK)
 	assert(DirAccess.remove_absolute(directory) == OK)
 	assert(not Cache.active.has(a) and not Cache.recent.has(a))
-	print("PASS bounded ZIP cache, import pins, dead-process partial cleanup, live-owner preservation and symlink safety")
+	print("PASS bounded ZIP cache, process-independent import pins, dead-process partial cleanup, live-owner preservation and symlink safety")

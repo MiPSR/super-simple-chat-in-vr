@@ -30,9 +30,32 @@ untouched because their owner cannot be determined safely.
 These are best-effort completed-cache limits, **not a filesystem quota, decoded
 memory budget or process sandbox**. Active imports can temporarily exceed the
 limit; filesystem failures are surfaced as a cache notice rather than breaking
-gameplay. Downloads add temporary disk usage before publication. Cross-process
-completed-ZIP pin coordination and legacy partial cleanup remain unfinished. Server-side
-immutable asset-version garbage collection is separate and still required.
+gameplay. Downloads add temporary disk usage before publication. Legacy partials
+without provable owners remain intentionally untouched. Server-side immutable
+asset-version garbage collection is separate; see [asset-storage.md](asset-storage.md).
+
+## Cross-process pins (new implementation, unverified)
+
+The native client now coordinates completed ZIPs with Linux OFD byte-range locks
+in one zero-length `.ssc-cache.lock` per directory. A 63-bit hash-derived lock
+offset means no per-access SSD writes or ever-growing per-version sidecar files.
+Offset collisions conservatively protect both entries. Readers hold shared pins
+through hashing/import/loaded callbacks; eviction requires a nonblocking exclusive
+lock. Independent processes and independently opened descriptors cannot remove
+each other's pinned entries. OS process exit/crash releases pins automatically.
+The lock file is opened with no-follow/close-on-exec flags and must be regular;
+cache paths must remain inside an operator-owned dedicated directory.
+
+Completed download publication uses an atomic no-replace hard link, not rename
+over an existing pinned pathname. A temporary shared publication pin bridges
+handoff to the import pin. Parallel downloaders discard their own redundant
+partial instead of replacing an immutable completed ZIP. Hash verification still
+runs before importing cached content. Invalid completed content is removed only
+after the import pin retires, and only if no other process is using it.
+
+These changes and new independent-descriptor/process-crash/symlink regression
+cases have not been compiled or executed. External tools deleting/replacing the
+lock file while clients are running are outside this cooperative-cache protocol.
 
 Headless checks cover byte/file eviction, recency, refcounted pins, malformed
 hash/path rejection, dead-process partial cleanup, live-owner preservation,

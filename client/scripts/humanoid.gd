@@ -14,9 +14,17 @@ var floor_heights: Dictionary = {}
 var limb_solvers: Dictionary = {}
 var grab_modifier: SkeletonModifier3D
 var bone_modifier: SkeletonModifier3D
+var query_nodes: Array[Node3D] = []
+var query_bones: Array[Dictionary] = []
 
-func setup(model: Node3D) -> void:
+func setup(model: Node3D, queries: bool = false) -> void:
 	model_root = model
+	if queries:
+		# Capture supplied nodes before adding host IK targets/modifiers. Flat
+		# indices remain stable when a supplied node is removed; never reuse IDs.
+		query_nodes.append(model)
+		for node in model.find_children("*", "Node3D", true, false):
+			query_nodes.append(node as Node3D)
 	add_child(model)
 	var found := model.find_children("*", "Skeleton3D", true, false)
 	if found.is_empty():
@@ -25,6 +33,13 @@ func setup(model: Node3D) -> void:
 	var meta = model.get("vrm_meta")
 	if meta:
 		bone_map = meta.get("humanoid_bone_mapping")
+	if queries:
+		var profile: SkeletonProfile = bone_map.profile if bone_map and bone_map.profile else SkeletonProfileHumanoid.new()
+		for index in profile.bone_size:
+			var canonical := str(profile.get_bone_name(index))
+			var actual := bone(canonical)
+			if actual >= 0:
+				query_bones.append({"id":"humanoid:" + canonical,"index":actual})
 	head_bone = bone("Head")
 	if head_bone >= 0:
 		rest_head = skeleton.get_bone_global_rest(head_bone).origin
@@ -129,6 +144,9 @@ func _physics_process(_delta: float) -> void:
 			if not hit.is_empty():
 				floor_heights[name] = float(hit.position.y)
 
+func creator_visual_root() -> Node3D:
+	return model_root
+
 func creator_action(action: String, name: String, weight: float) -> void:
 	if not model_root:
 		return
@@ -156,7 +174,8 @@ func creator_action(action: String, name: String, weight: float) -> void:
 func creator_bone(command: Dictionary) -> String:
 	if not skeleton or not bone_modifier:
 		return "Avatar has no editable skeleton"
-	var index := bone(str(command.target))
+	var target := str(command.target)
+	var index := _query_index(target, "bone:", skeleton.get_bone_count()) if target.begins_with("bone:") else bone(target.trim_prefix("humanoid:"))
 	if index < 0:
 		return "Unknown avatar bone: " + str(command.target)
 	if command.action == "reset_bone":
@@ -164,6 +183,47 @@ func creator_bone(command: Dictionary) -> String:
 		return ""
 	var values: Array = command.rotation
 	return bone_modifier.rotate_bone(index, Quaternion(float(values[0]), float(values[1]), float(values[2]), float(values[3])))
+
+static func _query_index(id: String, prefix: String, count: int) -> int:
+	if not id.begins_with(prefix):
+		return -1
+	var text := id.trim_prefix(prefix)
+	if text.length() > 10 or not text.is_valid_int():
+		return -1
+	var index := int(text)
+	return index if index >= 0 and index < count and str(index) == text else -1
+
+func creator_node(id: String) -> Node3D:
+	var index := _query_index(id, "node:", query_nodes.size())
+	if index >= 0 and is_instance_valid(query_nodes[index]):
+		return query_nodes[index]
+	return null
+
+func _bone_snapshot(index: int, tag: String) -> Dictionary:
+	var position := skeleton.get_bone_pose_position(index)
+	var rotation := skeleton.get_bone_pose_rotation(index)
+	return {"component":"bone","name":str(skeleton.get_bone_name(index)).left(64),"tags":[tag],"position":[position.x,position.y,position.z],"rotation":[rotation.x,rotation.y,rotation.z,rotation.w]}
+
+func creator_query_snapshot() -> Dictionary:
+	var bone_count := skeleton.get_bone_count() if skeleton else 0
+	if query_nodes.size() + bone_count + query_bones.size() > 4096:
+		return {"error":"Avatar query context exceeds 4096 objects"}
+	var objects: Dictionary = {}
+	for index in query_nodes.size():
+		var node = query_nodes[index]
+		if not is_instance_valid(node):
+			continue
+		var position: Vector3 = node.position
+		var basis: Basis = node.transform.basis
+		if not position.is_finite() or not basis.is_finite():
+			return {"error":"Non-finite avatar query transform"}
+		var rotation: Quaternion = node.quaternion if absf(basis.determinant()) > 0.000001 else Quaternion.IDENTITY
+		objects["node:%s" % index] = {"component":"node","name":str(node.name).left(64),"tags":["avatar.node"],"visible":node.visible,"position":[position.x,position.y,position.z],"rotation":[rotation.x,rotation.y,rotation.z,rotation.w]}
+	for index in bone_count:
+		objects["bone:%s" % index] = _bone_snapshot(index, "avatar.bone")
+	for entry in query_bones:
+		objects[str(entry.id)] = _bone_snapshot(int(entry.index), "avatar.humanoid")
+	return {"objects":objects}
 
 func creator_spring_gravity(multiplier: float) -> String:
 	if not is_finite(multiplier) or multiplier < -2 or multiplier > 2:

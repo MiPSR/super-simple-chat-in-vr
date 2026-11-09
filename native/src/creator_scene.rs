@@ -53,6 +53,7 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<String, Value>, &'static str> 
             !matches!(
                 key.as_str(),
                 "id" | "component"
+                    | "name"
                     | "tags"
                     | "position"
                     | "rotation"
@@ -63,6 +64,8 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<String, Value>, &'static str> 
                     | "controller"
                     | "owner"
                     | "prefab"
+                    | "attached_to"
+                    | "attachment_offset"
             )
         }) {
             return Err("Unsupported snapshot object property");
@@ -74,6 +77,12 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<String, Value>, &'static str> 
             return Err("Inconsistent snapshot object ID");
         }
         object.insert("id".into(), json!(id));
+        if object
+            .get("name")
+            .is_some_and(|value| !value.as_str().is_some_and(|name| name.len() <= 256))
+        {
+            return Err("Invalid snapshot display name");
+        }
         let mut tags: Vec<String> = match object.get("tags") {
             None => Vec::new(),
             Some(value) => value
@@ -98,7 +107,7 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<String, Value>, &'static str> 
             return Err("Snapshot tags exceed 64 KiB");
         }
         object.insert("tags".into(), json!(tags));
-        for field in ["position", "size"] {
+        for field in ["position", "size", "attachment_offset"] {
             if object.get(field).is_some_and(|value| !vector(value, 3)) {
                 return Err("Invalid snapshot vector");
             }
@@ -120,7 +129,7 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<String, Value>, &'static str> 
                 return Err("Invalid snapshot boolean");
             }
         }
-        for field in ["owner", "controller", "prefab", "component"] {
+        for field in ["owner", "controller", "prefab", "component", "attached_to"] {
             if object.get(field).is_some_and(|value| {
                 !value.is_null()
                     && !value
@@ -392,11 +401,22 @@ mod tests {
             br#"{"prop":{"script":"x"}}"#,
             br#"{"prop":{"tags":["a","a"]}}"#,
             br#"{"prop":{"position":[0,0]}}"#,
+            br#"{"prop":{"name":17}}"#,
+            br#"{"prop":{"attached_to":17}}"#,
+            br#"{"prop":{"attachment_offset":[0,0]}}"#,
         ] {
             assert!(scene.replace(invalid, 2).is_err());
             assert_eq!(scene.objects, original);
         }
         assert!(scene.replace(&vec![b' '; MAX_JSON_BYTES + 1], 2).is_err());
+        assert!(
+            scene
+                .replace(
+                    &serde_json::to_vec(&json!({"prop":{"name":"x".repeat(257)}})).unwrap(),
+                    2
+                )
+                .is_err()
+        );
         let entries: BTreeMap<_, _> = (0..4097).map(|i| (format!("id{i}"), json!({}))).collect();
         assert!(
             scene

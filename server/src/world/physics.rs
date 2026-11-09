@@ -16,6 +16,7 @@ pub struct Scene {
     ccd: CCDSolver,
     handles: BTreeMap<String, RigidBodyHandle>,
     names: std::collections::HashMap<ColliderHandle, String>,
+    attachments: BTreeMap<String,(String,ImpulseJointHandle)>,
 }
 impl Default for Scene {
     fn default() -> Self {
@@ -32,6 +33,7 @@ impl Default for Scene {
             ccd: CCDSolver::new(),
             handles: BTreeMap::new(),
             names: Default::default(),
+            attachments: BTreeMap::new(),
         }
     }
 }
@@ -103,7 +105,41 @@ impl Scene {
             body.set_body_type(RigidBodyType::Dynamic, true);
         }
     }
+    pub fn attach(&mut self, child: &str, parent: &str, offset: [f32;3]) -> bool {
+        let (Some(&child_handle),Some(&parent_handle))=(self.handles.get(child),self.handles.get(parent)) else {return false;};
+        if child_handle==parent_handle {return false;}
+        let Some(parent_body)=self.bodies.get(parent_handle) else {return false;};
+        let mut pose=*parent_body.position();
+        pose.translation+=pose.rotation*Vector::from(offset);
+        let linear=parent_body.linvel();
+        let angular=parent_body.angvel();
+        if self.bodies.get(child_handle).is_none() {return false;}
+        self.detach(child);
+        if let Some(body)=self.bodies.get_mut(child_handle) {
+            body.set_position(pose,true);
+            body.set_linvel(linear,true);
+            body.set_angvel(angular,true);
+        }
+        let joint=FixedJointBuilder::new().local_anchor1(Vector::from(offset))
+            .local_anchor2(Vector::ZERO).contacts_enabled(false).build();
+        let handle=self.impulse.insert(parent_handle,child_handle,joint,true);
+        self.attachments.insert(child.into(),(parent.into(),handle));
+        true
+    }
+    pub fn detach(&mut self, child: &str) {
+        if let Some((_,handle))=self.attachments.remove(child) {
+            self.impulse.remove(handle,true);
+        }
+    }
+    pub fn rotate(&mut self, id: &str, rotation: [f32;4]) {
+        if let Some(body)=self.body_mut(id) {
+            body.set_rotation(rapier3d::math::Rotation::from_xyzw(rotation[0],rotation[1],rotation[2],rotation[3]),true);
+        }
+    }
     pub fn remove(&mut self, id: &str) {
+        let children:Vec<_>=self.attachments.iter().filter(|(child,(parent,_))|child.as_str()==id || parent==id)
+            .map(|(child,_)|child.clone()).collect();
+        for child in children {self.detach(&child);}
         if let Some(handle) = self.handles.remove(id) {
             if let Some(body) = self.bodies.get(handle) {
                 for c in body.colliders() {
@@ -151,5 +187,31 @@ impl Scene {
                 ))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fixed_attachments_follow_parent_and_retire_with_bodies() {
+        let mut scene=Scene::default();
+        let parent=Physics {dynamic:false,gravity_scale:0.0,..Default::default()};
+        let child=Physics {gravity_scale:0.0,..Default::default()};
+        scene.insert("parent",[4.0,0.0,0.0],&parent,false);
+        scene.insert("child",[0.0,0.0,0.0],&child,false);
+        assert!(scene.attach("child","parent",[1.0,0.0,0.0]));
+        assert_eq!(scene.attachments.len(),1);
+        assert_eq!(scene.transform("child").unwrap().0,[5.0,0.0,0.0]);
+        let half=0.5f32.sqrt();
+        scene.rotate("parent",[0.0,half,0.0,half]);
+        for _ in 0..120 {scene.step(1.0/60.0);}
+        let position=scene.transform("child").unwrap().0;
+        assert!((position[0]-4.0).abs()<0.03 && (position[2]+1.0).abs()<0.03);
+        scene.remove("parent");
+        assert!(scene.attachments.is_empty());
+        assert!(scene.transform("child").is_some());
+        scene.remove("child");
+        assert!(scene.handles.is_empty());
     }
 }

@@ -2,6 +2,7 @@ extends RefCounted
 ## Completed ZIPs and dead-process-owned partials in the dedicated cache only.
 ## Import pins and recency stay in memory: no per-access metadata SSD writes.
 static var active: Dictionary = {}
+static var pins: Dictionary = {}
 static var recent: Dictionary = {}
 static var sequence := 0
 
@@ -39,16 +40,35 @@ static func touch(path: String) -> void:
 		sequence += 1
 		recent[path] = sequence
 
-static func acquire(path: String) -> void:
+static func acquire(path: String) -> bool:
 	if managed(path.get_file()):
+		if not active.has(path):
+			if not ClassDB.class_exists("CacheLease"):
+				return false
+			var pin = ClassDB.instantiate("CacheLease")
+			if not pin.pin(ProjectSettings.globalize_path(path)).is_empty():
+				return false
+			pins[path] = pin
 		active[path] = int(active.get(path, 0)) + 1
 		touch(path)
+		return true
+	return false
 
 static func release(path: String) -> void:
 	if active.has(path):
 		active[path] = int(active[path]) - 1
 		if int(active[path]) <= 0:
 			active.erase(path)
+			pins.erase(path)
+
+static func remove_completed(path: String) -> int:
+	if not managed(path.get_file()) or not ClassDB.class_exists("CacheLease"):
+		return 2
+	var lease = ClassDB.instantiate("CacheLease")
+	var result := int(lease.remove_completed(ProjectSettings.globalize_path(path)))
+	if result == 0:
+		recent.erase(path)
+	return result
 
 static func _older(a: Dictionary, b: Dictionary) -> bool:
 	if a.recent != b.recent: return a.recent < b.recent
@@ -58,12 +78,13 @@ static func _older(a: Dictionary, b: Dictionary) -> bool:
 static func _evict_oldest(candidates: Array[Dictionary], result: Dictionary) -> void:
 	candidates.sort_custom(_older)
 	var candidate: Dictionary = candidates.pop_front()
-	if DirAccess.remove_absolute(candidate.path) == OK:
+	var removed := remove_completed(str(candidate.path))
+	if removed == 0:
 		result.bytes -= int(candidate.bytes)
 		result.files -= 1
 		result.removed += 1
 		recent.erase(candidate.path)
-	else:
+	elif removed != 1:
 		result.errors += 1
 
 static func trim(directory: String = "user://cache", max_bytes: int = 1073741824, max_files: int = 128) -> Dictionary:

@@ -16,13 +16,24 @@ mod creator_scene;
 mod creator_state;
 #[path = "../../shared/creator_timers.rs"]
 mod creator_timers;
+#[path = "../../shared/media_addresses.rs"]
+mod media_addresses;
 mod media_proxy;
+#[path = "../../shared/media_request.rs"]
+mod media_request;
 mod media_security;
 mod media_source;
 mod packaged_audio;
 #[path = "../../shared/script_budget.rs"]
 mod script_budget;
 mod video;
+mod audio_budget;
+mod render_budget;
+mod cache_lock;
+#[path = "../../shared/error_message.rs"]
+mod error_message;
+#[path = "../../shared/visual_properties.rs"]
+mod visual_properties;
 
 struct Native;
 static CLIENT_VMS: AtomicUsize = AtomicUsize::new(0);
@@ -160,6 +171,11 @@ impl Vm {
                         | "release"
                         | "damage"
                         | "destroy"
+                        | "join"
+                        | "leave"
+                        | "collision"
+                        | "attach"
+                        | "detach"
                 ) {
                     return Err(mlua::Error::RuntimeError("Unsupported visual event".into()));
                 }
@@ -167,7 +183,82 @@ impl Vm {
                 handlers.set(event, callback)
             })?,
         )?;
+        if capabilities.iter().any(|c| c == "media") {
+            let output = commands.clone();
+            api.set(
+                "media",
+                lua.create_function(move |lua, value: mlua::Value| {
+                    let request: media_request::Request = lua.from_value(value)?;
+                    request.validate().map_err(mlua::Error::external)?;
+                    push(
+                        &output,
+                        json!({"action":"media","target":request.target,"request":request}),
+                    )
+                })?,
+            )?;
+        }
         if capabilities.iter().any(|c| c == "visual") {
+            for action in ["play_animation", "stop_animation", "seek_animation"] {
+                let output = commands.clone();
+                api.set(action, lua.create_function(move |_, values: mlua::MultiValue| {
+                    let target = match values.front() {
+                        Some(mlua::Value::String(value)) => value.to_str()?.to_string(),
+                        _ => return Err(mlua::Error::RuntimeError("Expected an animation target ID".into())),
+                    };
+                    if target.is_empty() || target.len() > 64 || target.contains('/') || target == ".." {
+                        return Err(mlua::Error::RuntimeError("Invalid animation target ID".into()));
+                    }
+                    let mut command = json!({"action":action,"target":target});
+                    if action == "play_animation" {
+                        let clip = match values.get(1) {
+                            Some(mlua::Value::String(value)) => value.to_str()?.to_string(),
+                            _ => return Err(mlua::Error::RuntimeError("Expected an animation clip name".into())),
+                        };
+                        if clip.is_empty() || clip.len() > 128 {
+                            return Err(mlua::Error::RuntimeError("Invalid animation clip name".into()));
+                        }
+                        let speed = match values.get(2) {
+                            None | Some(mlua::Value::Nil) => 1.0,
+                            Some(value) => visual_number(value.clone())?,
+                        };
+                        if !(0.1..=4.0).contains(&speed) {
+                            return Err(mlua::Error::RuntimeError("Animation speed must be in [0.1,4]".into()));
+                        }
+                        command["clip"] = json!(clip);
+                        command["value"] = json!(speed);
+                    } else if action == "seek_animation" {
+                        let position = visual_number(values.get(1).cloned().unwrap_or(mlua::Value::Nil))?;
+                        if !(0.0..=86400.0).contains(&position) {
+                            return Err(mlua::Error::RuntimeError("Invalid animation seek position".into()));
+                        }
+                        command["value"] = json!(position);
+                    }
+                    push(&output, command)
+                })?)?;
+            }
+            let output = commands.clone();
+            api.set("set_ambient", lua.create_function(move |lua, (color, brightness): (mlua::Value, mlua::Value)| {
+                let color = visual_value(lua, "light", "color", color)?;
+                visual_properties::validate("light", "color", &color).map_err(mlua::Error::external)?;
+                let brightness = visual_number(brightness)?;
+                if !(0.0..=2.0).contains(&brightness) {
+                    return Err(mlua::Error::RuntimeError("Ambient brightness must be in [0,2]".into()));
+                }
+                push(&output, json!({"action":"ambient","color":color,"brightness":brightness}))
+            })?)?;
+            for (name,kind) in [("set_material","material"),("set_light","light")] {
+                let output=commands.clone();
+                api.set(name,lua.create_function(move |lua,(target,property,value):(String,String,mlua::Value)| {
+                    if target.is_empty() || target.len()>64 || target.contains('/') || target==".." {
+                        return Err(mlua::Error::RuntimeError("Invalid visual target ID".into()));
+                    }
+                    // Decode only the permitted flat shape. Never recursively
+                    // deserialize an arbitrary creator table before validation.
+                    let value=visual_value(lua,kind,&property,value)?;
+                    visual_properties::validate(kind,&property,&value).map_err(mlua::Error::external)?;
+                    push(&output,json!({"action":kind,"target":target,"property":property,"value":value}))
+                })?)?;
+            }
             let output = commands.clone();
             api.set(
                 "spring_gravity",
@@ -236,6 +327,15 @@ impl Vm {
             )?;
         }
         if capabilities.iter().any(|c| c == "audio") {
+            let output = commands.clone();
+            api.set("set_zone", lua.create_function(move |lua, (target,property,value): (String,String,mlua::Value)| {
+                if target.is_empty() || target.len() > 64 {
+                    return Err(mlua::Error::RuntimeError("Invalid acoustic zone ID".into()));
+                }
+                let value = visual_value(lua,"zone",&property,value)?;
+                visual_properties::validate("zone",&property,&value).map_err(mlua::Error::external)?;
+                push(&output,json!({"action":"zone","target":target,"property":property,"value":value}))
+            })?)?;
             for action in ["play_sound", "stop_sound"] {
                 let output = commands.clone();
                 api.set(
@@ -322,6 +422,35 @@ impl Vm {
         Ok(std::mem::take(&mut self.commands.lock().unwrap()))
     }
 }
+fn visual_number(value: mlua::Value) -> mlua::Result<f64> {
+    let number=match value {
+        mlua::Value::Number(number)=>number,
+        mlua::Value::Integer(number)=>number as f64,
+        _=>return Err(mlua::Error::RuntimeError("Expected a finite visual number".into())),
+    };
+    if !number.is_finite() {return Err(mlua::Error::RuntimeError("Expected a finite visual number".into()));}
+    Ok(number)
+}
+fn visual_value(_lua: &Lua, kind: &str, property: &str, value: mlua::Value) -> mlua::Result<Value> {
+    use visual_properties::Shape;
+    Ok(match visual_properties::shape(kind,property) {
+        Some(Shape::Color)=>{
+            let mlua::Value::Table(table)=value else {return Err(mlua::Error::RuntimeError("Expected three color components".into()));};
+            if table.raw_len()!=3 {return Err(mlua::Error::RuntimeError("Expected three color components".into()));}
+            json!([visual_number(table.raw_get(1)?)?,visual_number(table.raw_get(2)?)?,visual_number(table.raw_get(3)?)?])
+        },
+        Some(Shape::Boolean)=>{
+            let mlua::Value::Boolean(value)=value else {return Err(mlua::Error::RuntimeError("Expected a visual boolean".into()));};
+            json!(value)
+        },
+        Some(Shape::Matcap)=>{
+            let mlua::Value::String(value)=value else {return Err(mlua::Error::RuntimeError("Expected a built-in matcap name".into()));};
+            json!(value.to_str()?.to_string())
+        },
+        Some(_)=>json!(visual_number(value)?),
+        None=>return Err(mlua::Error::RuntimeError("Unsupported creator visual property".into())),
+    })
+}
 fn push(commands: &Arc<Mutex<Vec<Value>>>, value: Value) -> mlua::Result<()> {
     if value["target"].as_str().is_none_or(|s| s.len() > 128) {
         return Err(mlua::Error::RuntimeError("Invalid visual target".into()));
@@ -380,7 +509,7 @@ impl CreatorVm {
                 self.vm = Some(vm);
                 GString::new()
             }
-            Err(e) => e.to_string().as_str().into(),
+            Err(e) => error_message::bounded(e).as_str().into(),
         }
     }
     #[func]
@@ -399,7 +528,7 @@ impl CreatorVm {
             Ok(commands) => json!({"commands":commands}).to_string().as_str().into(),
             Err(e) => {
                 self.vm = None;
-                json!({"error":e.to_string()}).to_string().as_str().into()
+                json!({"error":error_message::bounded(e)}).to_string().as_str().into()
             }
         }
     }
@@ -498,6 +627,61 @@ mod tests {
         assert!(Vm::new("avatar.set_visible('other',false)", &[]).is_err());
     }
     #[test]
+    fn fixed_visual_setters_reject_recursive_and_untyped_values() {
+        let capabilities = ["visual".into()];
+        for source in [
+            "world.set_material('Panel','shader','file:///tmp/x')",
+            "world.set_material('../Panel','albedo',{1,0,0})",
+            "world.set_material('Panel','roughness','0.5')",
+            "world.set_material('Panel','albedo',{1,2,0})",
+            "world.set_material('Panel','albedo',{1,0})",
+            "world.set_material('Panel','matcap','http://example.org/image')",
+            "world.set_material('Panel','matcap',{})",
+            "world.set_material('Panel','outline_width',0.1)",
+            "world.set_light('Lamp','enabled',1)",
+            "world.set_light('Lamp','enabled',{})",
+            "world.set_light('Lamp','range',0)",
+            "world.set_light('Lamp','energy',0/0)",
+            "world.set_ambient({1,1,1},3)",
+            "world.set_ambient({1,1,1},'1')",
+            "world.set_ambient({1,1,1},0/0)",
+            "world.play_animation('../Model','walk')",
+            "world.play_animation('Model','walk',0)",
+            "world.play_animation('Model','walk','1')",
+            "world.seek_animation('Model',-1)",
+            "world.seek_animation('Model',{})",
+            "local t={}; t[1]=t; t[2]=0; t[3]=0; world.set_ambient(t,1)",
+            "local t={}; t[1]=t; t[2]=0; t[3]=0; world.set_material('Panel','albedo',t)",
+            "local t={}; local p=t; for i=1,1000 do local n={}; p[1]=n; p=n end; world.set_material('Panel','albedo',t)",
+        ] {
+            assert!(Vm::new(source, &capabilities).is_err(), "{source}");
+        }
+        assert!(Vm::new("world.set_material('Panel','roughness',0.5)", &[]).is_err());
+        assert!(Vm::new("world.set_ambient({1,1,1},1)", &[]).is_err());
+        let vm = Vm::new(
+            "world.on('action',function() world.set_material('Panel','albedo',{0.2,0.4,0.6}); world.set_light('Lamp','enabled',false) end)",
+            &capabilities,
+        ).unwrap();
+        let commands = vm.dispatch("action", json!({})).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["value"], json!([0.2,0.4,0.6]));
+        assert_eq!(commands[1]["value"], json!(false));
+    }
+    #[test]
+    fn acoustic_zone_commands_require_audio_and_fixed_properties() {
+        assert!(Vm::new("world.set_zone('room','reverb',0.5)", &["visual".into()]).is_err());
+        for source in ["world.set_zone('room','reverb',2)",
+            "world.set_zone('room','compression',1)",
+            "world.set_zone('room','script','x')",
+            "local t={}; t[1]=t; world.set_zone('room','reverb',t)"] {
+            assert!(Vm::new(source,&["audio".into()]).is_err());
+        }
+        let vm = Vm::new("world.on('action',function() world.set_zone('room','reverb',0.5) end)",&["audio".into()]).unwrap();
+        let commands = vm.dispatch("action",json!({})).unwrap();
+        assert_eq!(commands[0]["action"],json!("zone"));
+        assert_eq!(commands[0]["value"],json!(0.5));
+    }
+    #[test]
     fn client_timers_share_capabilities_and_cpu_watchdog() {
         let vm = Vm::new(
             "world.after(0.1, function() world.set_visible('lamp', true) end)",
@@ -589,6 +773,23 @@ mod tests {
         );
         assert!(pcm.iter().all(|v| v.is_finite()));
         assert!(pcm.iter().any(|v| v.abs() > 0.01));
+    }
+    #[test]
+    fn creator_media_requests_are_capability_gated_bounded_and_identity_free() {
+        assert!(Vm::new("assert(world.media == nil)", &[]).is_ok());
+        for source in [
+            "world.media({target='screen',action='load',source='file:///etc/passwd'})",
+            "world.media({target='screen',action='seek',value=-1})",
+            "world.media({target='screen',action='rate',value=0/0})",
+            "world.media({target='screen',action='stop',actor='owner'})",
+        ] {
+            assert!(Vm::new(source, &["media".into()]).is_err());
+        }
+        let vm = Vm::new("world.on('action',function() world.media({target='screen',action='seek',value=42}) end)",&["media".into()]).unwrap();
+        let commands = vm.dispatch("action", json!({})).unwrap();
+        assert_eq!(commands[0]["action"], "media");
+        assert_eq!(commands[0]["request"]["value"], 42.0);
+        assert!(commands[0]["request"].get("actor").is_none());
     }
     #[test]
     fn avatar_bone_commands_are_capability_gated_normalized_and_bounded() {

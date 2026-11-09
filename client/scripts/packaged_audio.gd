@@ -7,7 +7,7 @@ var muted := false
 func set_muted(value: bool) -> void:
 	muted = value
 	for state in clips.values():
-		state.player.volume_linear = 0.0 if muted else float(state.volume)
+		state.player.volume_linear = 0.0 if muted else float(state.volume) * float(state.player.get_meta("ssc_occlusion_gain",1.0))
 
 func load_package(path: String, declarations: Array) -> void:
 	clear()
@@ -111,6 +111,7 @@ func _process(_delta: float) -> void:
 func environment(acoustics: Node) -> void:
 	for state in clips.values():
 		state.player.bus = acoustics.route(state.player.global_position)
+		state.player.volume_linear = 0.0 if muted else float(state.volume) * acoustics.source_gain(state.player)
 
 func clear() -> void:
 	for id in clips:

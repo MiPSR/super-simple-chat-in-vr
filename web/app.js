@@ -109,6 +109,11 @@ action("upload", async () => {
   status(`Published ${result.id} · ${result.version}`); await refresh();
 });
 action("allow", async () => {await api("/admin/users", {method:"POST",body:{id:$("discord-id").value}}); await refresh();});
+action("collect-assets", async () => {
+  const result = await api("/admin/assets/gc", {method:"POST",body:{}});
+  status(`GC inspected ${result.scanned} entries: ${result.files} files / ${result.bytes} bytes reclaimed; ${result.errors} errors.`);
+  await refresh();
+});
 action("blocks", async () => {
   const form = $("blocks"); const flags = [...form.querySelectorAll("input[type=checkbox]:checked")].reduce((a,b) => a | Number(b.value),0);
   await api(`/blocks/${encodeURIComponent(form.elements.target.value)}`, {method:"PUT",body:{flags}}); status("Privacy rule saved.");

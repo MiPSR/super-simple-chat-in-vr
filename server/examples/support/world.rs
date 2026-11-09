@@ -249,7 +249,7 @@ pub fn write_avatar(destination: impl Write + Seek) -> anyhow::Result<()> {
     avatar.extend((binary.len() as u32).to_le_bytes());
     avatar.extend(b"BIN\0");
     avatar.extend(binary);
-    let manifest = json!({"schema":1,"kind":"avatar","name":"Reference avatar","scene":"avatar.vrm","actions":["happy"],"contacts":[{"id":"hair","bone":"HairRoot","anchor":"head","offset":[0,0.12,0],"radius":0.2,"grabbable":true}],"scripts":[{"path":"scripts/visual.luau","side":"client","attachment":"avatar","capabilities":["visual"]}]});
+    let manifest = json!({"schema":1,"kind":"avatar","name":"Reference avatar","scene":"avatar.vrm","actions":["happy"],"contacts":[{"id":"hair","bone":"HairRoot","anchor":"head","offset":[0,0.12,0],"radius":0.2,"grabbable":true}],"scripts":[{"path":"scripts/visual.luau","side":"client","attachment":"avatar","capabilities":["visual","queries"]}]});
     let mut archive = zip::ZipWriter::new(destination);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
@@ -259,7 +259,7 @@ pub fn write_avatar(destination: impl Write + Seek) -> anyhow::Result<()> {
         ("avatar.vrm", avatar),
         (
             "scripts/visual.luau",
-            b"avatar.on('action', function(e) avatar.expression(e.name, e.weight) end)".to_vec(),
+            b"local head=avatar.object('humanoid:Head'); assert(head and head.component=='bone' and head.get_node==nil); local nodes=avatar.find_tag('avatar.node'); assert(#nodes>0); avatar.on('action', function(e) avatar.expression(e.name, e.weight) end)".to_vec(),
         ),
     ] {
         archive.start_file(name, options)?;

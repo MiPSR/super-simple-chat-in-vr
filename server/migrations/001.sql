@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS assets (
 CREATE TABLE IF NOT EXISTS asset_versions (
  hash TEXT PRIMARY KEY, manifest TEXT NOT NULL, bytes INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS assets_version ON assets(version);
 CREATE TABLE IF NOT EXISTS blocks (
  owner TEXT NOT NULL REFERENCES users(id), target TEXT NOT NULL REFERENCES users(id), flags INTEGER NOT NULL,
  PRIMARY KEY(owner,target)

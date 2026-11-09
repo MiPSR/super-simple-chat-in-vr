@@ -10,6 +10,7 @@ pub struct Config {
     pub discord_id: String,
     pub discord_secret: String,
     pub tps: u32,
+    pub network_rates: crate::realtime::rates::Policy,
     pub voice_bitrate: u32,
     pub audio_effect_max: f32,
     pub radio_channels: std::collections::BTreeSet<u16>,
@@ -35,6 +36,16 @@ impl Config {
             discord_id: get("SSC_DISCORD_ID", ""),
             discord_secret: get("SSC_DISCORD_SECRET", ""),
             tps: get("SSC_TPS", "60").parse()?,
+            network_rates: crate::realtime::rates::Policy {
+                minimum_hz: get("SSC_NETWORK_MIN_HZ", "1").parse()?,
+                maximum_hz: get("SSC_NETWORK_MAX_HZ", "120").parse()?,
+                automatic: get("SSC_NETWORK_ADAPT", "true").parse()?,
+                suppress_unchanged: match get("SSC_NETWORK_AGGREGATION", "latest").as_str() {
+                    "latest" => false,
+                    "suppress-unchanged" => true,
+                    _ => anyhow::bail!("Network aggregation must be latest or suppress-unchanged"),
+                },
+            },
             voice_bitrate: get("SSC_VOICE_BITRATE", "24000").parse()?,
             audio_effect_max: get("SSC_AUDIO_EFFECT_MAX", "0.9").parse()?,
             radio_channels: get("SSC_RADIO_CHANNELS", "1,2,3,4")
@@ -84,6 +95,7 @@ impl Config {
             "Audio effect ceiling must be 0..1"
         );
         anyhow::ensure!((1..=120).contains(&config.tps), "TPS must be 1..120");
+        config.network_rates.validate(config.tps)?;
         anyhow::ensure!(
             (8000..=64000).contains(&config.voice_bitrate),
             "Voice bitrate must be 8000..64000"

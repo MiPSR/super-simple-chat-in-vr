@@ -32,6 +32,9 @@ impl Request {
     pub fn is_voice(&self) -> bool {
         self.mode == "voice"
     }
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.target.len() + self.mode.len() + self.data.len()
+    }
 }
 struct Usage {
     voice_at: Option<Instant>,

@@ -9,6 +9,7 @@ static func run() -> void:
 	var root := Node3D.new()
 	var prop := Node3D.new()
 	prop.name = "prop"
+	prop.visible = false
 	root.add_child(prop)
 	tree.root.add_child(root)
 	var errors: Array[String] = []
@@ -16,6 +17,9 @@ static func run() -> void:
 	runtime.world_queries = true
 	runtime.update_objects({"prop":{"tags":["game.prop"],"position":[1,0,0],"controller":null}}, 10)
 	runtime.update_state({"ready":false,"count":0,"waypoint":[1,2,3]}, 10)
+	runtime.queue_world_events([{"event":"join","id":"new","clock":10}])
+	runtime._dispatch_world_events()
+	assert(runtime.pending_events.size() == 1, "Loading discarded a committed membership event")
 	var path := "user://creator-query-test.zip"
 	var zip := ZIPPacker.new()
 	assert(zip.open(path) == OK)
@@ -28,7 +32,10 @@ assert(world.state.set == nil and world.state.get('missing') == nil)
 assert(world.state.get('ready') == false and world.state.get('count') == 0)
 local waypoint = world.state.get('waypoint'); waypoint[1] = 999
 assert(world.state.get('waypoint')[1] == 1)
-for _, name in ipairs({'grab','lease','release','damage','destroy'}) do
+world.set_visible('prop',true)
+world.on('join',function(e) assert(e.id == 'new'); world.set_visible('prop',false) end)
+world.on('leave',function(e) assert(e.id == 'new'); world.set_visible('prop',true) end)
+for _, name in ipairs({'grab','lease','release','damage','destroy','collision'}) do
     world.on(name, function(e)
         assert(e.event == name and world.object('prop') == nil)
         if name == 'lease' then assert(e.kind == 'object' and e.hand == nil) end
@@ -58,6 +65,9 @@ end)
 	var declaration := {"side":"client","path":"query.luau","attachment":"world","capabilities":["visual"]}
 	runtime.load_package(path, {"scripts":[declaration, declaration]}, root, true)
 	assert(runtime.scripts.size() == 2 and errors.is_empty())
+	assert(prop.visible and runtime.pending_events.size() == 1)
+	runtime._dispatch_world_events()
+	assert(not prop.visible and errors.is_empty() and runtime.pending_events.is_empty())
 	runtime.dispatch("action", {"expected":1,"visible":false,"state":0})
 	assert(not prop.visible and errors.is_empty())
 	runtime.update_transforms([{"id":"prop","position":[3,0,0],"rotation":[0,0,0,1]}], 12)
@@ -79,6 +89,12 @@ end)
 	assert(not prop.visible and runtime.pending_events.size() == 1)
 	runtime._dispatch_world_events()
 	assert(prop.visible and runtime.pending_events.is_empty() and errors.is_empty())
+	runtime.queue_world_events([{"event":"collision","a":"prop","b":"floor","visible":false}])
+	runtime._dispatch_world_events()
+	assert(not prop.visible and errors.is_empty())
+	runtime.queue_world_events([{"event":"leave","id":"new"}])
+	runtime._dispatch_world_events()
+	assert(prop.visible and errors.is_empty())
 	var burst: Array = []
 	for index in 129:
 		burst.append({"event":"damage","target":"prop","visible":false})

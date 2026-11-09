@@ -48,6 +48,8 @@ func _ready() -> void:
 func ball(radius: float, color: Color) -> MeshInstance3D:
 	var mesh := MeshInstance3D.new()
 	var sphere := SphereMesh.new()
+	sphere.radial_segments = 8
+	sphere.rings = 4
 	sphere.radius = radius
 	sphere.height = radius * 2
 	mesh.mesh = sphere
@@ -129,7 +131,8 @@ func set_model(root: Node3D, package: String = "", manifest: Dictionary = {}) ->
 		model.queue_free()
 	model = Humanoid.new()
 	add_child(model)
-	model.setup(root)
+	var queries: bool = manifest.get("scripts", []).any(func(script): return script.get("side") == "client" and "queries" in script.get("capabilities", []))
+	model.setup(root, queries)
 	colliders = manifest.get("contacts", [])
 	if not package.is_empty():
 		var audio := PackagedAudio.new()

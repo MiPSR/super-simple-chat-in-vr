@@ -1,0 +1,127 @@
+extends RefCounted
+const Runtime = preload("res://scripts/creator_runtime.gd")
+const Materials = preload("res://scripts/materials.gd")
+const Visuals = preload("res://scripts/creator_visuals.gd")
+const Entity = preload("res://scripts/entity.gd")
+
+static func mesh(name: String, material: Material) -> MeshInstance3D:
+	var node := MeshInstance3D.new()
+	node.name = name
+	var box := BoxMesh.new()
+	box.material = material
+	node.mesh = box
+	return node
+
+static func run() -> void:
+	var tree: SceneTree = Engine.get_main_loop()
+	var original := StandardMaterial3D.new()
+	original.albedo_color = Color(0.1,0.2,0.3)
+	var root := Node3D.new()
+	var panel := mesh("Panel",original)
+	var other := mesh("Other",original)
+	root.add_child(panel)
+	root.add_child(other)
+	var precedence := mesh("Precedence",original)
+	var preferred := StandardMaterial3D.new()
+	preferred.albedo_color = Color(0.7,0.6,0.5)
+	precedence.material_override = preferred
+	root.add_child(precedence)
+	var lamp := OmniLight3D.new()
+	lamp.name = "Lamp"
+	lamp.shadow_enabled = true
+	root.add_child(lamp)
+	# Uploaded extras cannot pre-seed private renderer state.
+	panel.set_meta("ssc_creator_material",{"albedo":[1,0,1]})
+	Materials.prepare(root,0)
+	assert(not panel.has_meta("ssc_creator_material"))
+	assert(precedence.material_override == null)
+	assert((precedence.get_active_material(0) as StandardMaterial3D).albedo_color.is_equal_approx(preferred.albedo_color))
+	# Simulate normalized surface resources shared by PackedScene instances.
+	var shared := panel.get_surface_override_material(0)
+	other.set_surface_override_material(0,shared)
+	var runtime := Runtime.new()
+	tree.root.add_child(runtime)
+	runtime.set_process(false)
+	runtime.scope = root
+	var errors: Array[String] = []
+	runtime.script_error.connect(func(message: String): errors.append(message))
+	var vm = ClassDB.instantiate("CreatorVm")
+	assert(vm.load_script("""
+world.on('action',function()
+    world.set_material('Panel','albedo',{0.2,0.4,0.6})
+    world.set_material('Panel','roughness',0.25)
+    world.set_material('Panel','emission',{1,0,0})
+    world.set_material('Panel','emission_energy',2)
+    world.set_light('Lamp','energy',3)
+    world.set_light('Lamp','range',12)
+    world.set_light('Lamp','shadow',true)
+end)
+""",PackedStringArray(["visual"])).is_empty())
+	runtime.scripts.append({"vm":vm,"attachment":"world","failed":false})
+	runtime.dispatch("action",{})
+	var changed := panel.get_active_material(0) as StandardMaterial3D
+	assert(changed.albedo_color.is_equal_approx(Color(0.2,0.4,0.6)))
+	assert(is_equal_approx(changed.roughness,0.25))
+	assert(changed.emission_enabled and changed.emission_texture == null)
+	assert((other.get_active_material(0) as StandardMaterial3D).albedo_color.is_equal_approx(original.albedo_color))
+	assert(panel.get_surface_override_material(0) != shared)
+	assert(other.get_surface_override_material(0) == shared)
+	assert(original.albedo_color.is_equal_approx(Color(0.1,0.2,0.3)))
+	assert(not lamp.shadow_enabled and is_equal_approx(lamp.light_energy,3) and is_equal_approx(lamp.omni_range,12))
+	Materials.apply(root,2)
+	changed = panel.get_active_material(0) as StandardMaterial3D
+	assert(changed.albedo_color.is_equal_approx(Color(0.2,0.4,0.6)) and is_equal_approx(changed.roughness,0.25))
+	assert(lamp.shadow_enabled)
+	runtime._apply({"action":"material","target":"Other","property":"albedo","value":[1,1,1]},"Panel")
+	assert(errors.size() == 1)
+	assert((other.get_active_material(0) as StandardMaterial3D).albedo_color.is_equal_approx(original.albedo_color))
+	var group := Node3D.new()
+	group.name = "Lights"
+	root.add_child(group)
+	root.remove_meta("ssc_visual_names") # Fixture deliberately changes the supplied graph.
+	var omni := OmniLight3D.new()
+	var directional := DirectionalLight3D.new()
+	group.add_child(omni)
+	group.add_child(directional)
+	Materials.prepare(group,0)
+	var initial_range := omni.omni_range
+	assert(not Visuals.apply(root,"world",{"action":"light","target":"Lights","property":"range","value":20}).is_empty())
+	assert(is_equal_approx(omni.omni_range,initial_range) and not group.has_meta("ssc_creator_light"))
+	assert(Visuals.apply(root,"world",{"action":"light","target":"Lights","property":"energy","value":4}).is_empty())
+	assert(Visuals.apply(root,"world",{"action":"light","target":"Lights","property":"enabled","value":false}).is_empty())
+	Materials.apply(group,2)
+	assert(is_equal_approx(omni.light_energy,4) and is_equal_approx(directional.light_energy,4))
+	assert(not omni.visible and not directional.visible)
+	var first := Node3D.new()
+	var second := Node3D.new()
+	root.add_child(first)
+	root.add_child(second)
+	var duplicate_a := mesh("Duplicate",original)
+	var duplicate_b := mesh("Duplicate",original)
+	first.add_child(duplicate_a)
+	second.add_child(duplicate_b)
+	root.remove_meta("ssc_visual_names")
+	assert(Visuals.target(root,"Duplicate","world") == null)
+	assert(Visuals.target(root,"../Panel","world") == null)
+	var entity := Entity.new()
+	tree.root.add_child(entity)
+	entity.set_process(false)
+	var descriptor := {"id":"prop","prefab":"box","position":[0,0,0]}
+	entity.configure(descriptor,{},0,1)
+	root.set_meta("ssc_entities",{"prop":entity})
+	assert(Visuals.apply(root,"prop",{"action":"material","target":"prop","property":"albedo","value":[0.8,0.1,0.2]}).is_empty())
+	var prefab := mesh("Packaged",original)
+	Materials.prepare(prefab,0)
+	var packed := PackedScene.new()
+	assert(packed.pack(prefab) == OK)
+	prefab.free()
+	entity.configure(descriptor,{"box":packed},0,2)
+	assert(not entity.visual.has_meta("fallback"))
+	var upgraded := entity.visual as MeshInstance3D
+	assert((upgraded.get_active_material(0) as StandardMaterial3D).albedo_color.is_equal_approx(Color(0.8,0.1,0.2)))
+	Materials.apply(entity,2)
+	assert((upgraded.get_active_material(0) as StandardMaterial3D).albedo_color.is_equal_approx(Color(0.8,0.1,0.2)))
+	entity.free()
+	runtime.free()
+	root.free()
+	print("PASS scoped material/light commands, private-metadata reset, shared-resource isolation and tier reapplication")

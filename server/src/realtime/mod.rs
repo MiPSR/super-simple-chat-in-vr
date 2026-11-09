@@ -2,8 +2,10 @@ mod calls;
 mod contact;
 mod crypto;
 mod radio;
+pub(crate) mod rates;
 use crate::{App, assets::Manifest, auth, db, world::Join};
 pub(crate) use radio::Request as RadioRequest;
+pub(crate) use calls::Action as CallAction;
 use rusty_enet::{Event, Host, HostSettings, Packet, PacketKind, PeerID};
 use serde_json::{Value, json};
 use std::{
@@ -33,14 +35,19 @@ struct Session {
     session: String,
     instance: String,
     cipher: crypto::Cipher,
-    send_divisor: u32,
-    receive_divisor: u32,
-    last_input: Instant,
+    rates: rates::Rates,
+    rate_sample: Instant,
+    pose_digest: Option<[u8; 32]>,
+    last_output: Instant,
+    last_full_output: Instant,
     last_seen: Instant,
     window: Instant,
     messages: u32,
+    input_bytes: usize,
     voice_frames: u32,
     voice_epoch: u64,
+    input_suspended: bool,
+    call_state: Value,
 }
 fn filter_snapshot_players(snapshot: &mut Value, viewer: &str, db: &rusqlite::Connection) {
     if let Some(players) = snapshot["players"].as_object_mut() {
@@ -49,6 +56,18 @@ fn filter_snapshot_players(snapshot: &mut Value, viewer: &str, db: &rusqlite::Co
             !db::blocked(db, viewer, user, 8)
         });
     }
+}
+fn filter_instance_events(events: &[Value], viewer: &str, db: &rusqlite::Connection) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            !matches!(event["event"].as_str(), Some("join" | "leave"))
+                || event["id"]
+                    .as_str()
+                    .is_some_and(|user| !db::blocked(db, viewer, user, 8))
+        })
+        .cloned()
+        .collect()
 }
 fn send_bytes(
     peer: &mut rusty_enet::Peer<UdpSocket>,
@@ -74,20 +93,23 @@ fn send(
     kind: u8,
     value: &Value,
 ) {
+    if channel==0 && kind==21 && value["event"]=="state" {
+        session.call_state=value.clone();
+    }
     let payload = serde_json::to_vec(value).unwrap();
-    if payload.len() > 48000 && channel == 0 {
+    if let Some(fragment_kind) = fragment_kind(channel,kind,payload.len()) {
         let count = payload.len().div_ceil(24000);
         if count > 256 {
-            peer.disconnect_later(5);
+            if channel == 0 { peer.disconnect_later(5); }
             return;
         }
-        let id = session.cipher.sent[0] + 1;
+        let id = session.cipher.sent[channel as usize] + 1;
         for (index, part) in payload.chunks(24000).enumerate() {
             send(
                 peer,
                 session,
-                0,
-                10,
+                channel,
+                fragment_kind,
                 &json!({"id":id,"index":index,"count":count,"kind":kind,"data":hex::encode(part)}),
             );
         }
@@ -98,7 +120,16 @@ fn send(
     }
     send_bytes(peer, session, channel, kind, &payload);
 }
+fn fragment_kind(channel: u8, kind: u8, bytes: usize) -> Option<u8> {
+    if bytes <= 48000 { return None; }
+    match (channel,kind) {
+        (0,kind) if kind!=10 => Some(10),
+        (1,3) => Some(27),
+        _ => None,
+    }
+}
 pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
+    app.worlds.lock().unwrap().enable_script_scheduler();
     let socket = UdpSocket::bind(app.config.enet)?;
     let mut host = Host::new(
         socket,
@@ -108,6 +139,10 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
             ..Default::default()
         },
     )?;
+    // Bound ENet's unauthenticated fragment assembly before application-layer
+    // authentication sees a packet: 128 peers cannot reserve 32 MiB each.
+    host.set_maximum_packet_size(65536)?;
+    host.set_maximum_waiting_data(256 * 1024)?;
     let running = Arc::new(AtomicBool::new(true));
     let alive = running.clone();
     std::thread::Builder::new().name("authoritative-worlds".into()).spawn(move || {
@@ -132,7 +167,8 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                         let id=peer.id();let data=packet.data();
                         if !sessions.contains_key(&id) {
                             if channel_id!=0 || data.len()<64+75 || data.len()>2048 {peer.disconnect_now(1);pending.remove(&id);continue;}
-                            let ticket=match std::str::from_utf8(&data[..64]) {Ok(s)=>s,Err(_)=>{peer.disconnect_now(1);continue;}};
+                             let ticket=match std::str::from_utf8(&data[..64]) {Ok(s)=>s,Err(_)=>{peer.disconnect_now(1);continue;}};
+                            let _asset_gate=app.asset_gate.blocking_lock();
                             let grant={app.grants.lock().unwrap().get(ticket).cloned()};
                             let Some(g)=grant else {peer.disconnect_now(1);continue;};
                             if g.expires<=db::now() || !auth::session_valid(&app,&g.user,&g.session) {peer.disconnect_now(1);continue;}
@@ -144,24 +180,33 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                             // A rejected transition must leave its session/world intact.
                             let old:Vec<_>=sessions.iter().filter(|(_,s)|s.user==g.user).map(|(id,_)|*id).collect();
                             let result=app.worlds.lock().unwrap().admit(&g.join,&g.user,&g.name,&g.version,g.manifest,g.sources);
-                            let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,send_divisor:1,receive_divisor:1,last_input:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0,voice_epoch:0};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
+                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,1,1),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:0,input_suspended:false,call_state:Value::Null};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
                             // No leave here: admit already transitioned or resnapshotted
                             // membership, so a stale disconnect cannot remove the new one.
                             for old in old {sessions.remove(&old);pending.insert(old,Instant::now()-Duration::from_secs(6));}
                             next_voice_epoch+=1;
-                            let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,send_divisor:g.join.send_divisor,receive_divisor:g.join.receive_divisor,last_input:Instant::now()-step,last_seen:Instant::now(),window:Instant::now(),messages:0,voice_frames:0,voice_epoch:next_voice_epoch};
+                             let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,g.join.send_divisor,g.join.receive_divisor),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:next_voice_epoch,input_suspended:false,call_state:Value::Null};
                             let worlds=app.worlds.lock().unwrap();
                             let mut snapshot=worlds.instances[&instance].snapshot(worlds.tick);
                             filter_snapshot_players(&mut snapshot, &session.user, &app.db.lock().unwrap());
                             let user=session.user.clone();
-                             send(peer,&mut session,0,2,&json!({"snapshot":snapshot,"user":user,"tps":app.config.tps,"send_hz":app.config.tps/g.join.send_divisor,"receive_hz":app.config.tps/g.join.receive_divisor,"voice_bitrate":app.config.voice_bitrate,"audio_effect_max":app.config.audio_effect_max,"radio_bitrate":app.config.radio_bitrate,"radio_channels":app.config.radio_channels,"radio_policy":{"presets":app.config.radio_presets,"ft8_interval":app.config.radio_ft8_interval,"sstv_interval":app.config.radio_sstv_interval,"noise":app.config.radio_noise,"filter_hz":app.config.radio_filter_hz,"interference":app.config.radio_interference}}));
-                            drop(worlds);pending.remove(&id);sessions.insert(id,session);
+                             let send_hz=app.config.tps as f64/session.rates.send as f64;
+                             let receive_hz=app.config.tps as f64/session.rates.receive as f64;
+                              send(peer,&mut session,0,2,&json!({"snapshot":snapshot,"user":user,"tps":app.config.tps,"send_hz":send_hz,"receive_hz":receive_hz,"network_policy":{"minimum_hz":app.config.network_rates.minimum_hz,"maximum_hz":app.config.network_rates.maximum_hz,"automatic":app.config.network_rates.automatic,"aggregation":if app.config.network_rates.suppress_unchanged {"suppress-unchanged"} else {"latest"}},"voice_bitrate":app.config.voice_bitrate,"audio_effect_max":app.config.audio_effect_max,"radio_bitrate":app.config.radio_bitrate,"radio_channels":app.config.radio_channels,"radio_policy":{"presets":app.config.radio_presets,"ft8_interval":app.config.radio_ft8_interval,"sstv_interval":app.config.radio_sstv_interval,"noise":app.config.radio_noise,"filter_hz":app.config.radio_filter_hz,"interference":app.config.radio_interference}}));
+                             send(peer,&mut session,0,21,&calls.snapshot(&user));
+                             drop(worlds);pending.remove(&id);sessions.insert(id,session);
                         } else if let Some(session)=sessions.get_mut(&id) {
-                            if session.window.elapsed()>Duration::from_secs(1) {session.window=Instant::now();session.messages=0;session.voice_frames=0;}
-                            session.messages+=1;
-                            if session.messages>app.config.tps*3+100 {peer.disconnect_now(3);continue;}
+                             if session.window.elapsed()>Duration::from_secs(1) {session.window=Instant::now();session.messages=0;session.input_bytes=0;session.voice_frames=0;}
+                             session.messages+=1;
+                             session.input_bytes=session.input_bytes.saturating_add(data.len());
+                             if session.messages>app.config.tps*3+100 || session.input_bytes>256*1024 {
+                                 if let Some(retired)=sessions.remove(&id) {app.worlds.lock().unwrap().leave(&retired.user);calls.leave(&retired.user);}
+                                 peer.disconnect_now(3);continue;
+                             }
                             let Ok((kind,payload))=session.cipher.open(channel_id,0,data) else {continue;};
-                            session.last_seen=Instant::now();
+                             session.last_seen=Instant::now();
+                             if session.input_suspended && matches!(kind,3|5|6|12|13|14|20|24|25) {continue;}
+                             if channel_id==1 && !session.rates.allow_input(kind,app.config.tps,Instant::now()) {continue;}
                              if (kind==24 && channel_id==2 || kind==25 && channel_id==0) && payload.len()<=8192 {
                                 let epoch=session.voice_epoch;
                                 let deliveries=serde_json::from_slice::<radio::Request>(&payload).ok().filter(|r|r.is_voice()==(kind==24)).map(|request|radios.transmit(&app,&session.instance,&session.user,request));
@@ -199,17 +244,16 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                 if let Ok(tracking)=serde_json::from_slice::<std::collections::BTreeMap<String,crate::world::TrackedJoint>>(&payload)
                                     && crate::world::valid_tracking(&tracking)
                                     && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance)
-                                    && let Some(p)=i.players.get_mut(&session.user) {p.tracking=tracking;}
+                                     && let Some(p)=i.players.get_mut(&session.user) {if p.tracking!=tracking {p.tracking=tracking;p.last_motion=i.clock;}}
                             } else if kind==12 && channel_id==1 && payload.len()<=512 {
                                 if let Ok(action)=serde_json::from_slice::<crate::world::Action>(&payload)
                                     && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance) {let _=i.action(&session.user,action);}
                             } else if kind==3 && channel_id==1 {
-                                if payload.len()!=84 || session.last_input.elapsed()<step*session.send_divisor {continue;}
+                                 if payload.len()!=84 {continue;}
                                 let pose:Vec<f32>=payload.as_chunks::<4>().0.iter().map(|s|f32::from_le_bytes(*s)).collect();
                                 if !pose.iter().all(|v|v.is_finite() && v.abs()<100000.0) {continue;}
                                 let mut worlds=app.worlds.lock().unwrap();
-                                if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.pose=pose;}
-                                session.last_input=Instant::now();
+                                 if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {if p.pose!=pose {p.pose=pose;p.last_motion=i.clock;}}
                             } else if channel_id==0 {
                                 if payload.len()>8192 {continue;}
                                 let Ok(value)=serde_json::from_slice::<Value>(&payload) else {continue;};
@@ -233,7 +277,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                         if let Some(event)=event {for (other,s) in &mut sessions {if s.instance==instance && !db::blocked(&app.db.lock().unwrap(),&s.user,&sender,16) && !db::blocked(&app.db.lock().unwrap(),&s.user,event["target"].as_str().unwrap_or(""),16) {send(host.peer_mut(*other),s,0,6,&event);}}}
                                     }
                                     7=>{let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.sleeping=value["sleeping"].as_bool().unwrap_or(false);i.revision+=1;}}
-                                    8=>{let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) {let _=i.set_avatar(&session.user,valid);}}
+                                     8=>{let _asset_gate=app.asset_gate.blocking_lock();let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let result=app.worlds.lock().unwrap().select_avatar(&session.user,valid);if let Err(error)=result {send(peer,session,0,255,&json!({"error":error.to_string()}));}}
                                     9=>{peer.disconnect_later(0);}
                                     12=>{if let Ok(action)=serde_json::from_value::<crate::world::Action>(value)
                                         && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance)
@@ -251,8 +295,11 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                     21=>{
                                         let actor=session.user.clone();
                                         let online=sessions.values().map(|s|s.user.clone()).collect();
-                                        let messages=serde_json::from_value::<calls::Action>(value).ok().and_then(|action|calls.action(&actor,action,&online,&app.db.lock().unwrap()).ok());
-                                        if let Some(messages)=messages {for (user,value) in messages {for (id,s) in &mut sessions {if s.user==user {send(host.peer_mut(*id),s,0,21,&value);}}}}
+                                         let result=serde_json::from_value::<calls::Action>(value).map_err(anyhow::Error::from).and_then(|action|calls.action(&actor,action,&online,&app.db.lock().unwrap()));
+                                         match result {
+                                             Ok(messages)=>for (user,value) in messages {for (id,s) in &mut sessions {if s.user==user {send(host.peer_mut(*id),s,0,21,&value);}}},
+                                             Err(error)=>send(peer,session,0,255,&json!({"error":error.to_string()})),
+                                         }
                                     }
                                     22=>{
                                         let result=serde_json::from_value::<crate::world::media::Request>(value).map_err(anyhow::Error::from).and_then(|request| {
@@ -262,10 +309,16 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                         });
                                         if let Err(error)=result {send(peer,session,0,255,&json!({"error":error.to_string()}));}
                                     }
-                                    23=>{
+                                     23=>{
                                         if let Some(sent)=value["sent"].as_f64() && sent.is_finite() {
                                             send(peer,session,0,23,&json!({"sent":sent,"server":crate::world::media::now()}));
-                                        }
+                                     }
+                                     28=>{
+                                         if let Some(active)=value["active"].as_bool() {
+                                             session.input_suspended=!active;
+                                             app.worlds.lock().unwrap().input_focus(&session.user,active);
+                                         }
+                                     }
                                     }
                                     _=>{}
                                 }
@@ -284,15 +337,48 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                 let mut worlds=app.worlds.lock().unwrap();worlds.step();
                 for i in worlds.instances.values_mut() {contact::prune(&app,i);}
                 for (id,s) in &mut sessions {
-                    if worlds.tick.is_multiple_of(s.receive_divisor as u64)
+                    if worlds.tick.is_multiple_of(app.config.tps as u64) {
+                        let state=calls.snapshot(&s.user);
+                        if state!=s.call_state {send(host.peer_mut(*id),s,0,21,&state);}
+                    }
+                    if s.rate_sample.elapsed()>=Duration::from_secs(5) {
+                        s.rate_sample=Instant::now();
+                        let peer=host.peer_mut(*id);
+                        let rtt=peer.round_trip_time();
+                        let loss=peer.packet_loss() as f64/rusty_enet::consts::PEER_PACKET_LOSS_SCALE as f64;
+                        if s.rates.observe(app.config.network_rates,app.config.tps,rtt,loss) {
+                            let send_hz=app.config.tps as f64/s.rates.send as f64;
+                            let receive_hz=app.config.tps as f64/s.rates.receive as f64;
+                            send(peer,s,0,26,&json!({"send_hz":send_hz,"receive_hz":receive_hz,"reason":"connection-quality"}));
+                        }
+                    }
+                    if worlds.tick.is_multiple_of(s.rates.receive as u64)
                         && let Some(i)=worlds.instances.get(&s.instance) {
-                            let db=app.db.lock().unwrap();
-                            let players:Vec<_>=i.players.values().filter(|p|!db::blocked(&db,&s.user,&p.id,8)).map(|p| {
+                             let db=app.db.lock().unwrap();
+                             let full=!app.config.network_rates.suppress_unchanged || s.last_full_output.elapsed()>=Duration::from_secs(1);
+                             let players:Vec<_>=i.players.values().filter(|p|rates::recently_changed(full,i.clock,p.last_motion,app.config.tps) && !db::blocked(&db,&s.user,&p.id,8)).map(|p| {
                                 let mut value=json!(p);value["audio_allowed"]=json!(!db::blocked(&db,&s.user,&p.id,1));value
                             }).collect();
-                            let transforms:Vec<_>=i.entities.values().map(|e|json!({"id":e.id,"position":e.position,"rotation":e.rotation})).collect();
-                             let media:std::collections::BTreeMap<_,_>=i.media.iter().map(|(id,m)|(id,m.snapshot())).collect();
-                             send(host.peer_mut(*id),s,1,3,&json!({"tick":worlds.tick,"revision":i.revision,"players":players,"entities":transforms,"media":media}));
+                             let transforms:Vec<_>=i.entities.values().filter(|e|rates::recently_changed(full,i.clock,e.last_motion,app.config.tps)).map(|e|json!({"id":e.id,"position":e.position,"rotation":e.rotation})).collect();
+                              let media:std::collections::BTreeMap<_,_>=i.media.iter().filter(|_|full).map(|(id,m)|(id,m.snapshot())).collect();
+                             let unchanged=if app.config.network_rates.suppress_unchanged {
+                                 use sha2::Digest;
+                                 // Media position advances while playing. Exclude only the
+                                 // sampling timestamp so stopped media can be coalesced.
+                                 let mut comparison_media=media.clone();
+                                 for state in comparison_media.values_mut() {if let Some(state)=state.as_object_mut() {state.remove("sampled_at");}}
+                                 let digest:[u8;32]=sha2::Sha256::digest(serde_json::to_vec(&json!({"revision":i.revision,"players":players,"entities":transforms,"media":comparison_media})).unwrap()).into();
+                                 let unchanged=s.pose_digest==Some(digest);
+                                 s.pose_digest=Some(digest);
+                                 unchanged
+                             } else {false};
+                             // Always resend a complete latest sample at least once per
+                             // second; unreliable loss must never leave a frozen baseline.
+                             if full || !unchanged || s.last_output.elapsed()>=Duration::from_secs(1) {
+                                 send(host.peer_mut(*id),s,1,3,&json!({"tick":worlds.tick,"revision":i.revision,"players":players,"entities":transforms,"media":media}));
+                                 s.last_output=Instant::now();
+                                 if full {s.last_full_output=Instant::now();}
+                             }
                             // Reliable graph/state updates are independent of the negotiated pose rate.
                     }
                 }
@@ -306,13 +392,27 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                     send(host.peer_mut(*id),s,0,2,&json!({"snapshot":snapshot}));revisions.insert(*id,i.revision);
                 }}
                 for (id,s) in &mut sessions {if let Some(i)=worlds.instances.get(&s.instance) && !i.events.is_empty() {
-                    send(host.peer_mut(*id),s,0,11,&json!({"tick":worlds.tick,"events":i.events}));
+                    let events=filter_instance_events(&i.events,&s.user,&app.db.lock().unwrap());
+                    if !events.is_empty() {send(host.peer_mut(*id),s,0,11,&json!({"tick":worlds.tick,"events":events}));}
                 }}
                 for i in worlds.instances.values_mut() {i.events.clear();}
                 let radio_requests:Vec<_>=worlds.instances.iter_mut().flat_map(|(id,instance)| {
                     std::mem::take(&mut instance.radio_requests).into_iter().map(move |(actor,request)|(id.clone(),actor,request))
                 }).collect();
+                let call_requests:Vec<_>=worlds.instances.iter_mut().flat_map(|(id,instance)| {
+                    std::mem::take(&mut instance.call_requests).into_iter().map(move |(actor,action)|(id.clone(),actor,action))
+                }).collect();
                 drop(worlds);
+                for (instance,actor,action) in call_requests {
+                    if !sessions.values().any(|s|s.instance==instance && s.user==actor) {continue;}
+                    let online=sessions.values().map(|s|s.user.clone()).collect();
+                    match calls.creator_action(&actor,action,&online,&app.db.lock().unwrap()) {
+                        Ok(messages)=>for (user,value) in messages {
+                            for (id,s) in &mut sessions {if s.user==user {send(host.peer_mut(*id),s,0,21,&value);}}
+                        },
+                        Err(error)=>for (id,s) in &mut sessions {if s.user==actor {send(host.peer_mut(*id),s,0,255,&json!({"error":error.to_string()}));}}
+                    }
+                }
                 // Radio routing takes its own worlds lock and uses the same
                 // membership/reach/channel/block/cooldown checks as the phone.
                 for (instance,actor,request) in radio_requests {
@@ -329,4 +429,37 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
         }
     })?;
     Ok(running)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_fragment_envelopes_are_never_recursively_fragmented() {
+        for (channel,kind,output) in [(0,2,10),(1,3,27)] {
+            assert_eq!(fragment_kind(channel,kind,60001),Some(output));
+            let part=json!({"id":u64::MAX,"index":255,"count":256,"kind":kind,"data":hex::encode(vec![0;24000])});
+            let bytes=part.to_string().len();
+            assert!(bytes>48000 && bytes<=60000);
+            assert_eq!(fragment_kind(channel,output,bytes),None);
+        }
+        assert_eq!(fragment_kind(2,20,60001),None);
+    }
+    #[test]
+    fn membership_notifications_respect_bilateral_avatar_visibility_blocks() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(include_str!("../../migrations/001.sql"))
+            .unwrap();
+        db.execute_batch("INSERT INTO users(id) VALUES('viewer'),('hidden'),('visible'); INSERT INTO blocks VALUES('viewer','hidden',8)").unwrap();
+        let events = vec![
+            json!({"event":"join","id":"hidden"}),
+            json!({"event":"leave","id":"hidden"}),
+            json!({"event":"join","id":"visible"}),
+            json!({"event":"collision","a":"prop","b":"ground"}),
+        ];
+        assert_eq!(filter_instance_events(&events, "viewer", &db), events[2..]);
+        db.execute_batch("DELETE FROM blocks; INSERT INTO blocks VALUES('hidden','viewer',8)")
+            .unwrap();
+        assert_eq!(filter_instance_events(&events, "viewer", &db), events[2..]);
+    }
 }

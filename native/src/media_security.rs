@@ -12,8 +12,7 @@ use std::{
     thread,
 };
 
-#[path = "../../shared/media_addresses.rs"]
-mod addresses;
+use crate::media_addresses as addresses;
 pub use addresses::public_ip;
 
 #[repr(C)]

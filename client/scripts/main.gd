@@ -15,6 +15,8 @@ const Acoustics = preload("res://scripts/acoustics.gd")
 const RadialMenu = preload("res://scripts/radial_menu.gd")
 const Radio = preload("res://scripts/radio.gd")
 const ContactEvents = preload("res://scripts/contact_events.gd")
+const AmbientVisuals = preload("res://scripts/ambient_visuals.gd")
+var ambient_visuals := AmbientVisuals.new()
 var network: Node
 var loader: Node
 var origin: XROrigin3D
@@ -23,6 +25,7 @@ var controllers: Array[XRController3D] = []
 var avatars: Dictionary = {}
 var world_root: Node3D
 var current_version := ""
+var current_instance := ""
 var phone: Node3D
 var phone_viewport: SubViewport
 var desktop: SubViewportContainer
@@ -77,6 +80,43 @@ var radio_presets_ui: OptionButton
 var settings_panel: VBoxContainer
 var preference_save_timer: Timer
 var preference_save_pending := false
+var input_focused := true
+var phone_before_focus := false
+var xr_interface: OpenXRInterface
+
+func _update_xr_focus() -> void:
+	if xr_interface:
+		var focused := xr_interface.get_session_state() == OpenXRInterface.SESSION_STATE_FOCUSED
+		if xr_interface.is_user_presence_supported():
+			focused = focused and xr_interface.is_user_present()
+		_set_input_focus(focused)
+
+func _notification(what: int) -> void:
+	if not xr_active and what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		_set_input_focus(false)
+	elif not xr_active and what == NOTIFICATION_APPLICATION_FOCUS_IN:
+		_set_input_focus(true)
+
+func _set_input_focus(focused: bool) -> void:
+	if input_focused == focused:
+		return
+	input_focused = focused
+	if is_instance_valid(voice):
+		voice.set_input_focus(focused)
+	if is_instance_valid(network):
+		network.set_input_focus(focused)
+	if not focused:
+		selected_entity = ""
+		menu_pressed = false
+		menu_held = 0
+		drive_elapsed = 0
+		if is_instance_valid(radial):
+			radial.visible = false
+		if is_instance_valid(phone):
+			phone_before_focus = phone.visible
+			phone.visible = false
+	elif is_instance_valid(phone):
+		phone.visible = phone_before_focus
 
 func _ready() -> void:
 	vrm_runtime = VRMRuntime.new()
@@ -84,6 +124,7 @@ func _ready() -> void:
 	add_child(network)
 	network.message.connect(_message)
 	network.status.connect(_status)
+	network.disconnected.connect(_clear_instance)
 	voice = Voice.new()
 	add_child(voice)
 	voice.attach(network)
@@ -112,14 +153,18 @@ func _ready() -> void:
 		root.add_child(audio)
 		root.set_meta("ssc_audio", audio)
 		root.set_meta("ssc_radio", radios)
+		root.set_meta("ssc_network", network)
+		root.set_meta("ssc_entities", entity_nodes)
+		root.set_meta("ssc_visual_host",self)
+		root.set_meta("ssc_acoustics",acoustics)
 		audio.add_to_group("ssc_packaged_audio")
 		audio.failed.connect(_status)
 		audio.load_package(loader.staging, loader.manifest.get("sounds", []))
 		for id in entity_data:
 			entity_nodes[id].configure(entity_data[id], loader.prefabs, quality, latest_tick)
+		acoustics.configure(loader.manifest.get("audio_zones", []), audio_effect_max,bool(loader.manifest.get("realistic_acoustics",false)))
 		creator.load_package(loader.staging, loader.manifest, root, true)
 		_setup_video(loader.manifest)
-		acoustics.configure(loader.manifest.get("audio_zones", []), audio_effect_max)
 		radios.configure(loader.manifest.get("radios", []),radio_policy)
 		radio_choices.clear()
 		for spec in loader.manifest.get("radios", []):
@@ -129,14 +174,28 @@ func _ready() -> void:
 	_build_rig()
 	_build_lobby()
 	_build_phone()
+	voice.set_input_focus(input_focused)
+	network.set_input_focus(input_focused)
+	if not input_focused:
+		phone_before_focus = phone.visible
+		phone.visible = false
 	_status("Open the website, sign in, select a world, and paste a one-use grant below.")
 
 func _build_rig() -> void:
 	origin = XROrigin3D.new()
 	add_child(origin)
-	var xr := XRServer.find_interface("OpenXR")
+	var xr := XRServer.find_interface("OpenXR") as OpenXRInterface
 	if xr and xr.initialize():
 		xr_active = true
+		xr_interface = xr
+		xr.session_focussed.connect(_update_xr_focus)
+		xr.session_visible.connect(func(): _set_input_focus(false))
+		xr.session_stopping.connect(func(): _set_input_focus(false))
+		xr.session_synchronized.connect(func(): _set_input_focus(false))
+		xr.session_loss_pending.connect(func(): _set_input_focus(false))
+		xr.instance_exiting.connect(func(): _set_input_focus(false))
+		xr.user_presence_changed.connect(func(_present: bool): _update_xr_focus())
+		_update_xr_focus()
 		get_viewport().use_xr = true
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		camera = XRCamera3D.new()
@@ -393,6 +452,8 @@ func _connect() -> void:
 		_status(error_string(result))
 
 func _clear_instance() -> void:
+	ambient_visuals.clear()
+	loader.cancel()
 	for avatar in avatars.values():
 		avatar.fallback()
 		avatar.queue_free()
@@ -424,6 +485,7 @@ func _clear_instance() -> void:
 		world_root.queue_free()
 		world_root = null
 	current_version = ""
+	current_instance = ""
 
 func _message(kind: int, data: Dictionary) -> void:
 	if kind == 2 and data.has("user"):
@@ -438,6 +500,9 @@ func _message(kind: int, data: Dictionary) -> void:
 		_status(str(data.get("error", "Server error")))
 	elif kind == 2:
 		var snapshot: Dictionary = data.snapshot
+		if current_instance != str(snapshot.instance):
+			_clear_instance()
+			current_instance = str(snapshot.instance)
 		if current_version != str(snapshot.version):
 			current_version = str(snapshot.version)
 			loader.quality = quality
@@ -493,6 +558,8 @@ func _message(kind: int, data: Dictionary) -> void:
 			voice.prefer_radio(str(data.sender))
 		radios.receive(data)
 	elif kind == 11:
+		var graph_changed := false
+		var event_tick := int(data.tick)
 		for event in data.events:
 			if event.event == "sound" and world_root and world_root.has_meta("ssc_audio"):
 				var audio: Node = world_root.get_meta("ssc_audio")
@@ -500,22 +567,28 @@ func _message(kind: int, data: Dictionary) -> void:
 					"play_sound": audio.play_sound(str(event.target))
 					"stop_sound": audio.stop_sound(str(event.target))
 					"seek_sound": audio.seek_sound(str(event.target), float(event.value))
-			elif event.event == "spawn":
+			elif event.event == "spawn" and event_tick > latest_tick:
 				entity_data[str(event.entity.id)] = event.entity
 				_upsert_entity(event.entity, int(data.tick))
-			elif event.event == "destroy":
+				graph_changed = true
+			elif event.event == "destroy" and event_tick > latest_tick:
 				var id := str(event.target)
 				if entity_nodes.has(id):
 					entity_nodes[id].queue_free()
 					entity_nodes.erase(id)
 				entity_data.erase(id)
-		creator.update_objects(entity_data, int(data.tick))
+				graph_changed = true
+		# A reliable graph for this tick precedes its notifications. Spawn data
+		# describes creation-time poses, not necessarily the final tick pose.
+		if graph_changed:
+			creator.update_objects(entity_data, event_tick)
 		creator.queue_world_events(data.events)
 
 func _upsert_entity(data: Dictionary, tick: int) -> void:
 	var id := str(data.id)
 	if not entity_nodes.has(id):
 		var entity := Entity.new()
+		entity.presentation_error.connect(_status)
 		add_child(entity)
 		entity_nodes[id] = entity
 	entity_nodes[id].configure(data, loader.prefabs, quality, tick)
@@ -567,7 +640,7 @@ func _apply_radio_preset() -> void:
 	voice.configure_radio(clampi(int(radio_bitrate_ceiling * factor), 8000, radio_bitrate_ceiling))
 
 func _update_players(players: Array, tick: int, complete: bool) -> void:
-	voice.positions(players)
+	voice.positions(players,complete)
 	var seen: Dictionary = {}
 	for player in players:
 		var id := str(player.id)
@@ -599,12 +672,27 @@ func _update_players(players: Array, tick: int, complete: bool) -> void:
 				avatars[id].queue_free()
 				avatars.erase(id)
 
+func creator_ambient(color: Array, brightness: float) -> void:
+	var roots: Array = [world_root]
+	roots.append_array(avatars.values())
+	roots.append_array(entity_nodes.values())
+	ambient_visuals.request(roots,Color(float(color[0]),float(color[1]),float(color[2])),brightness)
+
 func _process(delta: float) -> void:
+	ambient_visuals.advance()
+	Materials.refresh_shadows()
+	acoustics.listener(camera.global_position,get_world_3d())
 	radios.environment(acoustics.route(camera.global_position))
 	for state in voice.streams.values():
 		state.player.bus = acoustics.route(state.player.global_position, int(state.get("route", 0)) == 1)
+		acoustics.source_gain(state.player,int(state.get("route",0)) == 1)
 	for surface in video_surfaces.values():
 		surface.player.bus = acoustics.route(surface.global_position)
+		surface.player.volume_linear = acoustics.source_gain(surface.player)
+	for state in radios.receiver.streams.values():
+		acoustics.source_gain(state.player)
+	for device in radios.devices.values():
+		device.tone.volume_linear = acoustics.source_gain(device.tone)
 	for audio in get_tree().get_nodes_in_group("ssc_packaged_audio"):
 		audio.environment(acoustics)
 	if world_root and not avatar_loader and not avatar_queue.is_empty():
@@ -624,6 +712,8 @@ func _process(delta: float) -> void:
 		avatars[network.user].local_pose(delta, poses, sleeping, tracked)
 	var constraints: Dictionary = {}
 	for contact in interactions.values():
+		if not input_focused and (str(contact.actor) == network.user or str(contact.target) == network.user):
+			continue
 		if avatars.has(str(contact.actor)) and avatars.has(str(contact.target)):
 			var list: Array = constraints.get(str(contact.target), [])
 			list.append({"bone":str(contact.bone), "position":avatars[str(contact.actor)].hands[int(contact.hand)].global_position})
@@ -633,6 +723,8 @@ func _process(delta: float) -> void:
 		for constraint in constraints.get(user, []):
 			list.append(constraint)
 		avatars[user].grabs(list)
+	if not input_focused:
+		return
 	touch_elapsed += delta
 	if touch_elapsed > 0.5 and bool(preferences.get("can_touch_others", false)):
 		touch_elapsed = 0
@@ -672,6 +764,8 @@ func _process(delta: float) -> void:
 			radial.point(controllers[1 - phone_hand].get_vector2("primary"))
 
 func _controller_pressed(action: StringName) -> void:
+	if not input_focused:
+		return
 	if action == &"menu_button" or action == &"ax_button":
 		menu_pressed = true
 		menu_held = 0
@@ -683,6 +777,8 @@ func _controller_pressed(action: StringName) -> void:
 			_fire()
 
 func _controller_released(action: StringName) -> void:
+	if not input_focused:
+		return
 	if action == &"menu_button" or action == &"ax_button":
 		if not menu_pressed:
 			return
@@ -772,6 +868,8 @@ func _release() -> void:
 		selected_entity = ""
 
 func _unhandled_input(event: InputEvent) -> void:
+	if not input_focused:
+		return
 	if xr_active:
 		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_RIGHT:

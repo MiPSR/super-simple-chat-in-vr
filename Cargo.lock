@@ -2398,6 +2398,7 @@ dependencies = [
  "libmpv2-sys",
  "mlua",
  "opus",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2430,6 +2431,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
  "zip",
 ]
 

@@ -87,7 +87,10 @@ pub fn router(app: Arc<App>) -> Router {
             put(update_user).delete(revoke_user),
         )
         .route("/api/v1/admin/health", get(admin_health))
-        .layer(DefaultBodyLimit::max(1_000_100_000))
+        .route("/api/v1/admin/assets/gc", post(collect_assets))
+        .layer(DefaultBodyLimit::max(
+            (crate::uploads::MAX_PACKAGE_BYTES + 100_000) as usize,
+        ))
         .layer(middleware::from_fn_with_state(app.clone(), security))
         .with_state(app)
 }
@@ -243,25 +246,36 @@ async fn upload(
     if !matches!(q.kind.as_str(), "world" | "avatar") {
         return Err(ApiError::bad("kind must be world or avatar"));
     }
-    let (budget, slots) = {
+    let budget = {
         let db = app.db.lock().unwrap();
         let sql = if q.kind == "world" {
-            "SELECT world_bytes,world_slots FROM users WHERE id=?"
+            "SELECT world_bytes FROM users WHERE id=?"
         } else {
-            "SELECT avatar_bytes,avatar_slots FROM users WHERE id=?"
+            "SELECT avatar_bytes FROM users WHERE id=?"
         };
-        db.query_row(sql, [&who.id], |r| {
-            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
-        })?
+        db.query_row(sql, [&who.id], |r| r.get::<_, i64>(0))? as u64
     };
-    // Unique staging file; validation and publication run off the async executor.
-    let temp = app.config.data.join(format!("upload-{}.tmp", db::token()));
-    let result=async {
-        let mut file=tokio::fs::File::create(&temp).await.map_err(ApiError::internal)?;
+    let budget = budget.min(crate::uploads::MAX_PACKAGE_BYTES);
+    let lease = app
+        .uploads
+        .reserve(budget)
+        .map_err(|message| ApiError(StatusCode::TOO_MANY_REQUESTS, message.into()))?;
+    let (stage, file) =
+        crate::uploads::Stage::create(&app.config.data, lease).map_err(ApiError::internal)?;
+    let temp = stage.path().to_path_buf();
+    // The stage/lease move into the validation worker, so HTTP cancellation
+    // cannot release its resource reservation while native validation continues.
+    async {
+        let mut file=tokio::fs::File::from_std(file);
+        let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(1800);
         let mut size=0u64;
-        let mut field=multipart.next_field().await.map_err(|_|ApiError::bad("Invalid multipart upload"))?.ok_or_else(||ApiError::bad("Missing package file"))?;
+        let timeout=||ApiError(StatusCode::REQUEST_TIMEOUT,"Upload receive timeout".into());
+        let mut field=tokio::time::timeout(std::time::Duration::from_secs(30),multipart.next_field()).await.map_err(|_|timeout())?.map_err(|_|ApiError::bad("Invalid multipart upload"))?.ok_or_else(||ApiError::bad("Missing package file"))?;
         use tokio::io::AsyncWriteExt;
-        while let Some(chunk)=field.chunk().await.map_err(|_|ApiError::bad("Invalid upload stream"))? {
+        loop {
+            if tokio::time::Instant::now()>=deadline {return Err(timeout());}
+            let idle_deadline=(tokio::time::Instant::now()+std::time::Duration::from_secs(30)).min(deadline);
+            let Some(chunk)=tokio::time::timeout_at(idle_deadline,field.chunk()).await.map_err(|_|timeout())?.map_err(|_|ApiError::bad("Invalid upload stream"))? else {break;};
             size+=chunk.len() as u64;
             if size>budget {return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE,format!("Package exceeds {budget} bytes")));}
             file.write_all(&chunk).await.map_err(ApiError::internal)?;
@@ -270,6 +284,7 @@ async fn upload(
         drop(file);
         let app=app.clone(); let temp=temp.clone();
         tokio::task::spawn_blocking(move || {
+            let _stage=stage;
             let mut f=std::fs::File::open(&temp).map_err(ApiError::internal)?;
             let manifest=assets::validate(&mut f,&q.kind,budget)?;
             use sha2::{Digest,Sha256}; use std::io::{Seek,SeekFrom};
@@ -278,14 +293,19 @@ async fn upload(
             let mut buf=[0u8;65536];
             loop {let n=f.read(&mut buf).map_err(ApiError::internal)?;if n==0 {break;}hash.update(&buf[..n]);}
             let version=hex::encode(hash.finalize());
+            let _asset_gate=app.asset_gate.blocking_lock();
             let mut db=app.db.lock().unwrap();
             let tx=db.transaction()?;
+            let sql=if q.kind=="world" {"SELECT world_bytes,world_slots,enabled FROM users WHERE id=?"} else {"SELECT avatar_bytes,avatar_slots,enabled FROM users WHERE id=?"};
+            let(current_budget,slots,enabled):(i64,i64,bool)=tx.query_row(sql,[&who.id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+            if !who.admin && !enabled {return Err(ApiError(StatusCode::FORBIDDEN,"Upload account was disabled".into()));}
+            if current_budget<0 || size>current_budget as u64 {return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE,"Upload quota changed before publication".into()));}
             let id=if let Some(id)=q.replace {
                 let (owner,kind):(String,String)=tx.query_row("SELECT owner,kind FROM assets WHERE id=?",[&id],|r|Ok((r.get(0)?,r.get(1)?)))?;
                 if (owner!=who.id && !who.admin) || kind!=q.kind {return Err(ApiError(StatusCode::FORBIDDEN,"Not your asset or wrong kind".into()));} id
             } else {
                 let count:i64=tx.query_row("SELECT COUNT(*) FROM assets WHERE owner=? AND kind=?",rusqlite::params![who.id,q.kind],|r|r.get(0))?;
-                if count as u64>=slots {return Err(ApiError::bad("Asset slots exhausted"));} db::token()[..16].to_string()
+                if count>=slots {return Err(ApiError::bad("Asset slots exhausted"));} db::token()[..16].to_string()
             };
             let destination=app.config.data.join("assets").join(format!("{version}.zip"));
             if !destination.exists() {std::fs::rename(&temp,&destination).map_err(ApiError::internal)?;}
@@ -294,9 +314,7 @@ async fn upload(
             tx.commit()?;
             Ok(Json(json!({"id":id,"version":version,"manifest":manifest})))
         }).await.map_err(ApiError::internal)?
-    }.await;
-    let _ = tokio::fs::remove_file(temp).await;
-    result
+    }.await
 }
 async fn remove_asset(
     State(app): State<Arc<App>>,
@@ -324,6 +342,7 @@ async fn download(
     Query(q): Query<Version>,
 ) -> ApiResult<Response> {
     let who = auth::identity(&app, &headers)?;
+    let _asset_gate = app.asset_gate.lock().await;
     use rusqlite::OptionalExtension;
     let catalog: Option<(String, String, String)> = app
         .db
@@ -371,7 +390,16 @@ async fn download(
             .join(format!("{version}.zip")),
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "Asset version is no longer available".into(),
+            )
+        } else {
+            ApiError::internal(error)
+        }
+    })?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip"),
@@ -425,6 +453,7 @@ async fn game_grant(
     Json(join): Json<world::Join>,
 ) -> ApiResult<Json<Value>> {
     let who = auth::identity(&app, &headers)?;
+    let _asset_gate = app.asset_gate.lock().await;
     if who.admin {
         auth::ensure_admin_user(&app)?;
     }
@@ -581,6 +610,14 @@ async fn admin_health(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiRes
     auth::admin(&app, &headers)?;
     let w = app.worlds.lock().unwrap();
     Ok(Json(
-        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps}),
+        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage()}),
     ))
+}
+
+async fn collect_assets(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    let stats = crate::asset_store::collect_once(app)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!(stats)))
 }

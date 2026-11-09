@@ -1,0 +1,62 @@
+extends RefCounted
+const Acoustics = preload("res://scripts/acoustics.gd")
+
+static func run() -> void:
+	var tree: SceneTree = Engine.get_main_loop()
+	var root := Node3D.new()
+	tree.root.add_child(root)
+	var wall := StaticBody3D.new()
+	wall.position = Vector3(0,1,0)
+	var collider := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(2,2,0.1)
+	collider.shape = box
+	wall.add_child(collider)
+	root.add_child(wall)
+	var acoustics := Acoustics.new()
+	root.add_child(acoustics)
+	acoustics.set_process(false)
+	acoustics.set_physics_process(false)
+	var before := AudioServer.bus_count
+	acoustics.configure([{"id":"room","position":[0,1,0],"size":[10,4,10],"effects":{"noise":0.8}}],0.25,true)
+	acoustics.listener(Vector3(0,1,2),root.get_world_3d())
+	await tree.physics_frame
+	await tree.physics_frame
+	assert(acoustics.obstructed(Vector3(0,1,2),Vector3(0,1,-2)))
+	var excluded: Array[RID] = [wall.get_rid()]
+	assert(not acoustics.obstructed(Vector3(0,1,2),Vector3(0,1,-2),excluded))
+	assert(is_equal_approx(acoustics.noise_at(Vector3(0,1,2)),0.25))
+	assert(acoustics.noise_at(Vector3(100,1,2)) == 0)
+	var player := AudioStreamPlayer3D.new()
+	root.add_child(player)
+	var cutoff := player.attenuation_filter_cutoff_hz
+	acoustics.source_gain(player)
+	player.set_meta("ssc_occlusion_gain",0.35)
+	player.attenuation_filter_cutoff_hz = 1200
+	assert(acoustics.source_gain(player,true) == 1.0)
+	assert(is_equal_approx(player.attenuation_filter_cutoff_hz,cutoff))
+	acoustics._update_noise()
+	assert(acoustics.noise_player != null and acoustics.noise_player.playing)
+	assert(is_equal_approx(acoustics.noise_player.volume_linear,0.025))
+	var generator_player := acoustics.noise_player
+	acoustics.listener(Vector3(100,1,2),root.get_world_3d())
+	acoustics._update_noise()
+	assert(not generator_player.playing)
+	acoustics.listener(Vector3(0,1,2),root.get_world_3d())
+	acoustics._update_noise()
+	assert(acoustics.noise_player == generator_player and generator_player.playing)
+	assert(acoustics.creator_property("room","noise",0).is_empty())
+	assert(acoustics.noise_at(Vector3(0,1,2)) == 0)
+	acoustics._update_noise()
+	assert(not generator_player.playing)
+	acoustics.clear()
+	assert(AudioServer.bus_count == before and acoustics.sources.is_empty() and acoustics.noise_player == null)
+	acoustics.configure([{"id":"silent","position":[0,1,0],"size":[10,4,10],"effects":{"noise":1}}],0,false)
+	acoustics.listener(Vector3(0,1,2),root.get_world_3d())
+	acoustics._update_noise()
+	assert(acoustics.noise_player == null)
+	assert(not acoustics.obstructed(Vector3(0,1,2),Vector3(0,1,-2)))
+	acoustics.clear()
+	assert(AudioServer.bus_count == before)
+	root.free()
+	print("PASS optional realistic ray occlusion, source exclusions, private-call dry bypass, bounded zone noise and cleanup")

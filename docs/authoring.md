@@ -95,14 +95,21 @@ Each server script has an independent 8 MiB sandbox and a 5 ms thread-CPU
 execution watchdog (3 ms for client scripts), with a separate 250 ms wall-time
 backstop. Scheduler stalls do not consume its CPU allowance. If the thread
 clock is unavailable, the watchdog fails back to the stricter wall-time limit.
+The server caps creator VMs at 64 across all instances (512 MiB of configured
+Lua heap ceilings, not a whole-process memory budget). Capacity failure rejects
+new-instance admission without leaving the player's previous instance; partial
+construction returns its slots. Disabled server VMs and their pending timers
+are dropped promptly. Administrator health reports active VMs and these limits.
 The native client caps active creator VMs at 64 (at most 512 MiB of configured
 Lua heaps, excluding other engine/native allocations). Exceeding a limit reports
 a script error; it does not remove server interactions or promise a minimum
 rendering frame rate. Client dispatch output is limited to 64 commands and
 64 KiB of serialized command values.
 It receives no OS/filesystem/network/engine handles. A script that errors during
-an event is disabled, not retried every frame. Command queues are bounded to 64
-commands per dispatch. Script-issued changes are applied by the server.
+an event is disabled, not retried every frame. Shared server command queues are
+bounded to 64 commands and 64 KiB of owned UTF-8 payload plus a fixed per-command
+bookkeeping charge. Command IDs are bounded to 64 bytes. These are not allocator
+or native-engine heap quotas. Script-issued changes are applied by the server.
 
 Common APIs:
 
@@ -150,8 +157,20 @@ Common APIs:
    drops newest notifications and reports an error. Each VM retains its own CPU
    watchdog. Queries reflect the latest received graph, not necessarily the
    historical object state when the event was generated. VM/package teardown
-   clears pending notifications. This does not yet supply collision or complete
-   join/leave callback coverage.
+   clears pending notifications.
+- Client-world scripts also receive `join`/`leave` with `id` and `clock`, and
+  `collision` with entity IDs `a`, `b` and `clock`. Membership notifications are
+  filtered by the viewer's bilateral avatar-visibility blocks. A live same-instance
+  connection takeover is continuous membership, not another join/leave pair.
+  Collision starts use the bounded deferred server queue too, rather than up to
+  64 independent immediate Lua dispatches; at most 64 new contacts are admitted
+  per physics tick, with overflow reported. These callbacks describe committed
+  outcomes, not client-declared contacts.
+  Client notifications received while a world package loads wait in its bounded
+  queue until scripts are ready. Startup commands are drained separately before
+  those callbacks and the first tick. Failed/empty packages and instance teardown
+  clear pending notifications. This is not a replay of membership history before
+  admission or a complete player-enumeration API.
 - Both hosts expose `world.after(seconds, function() ... end)` and
   `world.cancel_timer(id)`; client avatar scripts can use the `avatar` alias.
   Timers are VM-local one-shots, at most 64 pending, with finite delays in
@@ -185,8 +204,9 @@ Common APIs:
    survive older reliable graphs; deleted entities cannot be revived by stale
    graphs or pose packets. Limits are 2 MiB per JSON update, 4096 objects and
    64 KiB of resolved tags. Invalid updates clear the client context and report
-   an error. Avatar VMs currently have separate empty query contexts; their own
-   bones/nodes are not yet queryable through this API.
+   an error. Avatar VMs have separate contexts and require an explicit `queries`
+   capability for their own-model view, described below; they never inherit the
+   world's object context.
 - With `state`: `world.state.get(key)` / `world.state.set(key,value)` read/write
   explicitly declared, typed instance variables. Undeclared keys, incompatible
   types and out-of-range values error without changing the variable. Clients
@@ -220,7 +240,233 @@ scores. Reliable spawn/destruction/damage events accompany state changes;
 unreliable transform streams are independently rate-controlled. All of this is
 discarded when an instance empties.
 
+### Client material and light controls (unverified)
+
+Client scripts with `visual` can enqueue fixed presentation-only setters:
+
+```lua
+world.set_material('Panel', 'albedo', {0.2, 0.4, 0.6})
+world.set_material('Panel', 'roughness', 0.25)
+world.set_light('Lamp', 'energy', 3)
+world.set_light('Lamp', 'enabled', false)
+world.set_ambient({0.5, 0.6, 1}, 0.25)
+```
+
+Material properties are `albedo`/`emission` (three RGB numbers in `[0,1]`),
+`roughness`/`metallic` (`[0,1]`), and `emission_energy` (`[0,8]`). Light
+properties are `color` (RGB), `energy` (`[0,8]`), `enabled`/`shadow` (booleans),
+and `range` (`[0.01,100]` metres). Values must have their actual types; numeric
+strings are not numbers. No shader, texture, resource path or generic property
+access is exposed. Lua values are decoded only as these fixed flat shapes.
+
+Targets are exact unique scoped node names or authoritative entity IDs; avatars
+can also use their own captured `node:N` IDs when queries are enabled. World
+scripts can target `@world` for the loaded world root. Object-attached scripts
+can target only their attachment ID. A target group applies to all descendant
+meshes/lights. Ambiguous names and paths are rejected. A range update involving
+a directional light is rejected before updating any light in the group.
+
+Material overrides are isolated per mesh; script state survives tier changes,
+and entity-level overrides are reapplied when a fallback becomes a packaged
+prefab. Tier 0 suppresses computed shadows; lower tiers approximate scripted
+emission without the authored emission texture. These calls affect only the
+local presentation, not authoritative state or other clients. Use replicated
+state and client callbacks for shared behavior.
+
+`world.set_ambient(rgb, brightness)` is restricted to world-attached client
+scripts. RGB is in `[0,1]` and brightness in `[0,2]`, including complete darkness
+at zero in Tier 0. It tints world, entity and avatar base colors, not the phone
+or other host UI. Emission remains independently controlled. New visuals inherit
+the current tint. Existing visuals are recolored through an incremental walk
+(256 node/child steps per render frame); large scenes may settle over multiple
+frames. Repeated requests replace the desired tint without restarting the walk,
+and do not reimport assets or rebuild normalized materials. Instance teardown
+clears pending work and resets ambient color. This is a cheap presentation
+control, not an authoritative light simulation or an access-control mechanism.
+
+This implementation and its new regression cases have **not been compiled or
+executed**.
+
+#### Standardized advanced material schema (unverified)
+
+The same fixed material properties are usable from scripts and a package's
+optional `materials` map, including avatar packages. Prefab definitions can carry
+their own `materials` map. Targets are unique imported node names or `@root` for
+the supplied scene root; names are applied in sorted order (`@root` first):
+
+```json
+"materials": {
+  "@root": { "roughness": 0.8 },
+  "Panel": {
+    "albedo": [0.3, 0.4, 0.5],
+    "specular": 0.6,
+    "rim": 0.4,
+    "rim_tint": 0.7,
+    "outline_width": 0.005,
+    "outline_color": [0, 0, 0],
+    "matcap": "pearl",
+    "matcap_strength": 0.2
+  }
+}
+```
+
+`specular`, `rim`, `rim_tint` and `matcap_strength` are `[0,1]`;
+`outline_width` is `[0,0.02]` metres; `outline_color` is RGB `[0,1]`.
+`matcap` is exactly `none`, `pearl` or `metal`. Matcaps are project-generated
+cached 64-pixel textures with a project-owned shader, never uploaded shader code
+or runtime URLs. Tier 2 supports rim shading, normal maps, toon specular, emission
+and up to two optional extra passes (grown-backface outline and additive matcap).
+Tier 1 retains modest specular and core colors; lower tiers omit extra passes
+and rim shading but preserve their stored settings for switching back. Uploaded
+next-pass chains are not retained. Transparent/cutout outline appearance remains
+an explicit visual acceptance item rather than a promise of a Poiyomi clone.
+
+At most 256 style targets and 13 fixed properties per target are accepted.
+Missing/ambiguous mesh targets fail import. Own-node name and typed-descendant
+lookups use weak cached indexes rather than repeatedly scanning the entire
+scene for each command. Entity visual replacement invalidates those descendant
+indexes. Imported names are stable labels for that immutable loaded scene, not
+an API for adding arbitrary host nodes.
+
+Renderer/audio admission limits are documented in [resource-policy.md](resource-policy.md).
+
+### Supplied client animations (unverified)
+
+Client `visual` scripts can call `play_animation(target, clip, speed?)`,
+`stop_animation(target)`, and `seek_animation(target, seconds)`. World/avatar
+aliases expose the same functions. Targets use the same scoped resolver as
+materials/lights, and must be an AnimationPlayer or contain exactly one supplied
+player. `@avatar` selects the own imported avatar model; `@world` selects the
+loaded world. Speed defaults to 1 and is bounded to `[0.1,4]`. Seek requires an
+assigned clip and cannot exceed its length (absolute maximum one day).
+
+Package import disables autoplay and copies/sanitizes animation libraries.
+Only supplied spatial transform/bone and blend-shape tracks remain; arbitrary
+property, method, audio and foreign-node tracks are stripped. This does not
+grant access to the phone, other avatars or host nodes. Playback is cosmetic:
+shared/discrete behavior must be driven from authoritative replicated state or
+the avatar's declared server-replicated actions, not client-authored outcomes.
+The pre-existing avatar `animation(name)` helper remains available.
+
+These controls and new sanitization tests are written but not executed.
+
+### Client acoustic-zone controls (unverified)
+
+World-attached client scripts with `audio` can call
+`world.set_zone(id, property, value)` for a declared acoustic zone. Properties
+are `reverb`, `echo`, `distortion`, `noise` (numbers `[0,1]`) and `compression` (boolean).
+Effective amounts remain clamped to the administrator's audio-effect ceiling;
+zero ceiling also suppresses compression. Bounds/position and microphone/call
+routing are not writable. Avatar/object-attached scripts cannot use this host.
+
+Writes to the same zone coalesce, identical writes do nothing, and at most two
+zone effect chains rebuild per render frame with a rotating cursor. Private-call
+dry routing and the final limiter remain unchanged. The host configures declared
+zones before script initialization so startup setters are meaningful. Shared
+changes should be driven from replicated state. New coverage is unexecuted.
+
+### Client callback scheduling (unverified)
+
+Live callbacks are queued and processed in order by a fair client-wide render
+frame scheduler. A busy script does not make every other VM run a full watchdog
+budget in the same frame. Ticks coalesce instead of forming an unbounded backlog;
+`dt` includes deferred elapsed time, capped at one second. Author callbacks must
+not assume presentation commands have already reached the renderer synchronously
+when the input packet arrives. See [resource-policy.md](resource-policy.md) for
+ceilings, initialization exceptions and remaining cooperative-budget limits.
+
+### Creator call requests (unverified)
+
+Server-world scripts may request the `voice` capability and call
+`world.call_invite(user_id)` or `world.call_leave()` **only inside an authenticated
+`world.on_interact` callback**. The caller is always the actual interaction
+initiator, never a script-supplied identity. Deferred interactions recheck current
+membership/reach; timers cannot inherit this authority. Client/avatar/object
+declarations cannot request this capability, and creators cannot accept a call
+for someone else or enable microphone capture.
+
+Invitations pass through the same router as the phone: the target must be online,
+the initiator must explicitly enable `allow_creator_calls` in their account
+settings (off by default),
+voice blocks override requests, and the recipient must explicitly accept through
+their UI before receiving private audio. World bypass policies and user call modes
+still govern actual routing. Invite limits are four per actor per ten seconds
+and one per recipient per five seconds, with cooldowns surviving disconnect.
+The instance's creator call queue is bounded to eight requests. New authorization,
+timer, cooldown and acceptance tests are written but unexecuted.
+
+### Authoritative entity attachments and rotation (unverified)
+
+Server scripts with `objects` can enqueue:
+
+```lua
+world.attach('accessory', 'vehicle', {0, 1, 0})
+world.rotate('vehicle', {0, 0.7071068, 0, 0.7071068}) -- x,y,z,w
+world.detach('accessory')
+```
+
+Attachments are Rapier fixed joints between existing entities in the same
+instance, not Godot node parenting. The child must have dynamic physics; both
+entities require physics bodies. Offsets are parent-local, bounded to 100 metres
+per component, with relative identity rotation. Direct parent/child collision is
+disabled. The child initially snaps to the parent-local anchor; subsequent motion
+is server-simulated. Client rendering still interpolates received world poses,
+without another local parenting transform or speculative physics.
+
+Cycles and paths longer than 16 entities are rejected before changing leases or
+physics state. Attaching releases the child's existing control lease; it cannot
+be leased or directly teleported/rotated until detached. Reattachment publishes
+detach/attach notifications. Destroying a parent detaches surviving children and
+removes owned joints. `world.on('attach', ...)` / `world.on('detach', ...)` receive
+bounded deferred notifications on both creator hosts. Detached object queries
+and authoritative snapshots expose `attached_to` and `attachment_offset`.
+
+Rotation uses a normalized finite quaternion; flat numeric vectors/quaternions
+are decoded without recursively walking arbitrary Lua tables. These commands and
+the new Rapier/cycle/lease/snapshot regression cases have not been executed.
+
+Replicated `world.state.set` writes likewise decode only the variable's declared
+boolean/number/integer/string/vector shape. Numeric strings and truthy non-boolean
+values are not coerced; vectors use three raw numeric components without table
+metamethods. Recursive/deep tables are rejected before generic JSON traversal.
+
 ### Client avatar bone and spring controls
+
+Avatar scripts may request `queries` in addition to `visual`/`audio`. With this
+read-only capability, `avatar.object(id)` and `avatar.find_tag(tag, after?)` see
+only that avatar's supplied spatial nodes and skeleton, as detached JSON tables:
+
+```lua
+local head = avatar.object('humanoid:Head')
+local nodes, continuation = avatar.find_tag('avatar.node')
+-- Inspect node.name, node.visible, node.position and node.rotation.
+```
+
+`node:0` is the imported model root; `node:N` identifies a supplied `Node3D` in
+the captured normalized import traversal. Host IK targets/modifiers are excluded.
+`bone:N` identifies the normalized skeleton's bone index, and `humanoid:Head`
+(similarly other available humanoid names) aliases the mapped bone. Tags are
+`avatar.node`, `avatar.bone`, and `avatar.humanoid`, respectively. Display names
+are truncated to 64 Unicode characters (at most 256 UTF-8 bytes); use IDs, not
+these labels, as identifiers. IDs remain stable for that loaded immutable model,
+and removed nodes disappear without their IDs being reused.
+
+Stored local positions/quaternions and node visibility are sampled before each
+dispatch that has an active query-enabled script. Singular node transforms use
+identity rotation. These are local presentation snapshots, not authoritative
+world poses or a promise to expose final post-modifier rendered skin matrices.
+The normalized tracked/estimated input-source data remains in tick `tracking`.
+Limits are 4096 combined node/bone/alias objects, 2 MiB per JSON update, and
+64 KiB of tags. Invalid/oversized contexts clear and report an error rather than
+exposing partial Godot objects. Avatar scripts without `queries` get an empty
+context even when another script on the same avatar requested it. The opt-in
+avoids sampling this view for ordinary visual/audio-only scripts; aggregate
+sampling/renderer performance still requires extended acceptance.
+
+With `visual`, an `avatar`-attached script can use `avatar.set_visible('node:N',
+bool)` on these own-node IDs. Bone rotation/reset also accepts `bone:N` and
+`humanoid:Name`, in addition to ordinary bone names. No node path or foreign
+avatar can be reached. World state and world objects are not part of this view.
 
 Client avatar scripts with `visual` can call:
 
@@ -289,7 +535,7 @@ default to the instance owner only; `public_controls: true` permits joined
 players to control that surface. Phone controls issue authenticated reliable
 commands, independently of negotiated pose rates.
 
-A server script with the `media` capability can issue bounded commands:
+A server or client-world script with the `media` capability can issue bounded commands:
 
 ```lua
 world.media({target="screen", action="load", source="https://example.com/video.mp4"})
@@ -299,6 +545,22 @@ world.media({target="screen", action="rate", value=1.25})
 world.media({target="screen", action="play"})
 world.media({target="screen", action="stop"})
 ```
+
+Server scripts act as authoritative world rules. Client scripts instead send
+ordinary authenticated player requests through the same reliable path as the
+phone: they cannot supply actor/owner identity or bypass owner/public-control
+permissions. The client script attachment must be `world` or the exact target
+surface ID. Avatar runtimes have no media-control network binding. The runtime
+permits at most eight media requests per second across all its scripts, reports
+overflow once per window and resets the counter on teardown; this is separate
+from the server's connection limits. Neither host gives scripts a decoder,
+arbitrary HTTP, DNS or filesystem API.
+
+Both hosts share request validation: target IDs are 1–64 UTF-8 bytes, source
+strings at most 4096 bytes, load sources public HTTP(S) without credentials,
+seeks `0..604800` seconds, and rates `0.25..2`. Unknown fields/actions and
+non-finite values are rejected. Decoder-side DNS/redirect/socket protections
+still apply; syntax checks do not establish that a hostname resolves publicly.
 
 The server stores the source and a monotonic play/pause/seek/rate timeline only;
 clients fetch media directly through libmpv. Reliable snapshots and periodic
@@ -359,8 +621,33 @@ Effect amounts are in `[0,1]` and clamped to the administrator's
 `SSC_AUDIO_EFFECT_MAX` (default `0.9`). Geometry only defines membership: a large
 room may be dry, and a small room may be very reverberant. Voice and video audio
 use Godot's native bus effects and a final limiter. Buses are released when the
-world changes. Noise generation, scripted routing selection and optional
-occlusion/realistic acoustics remain unfinished.
+world changes. The new noise/occlusion implementation below is unverified;
+scripts cannot arbitrarily reroute sources or private calls.
+
+### Optional occlusion and zone noise (unverified)
+
+World manifests can set `"realistic_acoustics":true` (default false). This enables
+a bounded single-ray obstruction approximation, not a room-acoustics simulation:
+up to four physics-space queries per physics tick, rotating among at most 512
+sources, with a minimum 200-ms interval per source. A blocked path applies 0.35
+gain and a 1,200-Hz attenuation filter; unobstructed paths restore the original
+filter. Sources' ancestor collision bodies are excluded. Queries use existing
+physics collision geometry, not visual triangles; reflections, diffraction and
+material transmission are not simulated. Under load, updates are less frequent.
+
+Proximity voice, packaged clips, video and radio sources participate. Private-call
+audio bypasses both zone routing and obstruction, restoring any previous filter.
+Radio retains its narrowband chain and listener-zone routing; its obstruction is
+evaluated at the receiving device. Account voice gain also applies to radio voice.
+
+Zone `effects.noise` is independent of the realistic-acoustics toggle. The first
+zone containing the listener selects bounded mono white noise, mixed through that
+zone's effects. Gain is `0.1 * min(noise, audio_effect_ceiling)`; a zero ceiling
+disables it. One lazy generator fills at most 4,800 stereo frames per render
+frame, stops outside noisy zones, reuses its player on re-entry, and is released
+on world teardown. `world.set_zone(id,"noise",value)` uses the same `[0,1]` bounds
+as other scalar effects. Ray/exclusion/dry-route and generator lifecycle fixtures
+are written but have not been executed; audible and hardware acceptance remain.
 
 ### Packaged standalone audio
 
@@ -448,7 +735,7 @@ Client requests use the same authenticated request path as the phone. Declared c
 reach, channel, payload, cooldown and block checks remain server-owned. Scripts
 cannot enable microphone capture or send raw voice frames. Remote avatar scripts
 cannot impersonate the listener: avatar manifests allow only client-side
-`visual`/`audio` capabilities.
+`visual`/`audio` and read-only own-model `queries` capabilities, never `radio`.
 
 Server scripts may call these functions **only inside `world.on_interact`
 callbacks**. The host binds the actual authenticated initiator; editing the

@@ -14,6 +14,13 @@ var radio_target := ""
 var radio_codec: RefCounted
 var radio_suppressed: Dictionary = {}
 var playback_gain := 1.0
+var capture_permitted := true
+
+func set_input_focus(focused: bool) -> void:
+	capture_permitted = focused
+	if not focused:
+		radio_target = ""
+		set_microphone(false)
 
 func prefer_radio(user: String) -> void:
 	radio_suppressed[user] = Time.get_ticks_msec() + 300
@@ -55,7 +62,7 @@ func configure_radio(server_bitrate: int) -> void:
 			radio_codec = null
 
 func set_microphone(enabled: bool) -> void:
-	microphone_enabled = enabled and codec != null and network.joined
+	microphone_enabled = enabled and capture_permitted and codec != null and network.joined
 	capture.clear_buffer()
 	if microphone_enabled:
 		microphone.play()
@@ -98,7 +105,7 @@ func _receive(user: String, serial: int, _timestamp: int, packet: PackedByteArra
 	state.route = route
 	state.player.panning_strength = 0.0 if route == 1 else 1.0
 	state.player.max_distance = 0.0 if route == 1 else 30.0
-	state.player.volume_linear = 0.0 if Time.get_ticks_msec() < int(radio_suppressed.get(user,0)) else playback_gain
+	state.player.volume_linear = 0.0 if Time.get_ticks_msec() < int(radio_suppressed.get(user,0)) else playback_gain * float(state.player.get_meta("ssc_occlusion_gain",1.0))
 	state.player.attenuation_model = AudioStreamPlayer3D.ATTENUATION_DISABLED if route == 1 else AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
 	var queue: Array = state.queue
 	queue.append(packet)
@@ -107,7 +114,7 @@ func _receive(user: String, serial: int, _timestamp: int, packet: PackedByteArra
 	if queue.size() >= 3:
 		state.started = true
 
-func positions(players: Array) -> void:
+func positions(players: Array, complete: bool = true) -> void:
 	var present: Dictionary = {}
 	for player in players:
 		var user := str(player.id)
@@ -116,7 +123,7 @@ func positions(players: Array) -> void:
 			var p: Array = player.pose
 			streams[user].player.global_position = Vector3(float(p[0]),float(p[1]),float(p[2]))
 	for user in streams.keys():
-		if not present.has(user) and int(streams[user].get("route", 0)) == 0:
+		if complete and not present.has(user) and int(streams[user].get("route", 0)) == 0:
 			streams[user].player.stop()
 			streams[user].player.queue_free()
 			streams.erase(user)
@@ -137,7 +144,7 @@ func _process(delta: float) -> void:
 		if Time.get_ticks_msec() >= int(radio_suppressed[user]):
 			radio_suppressed.erase(user)
 	for user in streams:
-		streams[user].player.volume_linear = 0.0 if radio_suppressed.has(user) else playback_gain
+		streams[user].player.volume_linear = 0.0 if radio_suppressed.has(user) else playback_gain * float(streams[user].player.get_meta("ssc_occlusion_gain",1.0))
 	if not network or not network.joined:
 		if microphone_enabled:
 			set_microphone(false)

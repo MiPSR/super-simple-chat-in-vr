@@ -306,6 +306,20 @@ fn deterministic_reference_package() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn website_administrator_controls_are_authenticated_and_failure_safe() -> Result<()> {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/tests/admin.cjs");
+    let output = Command::new("node").arg("--test").arg(tests).output()?;
+    ensure!(
+        output.status.success(),
+        "Website controls failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
 #[tokio::test]
 async fn encrypted_godot_enet() -> Result<()> {
     let temp_root = std::env::var_os("SSC_TEST_TMP")
@@ -334,6 +348,10 @@ async fn encrypted_godot_enet() -> Result<()> {
     };
     drop(http_socket);
     drop(udp_socket);
+    let abandoned_upload = directory
+        .path()
+        .join(format!("upload-{}.tmp", "a".repeat(64)));
+    std::fs::write(&abandoned_upload, b"abandoned upload")?;
     let _server = Process(
         Command::new(env!("CARGO_BIN_EXE_super-simple-chat-server"))
             .env("SSC_ADMIN_TOKEN", &api.admin)
@@ -357,6 +375,23 @@ async fn encrypted_godot_enet() -> Result<()> {
         ensure!(Instant::now() < deadline, "Backend did not start");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    ensure!(
+        !abandoned_upload.exists(),
+        "Exclusive startup did not recover a crash-orphaned upload"
+    );
+    let duplicate = Command::new("timeout")
+        .args(["3", env!("CARGO_BIN_EXE_super-simple-chat-server")])
+        .env("SSC_ADMIN_TOKEN", &api.admin)
+        .env("SSC_DATA", directory.path())
+        .env("SSC_LISTEN", "127.0.0.1:0")
+        .env("SSC_ENET", "127.0.0.1:0")
+        .output()?;
+    ensure!(
+        !duplicate.status.success()
+            && String::from_utf8_lossy(&duplicate.stderr)
+                .contains("data directory is already in use"),
+        "A second server did not honor exclusive directory ownership"
+    );
     for path in ["/api/v1/me", "/api/v1/assets", "/api/v1/instances"] {
         ensure!(api.response(path, None, "invalid").await?.status() == 401);
     }
@@ -381,6 +416,64 @@ async fn encrypted_godot_enet() -> Result<()> {
                 rusqlite::params![hex::encode(Sha256::digest(token.as_bytes())), user, expires],
             )?;
         }
+    }
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stalled = Vec::new();
+        for _ in 0..2 {
+            let mut stream = tokio::net::TcpStream::connect(http_address).await?;
+            stream.write_all(format!("POST /api/v1/assets?kind=world HTTP/1.1\r\nHost: {http_address}\r\nAuthorization: Bearer {}\r\nContent-Type: multipart/form-data; boundary=hold\r\nContent-Length: 1000\r\n\r\n--hold\r\nContent-Disposition: form-data; name=\"package\"; filename=\"partial.zip\"\r\n\r\npartial",tokens[0]).as_bytes()).await?;
+            stalled.push(stream);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+            if health["uploads"]["active"] == 2 {
+                ensure!(health["uploads"]["reserved_bytes"] == 2_000_000_000u64);
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Uploads did not acquire bounded reservations"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rejected = api
+            .client
+            .post(format!("{}/api/v1/assets?kind=world", api.base))
+            .bearer_auth(&tokens[0])
+            .header("Content-Type", "multipart/form-data; boundary=hold")
+            .body("--hold--\r\n")
+            .send()
+            .await?;
+        ensure!(
+            rejected.status() == 429,
+            "Concurrent upload admission did not reject excess work"
+        );
+        drop(stalled);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+            if health["uploads"]["active"] == 0 {
+                ensure!(health["uploads"]["reserved_bytes"] == 0);
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Cancelled upload reservations survived disconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ensure!(
+            !std::fs::read_dir(directory.path())?.any(|entry| entry.is_ok_and(|entry| entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("upload-") && name.ends_with(".tmp")))),
+            "Cancelled upload files survived cleanup"
+        );
+        println!(
+            "PASS exclusive server ownership, crash-stage recovery, bounded concurrent uploads and disconnect cleanup"
+        );
     }
     let mut settings = api.json("/api/v1/me", None, &tokens[0]).await?["preferences"].clone();
     settings["resolution_scale"] = json!(0.75);
@@ -723,10 +816,20 @@ async fn encrypted_godot_enet() -> Result<()> {
             .is_some_and(|p| p.len() == 2)
     })
     .await?;
-    a.command(json!({"action":"command","kind":22,"data":{"target":"screen","action":"load","source":"https://example.com/video.mp4"}}))?;
+    a.wait(|event| {
+        event["kind"].as_f64() == Some(11.0)
+            && event["data"]["events"].as_array().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["event"] == "join" && event["id"] == users[1])
+            })
+    })
+    .await
+    .context("Reliable creator join notification")?;
+    a.command(json!({"action":"creator_media","source":"world.on('action',function() world.media({target='screen',action='load',source='https://example.com/video.mp4'}) end)"}))?;
     b.wait(|e| snapshot(e)["media"]["screen"]["playing"] == true)
         .await?;
-    b.command(json!({"action":"command","kind":22,"data":{"target":"screen","action":"pause"}}))?;
+    b.command(json!({"action":"creator_media","source":"world.on('action',function() world.media({target='screen',action='pause'}) end)"}))?;
     b.wait(|e| {
         e["kind"].as_f64() == Some(255.0)
             && e["data"]["error"]
@@ -738,7 +841,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     b.wait(|e| snapshot(e)["media"]["screen"]["playing"] == false)
         .await?;
     a.command(
-        json!({"action":"command","kind":22,"data":{"target":"screen","action":"seek","value":42}}),
+        json!({"action":"creator_media","source":"world.on('action',function() world.media({target='screen',action='seek',value=42}) end)"}),
     )?;
     b.wait(|e| snapshot(e)["media"]["screen"]["position"].as_f64() == Some(42.0))
         .await?;
@@ -1385,6 +1488,16 @@ async fn encrypted_godot_enet() -> Result<()> {
     b.stop().await?;
     settle().await;
     ensure!(api.json("/api/v1/instances", None, &tokens[0]).await?[0]["players"] == 1);
+    a.wait(|event| {
+        event["kind"].as_f64() == Some(11.0)
+            && event["data"]["events"].as_array().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["event"] == "leave" && event["id"] == users[1])
+            })
+    })
+    .await
+    .context("Reliable creator leave notification")?;
     let grant = api
         .json(
             "/api/v1/game-grants",
@@ -1451,7 +1564,116 @@ async fn encrypted_godot_enet() -> Result<()> {
             .is_some_and(|m| m.is_empty()),
         "Fresh instance retained a previous media session"
     );
+    let pending_gc_grant = api
+        .json(
+            "/api/v1/game-grants",
+            Some(json!({"world":asset["id"]})),
+            &tokens[1],
+        )
+        .await?;
+    let version = asset["version"].as_str().unwrap();
+    let retired_path = directory
+        .path()
+        .join("assets")
+        .join(format!("{version}.zip"));
+    std::fs::File::open(&retired_path)?.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(172800)),
+    )?;
+    ensure!(
+        api.response("/api/v1/admin/assets/gc", Some(json!({})), &tokens[0])
+            .await?
+            .status()
+            == 403
+    );
+    api.json("/api/v1/admin/assets/gc", Some(json!({})), &api.admin)
+        .await?;
+    ensure!(retired_path.is_file(), "GC removed a catalog version");
+    api.client
+        .delete(format!(
+            "{}/api/v1/assets/{}",
+            api.base,
+            asset["id"].as_str().unwrap()
+        ))
+        .bearer_auth(&tokens[0])
+        .send()
+        .await?
+        .error_for_status()?;
+    let stats = api
+        .json("/api/v1/admin/assets/gc", Some(json!({})), &api.admin)
+        .await?;
+    ensure!(stats["scanned"].as_u64().is_some_and(|count| count <= 64));
+    ensure!(
+        retired_path.is_file(),
+        "GC removed a live or granted immutable version"
+    );
+    let bytes = api
+        .response(
+            &format!(
+                "/api/v1/assets/{}/download?version={version}",
+                asset["id"].as_str().unwrap()
+            ),
+            None,
+            &tokens[0],
+        )
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    ensure!(
+        hex::encode(Sha256::digest(&bytes)) == version,
+        "Live deleted-catalog download changed bytes"
+    );
     fresh.stop().await?;
+    settle().await;
+    api.json("/api/v1/admin/assets/gc", Some(json!({})), &api.admin)
+        .await?;
+    ensure!(
+        retired_path.is_file(),
+        "GC removed an unexpired pending grant's package"
+    );
+    let mut granted = Peer::start(directory.path(), "gc-grant-handoff", pending_gc_grant)?;
+    granted
+        .wait(|event| event["data"]["user"].is_string())
+        .await?;
+    api.json("/api/v1/admin/assets/gc", Some(json!({})), &api.admin)
+        .await?;
+    ensure!(
+        retired_path.is_file(),
+        "Grant consumption lost the live-instance pin"
+    );
+    granted.stop().await?;
+    settle().await;
+    api.json("/api/v1/admin/assets/gc", Some(json!({})), &api.admin)
+        .await?;
+    ensure!(
+        !retired_path.exists(),
+        "Released obsolete version was not reclaimed"
+    );
+    let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+    ensure!(
+        db.query_row(
+            "SELECT COUNT(*) FROM asset_versions WHERE hash=?",
+            [version],
+            |row| row.get::<_, i64>(0)
+        )? == 0
+    );
+    ensure!(
+        api.response(
+            &format!(
+                "/api/v1/assets/{}/download?version={version}",
+                asset["id"].as_str().unwrap()
+            ),
+            None,
+            &api.admin
+        )
+        .await?
+        .status()
+            == 404
+    );
+    println!(
+        "PASS administrator-only bounded GC, live deleted-catalog downloads, pending-grant handoff and final version reclamation"
+    );
     println!(
         "PASS late join, reconnect, empty-instance destruction including media, persistent catalog"
     );

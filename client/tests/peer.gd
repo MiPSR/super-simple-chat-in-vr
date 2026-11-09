@@ -1,6 +1,7 @@
 extends SceneTree
 const Network = preload("res://scripts/network.gd")
 const VideoSurface = preload("res://scripts/video_surface.gd")
+const CreatorRuntime = preload("res://scripts/creator_runtime.gd")
 var network: Node
 var commands := ""
 var serial := 0
@@ -77,6 +78,21 @@ func _process(delta: float) -> bool:
 			match str(command.action):
 				"command":
 					network.command(int(command.kind), command.data)
+				"creator_media":
+					var creator := CreatorRuntime.new()
+					root.add_child(creator)
+					creator.set_process(false)
+					var scope := Node3D.new()
+					root.add_child(scope)
+					scope.set_meta("ssc_network", network)
+					creator.scope = scope
+					creator.script_error.connect(func(message: String): push_error(message))
+					var vm = ClassDB.instantiate("CreatorVm")
+					assert(vm.load_script(str(command.source), PackedStringArray(["media"])).is_empty())
+					creator.scripts.append({"vm":vm,"attachment":"world","failed":false})
+					creator.dispatch("action", {})
+					creator.free()
+					scope.free()
 				"pause_pose":
 					emit_pose = false
 				"video_probe":

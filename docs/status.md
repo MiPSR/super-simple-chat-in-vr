@@ -32,6 +32,12 @@ tests seed their own isolated temporary database sessions.
 
 ## Implemented but not fully accepted
 
+- Optional world ray occlusion and bounded listener-zone noise are newly
+  implemented and unverified. Queries rotate in the physics callback; private
+  calls bypass obstruction and zone effects. Generator lifecycle, exclusions and
+  dry-route regression sources are written but unexecuted. This approximation is
+  not full geometric acoustics; audible/hardware acceptance remains outstanding.
+
 - Discord OAuth plus allowlist and protected administrator secret: live OAuth
   validation requires the deployment's Discord application/configuration.
 - World/avatar upload, versioning, replacement, deletion and quotas: validation
@@ -44,7 +50,12 @@ tests seed their own isolated temporary database sessions.
   Maintained PNG/JPEG/WebP decode, dimension and per-image/package allocation
   checks, including duplicate-view budget charging, pass full local workspace
   regression and Clippy. These do not replace index-content validation,
-  importer/GPU budgets or aggregate concurrent-upload limits.
+   importer/GPU budgets or aggregate concurrent-upload limits.
+   New unverified hardening adds glTF scene/skin/morph/animation/texture/light
+   reference validation, bounded VRM expression/spring work, and streaming BIN
+   checks for actual index bounds, finite floats, sparse ordering and overlaid
+   animation-time ordering. New regression sources are unexecuted; see
+   [asset-validation.md](asset-validation.md).
 - Private instances/invitations: implemented; the full lifecycle/privacy matrix
   now has registry tests for visibility, invitation identity/expiry/consumption,
   full-instance rejection, owner/member return and empty-instance destruction.
@@ -53,8 +64,16 @@ tests seed their own isolated temporary database sessions.
    and releases old constraints; real-peer tests pass. Voice epoch restarts and
    stricter peer-error checks pass full local and combined Nix package checks.
   Broader deployment/privacy acceptance remains.
+   New unverified client work stages replacement transports until admission,
+   explicitly tears down on disconnect, resets by instance identity, and discards
+   cancelled loader generations before scene publication. New headless transition/
+   cancellation fixtures are written but unexecuted.
 - Native OpenXR rig, smartphone/pointing, and tracker adapter: real hardware,
   focus loss/resume, standing/crouching/sitting/lying and comfort checks remain.
+  New unverified focus handling now watches desktop/OpenXR focus and presence,
+  mutes capture without automatic re-enable, cancels gestures/control input,
+  releases authoritative constraints and resumes without reacquiring them.
+  New headless focus/privacy/lease fixtures are written but unexecuted.
 - Material tiers apply to worlds/avatars, but the complete standardized advanced
   feature schema, presentation controls, texture policies and quality testing
   are not finished. The quick menu now draws eight circular stick-selectable
@@ -63,7 +82,22 @@ tests seed their own isolated temporary database sessions.
   (original/half/quarter/eighth dimensions), shared by worlds/prefabs/avatars.
   Full local regression tests verify actual texture dimensions, all material
   tiers and account persistence; Nix client/server checks pass. Existing content
-  needs reloading; physical GPU memory and visual-quality acceptance remain.
+   needs reloading; physical GPU memory and visual-quality acceptance remain.
+   New fixed client-side `set_material`/`set_light` commands are implemented but
+   **unverified**: compilation and tests are paused at the user's request.
+   Deferred coverage includes flat-value validation, shared-resource isolation,
+   material-override precedence, scoped targets and light-group tier persistence.
+   World-only global ambient tint/brightness (including Tier-0 darkness) is now
+   implemented with an incremental recoloring walk, untinted base preservation
+   and teardown reset; it and its new regression cases are also unverified.
+   A fixed advanced schema now adds bounded outline/rim/specular controls,
+   project-generated matcaps and per-package/prefab material declarations, with
+   tier approximations and deferred regression cases. It remains unverified;
+   complete GPU/visual acceptance is not established.
+   Supplied client animation play/stop/seek controls and import-time track
+   sanitization are also implemented but unverified. Only own-model spatial/
+   bone/blend-shape tracks remain; arbitrary method/audio/property tracks are
+   stripped, with deferred regression coverage for escape and resource isolation.
   Persistent eight-sector action bindings and long-press timing now have phone/
   website controls, allowlisted actions, a disabled-slot option and per-gesture
   policy snapshots. Full local workspace/Clippy checks, targeted phone-control
@@ -118,9 +152,19 @@ tests seed their own isolated temporary database sessions.
    combined Nix client/server package checks, including startup, detached-vector,
    false/nil, stale-tick and teardown checks. The subsequent modifier-order and
    custom-bone lookup fixes pass local integration, another 1000-cycle stress
-   run and combined Nix client/server package checks. Avatar
-   own-node queries and complete
+   run and combined Nix client/server package checks. Opt-in avatar-local
+   node/bone queries now pass targeted Godot tests for startup, live detached
+   samples, per-script capabilities, foreign-avatar isolation, deletion and
+   teardown. Full local native/server/Godot and actual imported-VRM regression
+   passes; combined package verification is pending. Complete
    object/light/material APIs remain.
+   Client-world `world.media` now uses the authenticated player-control path,
+   with shared native/server request validation, attachment restrictions and an
+   aggregate client request limit. Full local native/server/Godot and real-peer
+   tests pass, including owner denial and synchronized load/seek. The server
+   creator command queue additionally has an aggregate 64-KiB owned-payload
+   budget and bounded IDs; full local regression and combined Nix client/server
+   package checks pass.
 
 ## Not yet complete
 
@@ -153,15 +197,63 @@ tests seed their own isolated temporary database sessions.
   Async DNS cancellation and joined worker shutdown are added; media-hardening
   Nix client/server package checks pass. This is not a general process sandbox
   or complete decoder/resolver memory budget; see [media-security.md](media-security.md).
-- Full administration/settings acceptance, rate adaptation/aggregation policy,
-  complete resource budgets and immutable-version garbage collection. Completed
+- Full administration/settings acceptance and complete resource budgets remain.
+   New per-peer min/max rates, asymmetric fractional negotiation, hysteretic
+   ENet-quality adaptation and optional unchanged-sample aggregation are
+   implemented but **unverified**, with deferred policy/client regression cases.
+   Reliable state/events remain independent of pose scheduling. See
+   [networking.md](networking.md). Immutable-version garbage collection
+  now has exclusive data-directory ownership, coordinated reference handoffs,
+  catalog/live-world/avatar/grant pins, bounded background passes and an
+  administrator-only manual pass. Full local/Nix integration passes, including
+  deleted-catalog live downloads, pending-grant handoff and final reclamation.
+  Bounded concurrent upload/staging reservations, receive deadlines, cancellation
+  guards and exclusive-startup orphan cleanup now pass full local integration,
+  including stalled raw HTTP streams, 429 admission and disconnect cleanup.
+  A global 64-server-VM ceiling, failed-admission rollback and prompt disabled-VM
+  teardown pass full local regression; combined package verification is pending.
+  Client-world join/leave/collision notifications, bilateral visibility filtering,
+  load-time backlog preservation and deferred server collision callbacks pass
+  full local regression. Explicit lock teardown now covers transient inherited
+  descriptors. The administrator web GC form has authenticated/failure-safe DOM
+  action tests, and client object notifications no longer overwrite a newer or
+  same-tick authoritative graph with creation-time data. Combined Nix client/
+  server package checks pass for these changes; avatar queries are newer and
+  under verification.
+   See [asset-storage.md](asset-storage.md).
+   New aggregate native renderer reservations and packaged-audio memory/clip
+   admission are implemented but unverified. See [resource-policy.md](resource-policy.md)
+   for exact ceilings, fallback behavior and important importer/RSS/CPU gaps.
+   New cooperative client-wide creator scheduling queues callbacks in order,
+   rotates fairly across runtimes, coalesces ticks and yields at a shared frame
+   target; deterministic scheduler fixtures are written but unexecuted.
+   World-only acoustic-zone setters now coalesce/rebuild at most two declared
+   zones per frame under administrator ceilings, with unexecuted regression cases.
+   Live server creator callbacks now use a fair cross-instance queue with tick
+   coalescing and execution-time authenticated-interaction checks; global live
+   entity admission has RAII teardown and preserves old membership on failure.
+   New scheduler/entity-capacity regression cases are written but unexecuted.
+   Native fixed-joint entity attach/detach and authoritative rotation now include
+   cycle/depth checks, lease release/conflict handling, snapshot/query metadata,
+   deferred notifications and parent-destruction cleanup. New Rapier/API tests
+   are written but unexecuted.
+   Replicated Lua writes now decode by their declared flat shape before touching
+   JSON, avoiding recursive host traversal of cyclic/deep creator tables. Bounded
+   diagnostic formatting/log summaries and avatar/media request controls are also
+   newly implemented and unverified.
+   Server-world `voice` creator requests now bind call invite/leave to the actual
+   authenticated interaction initiator, use the ordinary acceptance/block/policy
+   router and have persistent bounded invite cooldowns. New tests are unexecuted.
+  Completed
   client ZIP-cache eviction now has 1 GiB/128-file limits, in-memory recency,
   import pins, safe filename/symlink handling and focused/real-import tests.
   Full local/Nix package checks pass for completed ZIP eviction. Process-owned
   random partial filenames and dead-process cleanup pass full local and combined
   Nix package checks (subsequent stricter filename parsing has targeted coverage).
-  Legacy partial cleanup and
-  cross-process completed-ZIP pins remain; see [asset-cache.md](asset-cache.md).
+   Cross-process completed-ZIP pins, no-replace publication and pin handoff are
+   newly implemented but unverified, with independent-descriptor/process-crash
+   regression cases. Unowned legacy partials remain conservatively preserved;
+   see [asset-cache.md](asset-cache.md).
 - Extended VR/sleeping sessions, repeated avatar/world/media changes, leak and
   interruption testing, full NixOS deployment acceptance and external OAuth.
 
@@ -192,7 +284,9 @@ No row below waives any part of the corresponding scenario.
 | 19 | Bounded queues and repeated decoder shutdown tests; long-session/leak/interruption testing remains. |
 | 20 | Real encrypted Godot↔Rust ENet suite covers reliable/sequenced/reduced-rate/reconnect traffic. |
 
-Latest local workspace tests and Clippy pass. The most recent verified
+The latest completed local workspace tests and Clippy passed **before the current
+unverified implementation batch**. Compilation/testing is deferred until the
+remaining implementation is complete, as requested. The most recent verified
 `nix build .#server .#client --no-link` snapshot includes media hardening,
 asynchronous DNS cancellation, joined decoder shutdown, CPU-time watchdogs,
 typed replicated variables, packaged Opus, client radio APIs/presets, the admin

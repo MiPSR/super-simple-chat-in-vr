@@ -7,6 +7,7 @@ mod opus_file;
 #[class(base=RefCounted,init)]
 struct PackagedOpus {
     clip: Option<opus_file::OpusFile>,
+    lease: Option<crate::audio_budget::Lease>,
     last_error: String,
     base: Base<RefCounted>,
 }
@@ -18,9 +19,14 @@ impl PackagedOpus {
         if bytes.len() > opus_file::MAX_OPUS_BYTES {
             return "Audio exceeds 32 MiB".into();
         }
+        let lease = match crate::audio_budget::Lease::reserve(bytes.len()) {
+            Ok(lease) => lease,
+            Err(error) => return error.into(),
+        };
         match opus_file::OpusFile::open(bytes.to_vec()) {
             Ok(clip) => {
                 self.clip = Some(clip);
+                self.lease = Some(lease);
                 GString::new()
             }
             Err(error) => error.as_str().into(),
@@ -40,6 +46,7 @@ impl PackagedOpus {
             ),
             Err(error) => {
                 self.clip = None;
+                self.lease = None;
                 self.last_error = error;
                 PackedVector2Array::new()
             }
@@ -74,6 +81,7 @@ impl PackagedOpus {
     #[func]
     fn close(&mut self) {
         self.clip = None;
+        self.lease = None;
         self.last_error.clear();
     }
 }

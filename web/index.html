@@ -12,6 +12,7 @@
 <label>Receive rate <select name="receive_divisor"><option value="1">Full</option><option value="2">Half</option><option value="4">Quarter</option></select></label>
 <label>Phone hand <select name="phone_hand"><option>left</option><option>right</option></select></label>
 <label>Private-call routing <select name="call_mode"><option value="automatic">Spatial when nearby, private otherwise</option><option value="private">Always non-positional</option><option value="spatial">Proximity only</option></select></label>
+<label><input type="checkbox" name="allow_creator_calls"> Allow world interaction scripts to invite/leave my calls (off by default)</label>
 <label>Microphone device name <input name="input_device" maxlength="256" placeholder="Default"></label>
 <label>Output device name <input name="output_device" maxlength="256" placeholder="Default"></label>
 <label>Voice playback gain <input name="voice_volume" type="number" min="0" max="1" step="0.05"></label>
@@ -30,5 +31,5 @@
 <h2>Live instances</h2><button id="refresh">Refresh</button><div id="instances"></div>
 <h2>Privacy</h2><form id="blocks"><label>Discord user ID <input name="target" required></label><label><input type="checkbox" name="voice" value="1"> Mute voice</label><label><input type="checkbox" name="text" value="2"> Hide text</label><label><input type="checkbox" name="touch" value="4"> Prohibit contact</label><label><input type="checkbox" name="avatar" value="8"> Hide avatar</label><label><input type="checkbox" name="complete" value="16"> Complete block</label><button>Save block levels</button></form>
 <h2>Connect the client</h2><p>Create a connection grant from a world or instance below, then paste the JSON into the client's phone. A grant expires in 60 seconds and can be used only once. Treat its secret as a password.</p><textarea id="grant" readonly rows="6" aria-label="One-use connection grant"></textarea></section>
-<section id="admin" hidden><h2>Administration</h2><form id="allow"><label>Discord user ID <input id="discord-id" required pattern="[0-9]{5,24}"></label><button>Allow account</button></form><div id="users"></div><pre id="health"></pre></section>
+<section id="admin" hidden><h2>Administration</h2><form id="allow"><label>Discord user ID <input id="discord-id" required pattern="[0-9]{5,24}"></label><button>Allow account</button></form><div id="users"></div><pre id="health"></pre><form id="collect-assets"><button>Reclaim unused versions (24h+)</button><p>One bounded pass. Catalog, live-instance and pending-grant references are preserved.</p></form></section>
 </main><footer>Development build — see docs/status.md for unimplemented release requirements.</footer></body></html>

@@ -20,7 +20,83 @@ u64 counter, followed by a random 16-byte IV, ciphertext and 32-byte MAC. MACs a
 verified before decryption. Each channel rejects counters at or below its latest
 authenticated value; older reordered envelopes are discarded too. Large reliable
 JSON snapshots use bounded application fragments. This is not a completed
-cryptographic/security audit or a complete aggregation/load policy.
+cryptographic/security audit or full load acceptance.
+
+## Per-peer rates (new implementation, unverified)
+
+`SSC_NETWORK_MIN_HZ`/`SSC_NETWORK_MAX_HZ` (defaults 1/120) bound both directions
+independently. Integer tick divisors are chosen within those bounds, so a 90 TPS
+server can announce fractional rates such as 22.5 Hz. Impossible configurations
+(for example exactly 40 Hz at 60 TPS) fail startup instead of silently violating
+the limits. Requested full/half/quarter factors are clamped to this policy.
+
+`SSC_NETWORK_ADAPT=true` samples ENet RTT/reliable-packet loss every five seconds.
+Three consecutive poor samples (RTT >=350 ms or loss >=8%) double each peer's
+divisors within the minimum rate. Six consecutive healthy samples (RTT <=180 ms
+and loss <=2%) recover toward that peer's original requested/clamped rates.
+Intermediate samples reset both streaks. No peer can change simulation TPS or
+another peer's schedule. Reliable authenticated kind 26 announces the effective
+`send_hz`/`receive_hz`; the client adjusts its tracking cadence, not rendering.
+Set adaptation to `false` to disable this policy.
+
+`SSC_NETWORK_AGGREGATION=latest` sends complete latest samples at each peer's
+receive cadence. Optional `suppress-unchanged` additionally hashes current
+presentation state and skips identical disposable packets. It resends a complete
+sample at least once per second (or the next negotiated send opportunity), never
+uses lossy delta baselines, averages poses or predicts missing input. Playing
+media still changes position; stopped-media sampling timestamps alone do not
+force updates. Reliable graph/state/events remain independent of this setting.
+The NixOS module exposes matching `simulationTps`, `networkMinimumHz`,
+`networkMaximumHz`, `networkAdaptation` and `networkAggregation` options.
+
+This batch has not been compiled/tested; deterministic policy and client decode
+regressions are written, and packet-loss/load acceptance remains outstanding.
+
+The optional aggregation path now repeats recently changed player/body samples
+for one second and emits a complete keyframe at least once per second. Old static
+samples need not occupy every intermediate packet. Playing-media timing is
+refreshed in keyframes and reliable controls, rather than forcing the entire idle
+graph to transmit at pose rate. This is not a delta baseline or prediction:
+changed samples repeat across packet loss and keyframes repair an omitted final
+sample. Partial player updates cannot retire idle proximity voice streams;
+complete reliable rosters still remove departed/blocked players.
+
+Authenticated upstream data is capped at 256 KiB per peer per second, before
+envelope authentication work. Exceeding byte/message limits retires membership
+immediately rather than leaving a disconnected peer counted for the timeout.
+Independent pose/body-tracker/control pacing permits a two-sample jitter burst
+without inadvertently halving well-paced input. New pacing/partial-roster cases
+are unexecuted.
+
+Large disposable pose graphs now use bounded kind-27 multipart samples instead
+of silently exceeding the 60-KiB packet ceiling. Reassembly retains only the
+newest sample, caps it at 256 parts / 6 MiB, expires incomplete data after two
+seconds, and applies nothing until complete. A later sample supersedes missing
+parts rather than retransmitting obsolete transforms. Reliable kind-10 and
+disposable kind-27 envelopes are explicitly excluded from recursive fragmentation;
+this also fixes a large-reliable-envelope recursion case found during review.
+ENet itself is limited to 64-KiB packets and 256-KiB waiting data per server peer,
+before application authentication. New fragmentation cases are unexecuted.
+
+## Focus loss and resume (new implementation, unverified)
+
+Reliable authenticated kind 28 reports the connection owner's `active` boolean.
+Suspending input immediately releases that player's leases/held props and avatar
+constraints with reason `focus_lost`, clears body-tracker input, and holds the
+last authoritative pose. Suspended sessions cannot send gameplay/tracking,
+proximity/radio voice or contact/action requests. World scripts also cannot lease
+an object to an input-suspended player. Deferred interaction callbacks recheck
+this state. Resuming permits new input but never recreates old constraints.
+
+The client watches desktop application focus or OpenXR session focus/presence,
+not desktop-window focus while XR is active. It cancels pending radial gestures,
+stops movement/control transmission, mutes capture, clears radio transmission
+selection and hides the 3D phone. Local XR camera tracking remains independent;
+rendered remote poses are not extrapolated. Resume restores permitted input and
+phone visibility, but the microphone stays muted until the user explicitly
+enables it again. OpenXR signals/current state avoid assuming the initial session
+is already focused. New headless transition fixtures are unexecuted; real
+headset/dashboard/focus/resume acceptance remains outstanding.
 
 ## Voice stream epochs
 
@@ -73,3 +149,18 @@ This does not resurrect an instance destroyed after its last participant left.
 Synthetic and real-Godot tests cover rejection preservation, private invitation
 boundaries, live takeover, stale disconnects and voice restart. Packet-loss/load,
 long-session and real XR acceptance remain required.
+
+New unverified client work now stages a second transport while retaining the old
+authenticated one. Rejection leaves the old connection, cipher and resources
+untouched. Success transfers the admitted transport and renegotiates audio without
+briefly treating a successful takeover's old-peer retirement as a user leave.
+Real disconnect/timeout emits explicit teardown instead of leaving old scripts,
+media and constraints running indefinitely. Main instance identity, not just the
+asset hash, controls runtime reset, including switches between instances using
+the same immutable world version.
+
+Asset loaders now cancel by generation: stale HTTP callbacks and completed GLTF
+results cannot publish an abandoned scene. A running importer retires without a
+UI-thread join, releases its pin, and then processes the newest queued load.
+Only final node teardown joins a still-running worker. New staged-transition and
+cancelled-generation fixtures are unexecuted.
