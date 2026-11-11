@@ -4,10 +4,15 @@ use std::sync::Mutex;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CLIPS: usize = 128;
 #[derive(Default)]
-struct Usage { bytes: usize, clips: usize }
+struct Usage {
+    bytes: usize,
+    clips: usize,
+}
 static USAGE: Mutex<Usage> = Mutex::new(Usage { bytes: 0, clips: 0 });
 
-pub struct Lease { bytes: usize }
+pub struct Lease {
+    bytes: usize,
+}
 impl Lease {
     pub fn reserve(bytes: usize) -> Result<Self, &'static str> {
         let mut usage = USAGE.lock().unwrap();

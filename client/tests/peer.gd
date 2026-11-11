@@ -14,6 +14,24 @@ var raised_hands := false
 var radio_codec: RefCounted
 var video: Node3D
 var media_sampled := -1.0
+var stopping := false
+
+func _stop(code: int = 0) -> void:
+	if stopping:
+		return
+	stopping = true
+	emit_pose = false
+	network.close()
+	if video:
+		video.close()
+		video.queue_free()
+		video = null
+	codec = null
+	radio_codec = null
+	# Let the mixer/main thread retire stopped generator playbacks before exit.
+	await create_timer(0.1).timeout
+	await process_frame
+	quit(code)
 
 func _update_video(data: Dictionary) -> void:
 	var source := OS.get_environment("SSC_TEST_PUBLIC_VIDEO")
@@ -65,6 +83,8 @@ func _initialize() -> void:
 	started = Time.get_ticks_msec()
 
 func _process(delta: float) -> bool:
+	if stopping:
+		return false
 	if emit_pose:
 		var poses: Array[Transform3D] = [Transform3D(Basis.IDENTITY, Vector3(0,1.65,0)), Transform3D(Basis.IDENTITY,Vector3(-0.05 if raised_hands else -0.3,1.7 if raised_hands else 1,0)), Transform3D(Basis.IDENTITY,Vector3(0.05 if raised_hands else 0.3,1.7 if raised_hands else 1,0))]
 		network.pose(delta, poses)
@@ -120,10 +140,8 @@ func _process(delta: float) -> bool:
 						packet[30] ^= 1
 						network.peer.send(0, packet, ENetPacketPeer.FLAG_RELIABLE)
 				"quit":
-					network.close()
-					quit()
+					_stop()
 			print("SSCTEST " + JSON.stringify({"kind":254,"data":{"serial":serial}}))
 	if Time.get_ticks_msec() - started > (90000 if not OS.get_environment("SSC_TEST_PUBLIC_VIDEO").is_empty() else 45000):
-		network.close()
-		quit(2)
+		_stop(2)
 	return false

@@ -13,38 +13,88 @@ static func _source(original: Material) -> StandardMaterial3D:
 	# Retain only the standardized family's source data, never arbitrary shader
 	# state/next-pass chains and their otherwise-unused uploaded textures.
 	var source := StandardMaterial3D.new()
+	source.roughness = 0.8
 	if original is StandardMaterial3D:
-		source.albedo_color = original.albedo_color
+		source.albedo_color = _color(original.albedo_color,Color.WHITE)
 		source.albedo_texture = original.albedo_texture
 		source.transparency = original.transparency
+		source.alpha_scissor_threshold = original.alpha_scissor_threshold
+		source.uv1_scale = original.uv1_scale
+		source.uv1_offset = original.uv1_offset
 		source.cull_mode = original.cull_mode
 		source.emission_enabled = original.emission_enabled
-		source.emission = original.emission
+		source.emission = _color(original.emission,Color.BLACK)
 		source.emission_texture = original.emission_texture
-		source.emission_energy_multiplier = original.emission_energy_multiplier
+		source.emission_energy_multiplier = clampf(original.emission_energy_multiplier,0,8)
 		source.metallic = original.metallic
+		source.roughness = original.roughness
 		source.metallic_specular = original.metallic_specular
 		source.normal_enabled = original.normal_enabled
 		source.normal_texture = original.normal_texture
-		source.normal_scale = original.normal_scale
+		source.normal_scale = clampf(original.normal_scale,-4,4)
 	elif original is ShaderMaterial:
 		var texture = original.get_shader_parameter("_MainTex")
 		var color = original.get_shader_parameter("_Color")
 		if texture is Texture2D:
 			source.albedo_texture = texture
-		if color is Color:
-			source.albedo_color = color
+		source.albedo_color = _color(color,Color.WHITE)
+		# Interpret only the pinned importer's fixed MToon uniforms/variants.
+		# No supplied shader or next-pass resource survives normalization.
+		if original.shader and original.shader.resource_path.begins_with("res://addons/Godot-MToon-Shader/"):
+			var variant: String = original.shader.resource_path.get_file().get_basename()
+			if variant.begins_with("mtoon_trans"):
+				source.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			elif variant.begins_with("mtoon_cutout"):
+				source.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+				var cutoff = original.get_shader_parameter("_Cutoff")
+				if cutoff is float or cutoff is int:
+					source.alpha_scissor_threshold = clampf(float(cutoff),0,1)
+			var normal = original.get_shader_parameter("_BumpMap")
+			if normal is Texture2D:
+				source.normal_texture = normal
+				source.normal_enabled = true
+				source.normal_scale = _number(original.get_shader_parameter("_BumpScale"),1,0,4)
+			var emission = original.get_shader_parameter("_EmissionMap")
+			if emission is Texture2D:
+				source.emission_texture = emission
+			source.emission = _color(original.get_shader_parameter("_EmissionColor"),Color.BLACK)
+			source.emission_energy_multiplier = _number(original.get_shader_parameter("_EmissionMultiplier"),1,0,8)
+			source.emission_enabled = source.emission_texture != null or source.emission.r > 0 or source.emission.g > 0 or source.emission.b > 0
+			var uv = original.get_shader_parameter("_MainTex_ST")
+			if uv is Vector4:
+				source.uv1_scale = Vector3(uv.x,uv.y,1)
+				source.uv1_offset = Vector3(uv.z,uv.w,0)
+			elif uv is Plane:
+				source.uv1_scale = Vector3(uv.x,uv.y,1)
+				source.uv1_offset = Vector3(uv.z,uv.d,0)
 	return source
+
+static func _number(value: Variant, fallback: float, minimum: float, maximum: float) -> float:
+	return clampf(float(value),minimum,maximum) if (value is float or value is int) and is_finite(float(value)) else fallback
+
+static func _color(value: Variant, fallback: Color) -> Color:
+	var color := fallback
+	if value is Color:
+		color = value
+	elif value is Vector4:
+		color = Color(value.x,value.y,value.z,value.w)
+	elif value is Plane:
+		color = Color(value.x,value.y,value.z,value.d)
+	if not is_finite(color.r) or not is_finite(color.g) or not is_finite(color.b) or not is_finite(color.a):
+		return fallback
+	return color.clamp(Color(0,0,0,0),Color(1,1,1,1))
 
 static func _clear_mesh_materials(root: Node) -> void:
 	# All instances captured their source before this second traversal. Clearing
 	# shared mesh slots therefore cannot erase a sibling's authored source.
 	if root is MeshInstance3D and root.mesh:
 		if root.mesh is PrimitiveMesh:
-			root.mesh.material = null
+			if root.mesh.material != null:
+				root.mesh.material = null
 		elif root.mesh is ArrayMesh:
 			for index in root.mesh.get_surface_count():
-				root.mesh.surface_set_material(index,null)
+				if root.mesh.surface_get_material(index) != null:
+					root.mesh.surface_set_material(index,null)
 	for child in root.get_children():
 		_clear_mesh_materials(child)
 
@@ -83,6 +133,9 @@ static func apply(root: Node, tier: int, brightness: float = 1.0) -> void:
 				mat.albedo_color = original.albedo_color
 				mat.albedo_texture = original.albedo_texture
 				mat.transparency = original.transparency
+				mat.alpha_scissor_threshold = original.alpha_scissor_threshold
+				mat.uv1_scale = original.uv1_scale
+				mat.uv1_offset = original.uv1_offset
 				mat.cull_mode = original.cull_mode
 				mat.emission_enabled = tier == 2 and original.emission_enabled
 				mat.emission = original.emission
@@ -106,7 +159,9 @@ static func apply(root: Node, tier: int, brightness: float = 1.0) -> void:
 			mat.specular_mode = BaseMaterial3D.SPECULAR_TOON if tier == 2 else BaseMaterial3D.SPECULAR_SCHLICK_GGX
 			if tier == 0:
 				mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
-			mat.roughness = 0.8
+				if mat.transparency in [BaseMaterial3D.TRANSPARENCY_ALPHA,BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS]:
+					mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_HASH
+			mat.roughness = original.roughness if original is StandardMaterial3D else 0.8
 			root.set_surface_override_material(i, mat)
 		apply_overrides(root)
 		apply_tint(root)

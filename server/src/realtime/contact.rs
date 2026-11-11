@@ -72,7 +72,10 @@ pub fn apply(
         .players
         .get(actor)
         .ok_or_else(|| anyhow::anyhow!("Actor is not joined"))?;
-    anyhow::ensure!(source.input_active && target.input_active,"Contact input is suspended");
+    anyhow::ensure!(
+        source.input_active && target.input_active,
+        "Contact input is suspended"
+    );
     let collider = if request.segment == "head" {
         Contact {
             id: "head".into(),

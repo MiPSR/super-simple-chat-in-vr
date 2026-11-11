@@ -23,7 +23,7 @@ impl Default for Spawn {
     }
 }
 pub enum Command {
-    Call(String,crate::realtime::CallAction),
+    Call(String, crate::realtime::CallAction),
     Radio(String, crate::realtime::RadioRequest),
     Sound(String, &'static str, f64),
     Media(super::media::Request),
@@ -32,8 +32,8 @@ pub enum Command {
     Visible(String, bool),
     Active(String, bool),
     Move(String, [f32; 3]),
-    Rotate(String,[f32;4]),
-    Attach(String,String,[f32;3]),
+    Rotate(String, [f32; 4]),
+    Attach(String, String, [f32; 3]),
     Detach(String),
     Velocity(String, [f32; 3]),
     Damage(String, f32, Option<String>),
@@ -45,10 +45,16 @@ impl Command {
         let valid = |id: &str| !id.is_empty() && id.len() <= 64;
         let optional = |id: &Option<String>| id.as_deref().is_none_or(valid);
         let (valid_ids, bytes) = match self {
-            Self::Call(actor,action)=>match action {
-                crate::realtime::CallAction::Invite {user}=>(valid(actor) && valid(user),actor.len()+user.len()),
-                crate::realtime::CallAction::Leave=>(valid(actor),actor.len()),
-                crate::realtime::CallAction::Accept {..}=>return Err(mlua::Error::RuntimeError("Creators cannot accept calls".into())),
+            Self::Call(actor, action) => match action {
+                crate::realtime::CallAction::Invite { user } => {
+                    (valid(actor) && valid(user), actor.len() + user.len())
+                }
+                crate::realtime::CallAction::Leave => (valid(actor), actor.len()),
+                crate::realtime::CallAction::Accept { .. } => {
+                    return Err(mlua::Error::RuntimeError(
+                        "Creators cannot accept calls".into(),
+                    ));
+                }
             },
             Self::Radio(actor, request) => (valid(actor), actor.len() + request.payload_bytes()),
             Self::Sound(id, _, _)
@@ -56,7 +62,7 @@ impl Command {
             | Self::Visible(id, _)
             | Self::Active(id, _)
             | Self::Move(id, _)
-            | Self::Rotate(id,_)
+            | Self::Rotate(id, _)
             | Self::Detach(id)
             | Self::Velocity(id, _)
             | Self::Score(id, _) => (valid(id), id.len()),
@@ -76,7 +82,9 @@ impl Command {
                 id.len() + actor.as_ref().map_or(0, String::len),
             ),
             Self::Lease(id, actor) => (valid(id) && valid(actor), id.len() + actor.len()),
-            Self::Attach(child,parent,_)=>(valid(child) && valid(parent),child.len()+parent.len()),
+            Self::Attach(child, parent, _) => {
+                (valid(child) && valid(parent), child.len() + parent.len())
+            }
         };
         if !valid_ids {
             return Err(mlua::Error::RuntimeError(
@@ -115,18 +123,34 @@ fn enqueue(context: &Shared, command: Command) -> mlua::Result<()> {
     context.commands.push(command);
     Ok(())
 }
-fn components<const N:usize>(value: mlua::Value) -> mlua::Result<[f32;N]> {
-    let mlua::Value::Table(table)=value else {return Err(mlua::Error::RuntimeError("Expected a flat numeric vector".into()));};
-    if table.raw_len()!=N {return Err(mlua::Error::RuntimeError("Wrong vector component count".into()));}
-    let mut result=[0.0;N];
-    for (index,component) in result.iter_mut().enumerate() {
-        let value=match table.raw_get(index+1)? {
-            mlua::Value::Number(value)=>value,
-            mlua::Value::Integer(value)=>value as f64,
-            _=>return Err(mlua::Error::RuntimeError("Expected finite numeric components".into())),
+fn components<const N: usize>(value: mlua::Value) -> mlua::Result<[f32; N]> {
+    let mlua::Value::Table(table) = value else {
+        return Err(mlua::Error::RuntimeError(
+            "Expected a flat numeric vector".into(),
+        ));
+    };
+    if table.raw_len() != N {
+        return Err(mlua::Error::RuntimeError(
+            "Wrong vector component count".into(),
+        ));
+    }
+    let mut result = [0.0; N];
+    for (index, component) in result.iter_mut().enumerate() {
+        let value = match table.raw_get(index + 1)? {
+            mlua::Value::Number(value) => value,
+            mlua::Value::Integer(value) => value as f64,
+            _ => {
+                return Err(mlua::Error::RuntimeError(
+                    "Expected finite numeric components".into(),
+                ));
+            }
         };
-        if !value.is_finite() || value.abs()>100000.0 {return Err(mlua::Error::RuntimeError("Vector component out of bounds".into()));}
-        *component=value as f32;
+        if !value.is_finite() || value.abs() > 100000.0 {
+            return Err(mlua::Error::RuntimeError(
+                "Vector component out of bounds".into(),
+            ));
+        }
+        *component = value as f32;
     }
     Ok(result)
 }
@@ -139,19 +163,47 @@ pub fn install(
     context: Shared,
     capabilities: &[String],
 ) -> mlua::Result<()> {
-    if capabilities.iter().any(|capability|capability=="voice") {
-        let calls=context.clone();
-        world.set("call_invite",lua.create_function(move |_,user:String| {
-            let actor=calls.lock().unwrap().interaction_actor.clone()
-                .ok_or_else(||mlua::Error::RuntimeError("Call requests require an authenticated interaction".into()))?;
-            enqueue(&calls,Command::Call(actor,crate::realtime::CallAction::Invite {user}))
-        })?)?;
-        let calls=context.clone();
-        world.set("call_leave",lua.create_function(move |_,():()| {
-            let actor=calls.lock().unwrap().interaction_actor.clone()
-                .ok_or_else(||mlua::Error::RuntimeError("Call requests require an authenticated interaction".into()))?;
-            enqueue(&calls,Command::Call(actor,crate::realtime::CallAction::Leave))
-        })?)?;
+    if capabilities.iter().any(|capability| capability == "voice") {
+        let calls = context.clone();
+        world.set(
+            "call_invite",
+            lua.create_function(move |_, user: String| {
+                let actor = calls
+                    .lock()
+                    .unwrap()
+                    .interaction_actor
+                    .clone()
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "Call requests require an authenticated interaction".into(),
+                        )
+                    })?;
+                enqueue(
+                    &calls,
+                    Command::Call(actor, crate::realtime::CallAction::Invite { user }),
+                )
+            })?,
+        )?;
+        let calls = context.clone();
+        world.set(
+            "call_leave",
+            lua.create_function(move |_, (): ()| {
+                let actor = calls
+                    .lock()
+                    .unwrap()
+                    .interaction_actor
+                    .clone()
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(
+                            "Call requests require an authenticated interaction".into(),
+                        )
+                    })?;
+                enqueue(
+                    &calls,
+                    Command::Call(actor, crate::realtime::CallAction::Leave),
+                )
+            })?,
+        )?;
     }
     lua.set_named_registry_value("events", lua.create_table()?)?;
     world.set(
@@ -168,7 +220,7 @@ pub fn install(
                     | "lease"
                     | "release"
                     | "damage"
-                     | "destroy"
+                    | "destroy"
                     | "attach"
                     | "detach"
             ) {
@@ -274,22 +326,43 @@ pub fn install(
     if !capabilities.iter().any(|c| c == "objects") {
         return Ok(());
     }
-    let scene=context.clone();
-    world.set("attach",lua.create_function(move |_,(child,parent,offset):(String,String,mlua::Value)| {
-        let offset=components::<3>(offset)?;
-        if offset.iter().any(|v|v.abs()>100.0) {return Err(mlua::Error::RuntimeError("Attachment offset exceeds 100 metres".into()));}
-        enqueue(&scene,Command::Attach(child,parent,offset))
-    })?)?;
-    let scene=context.clone();
-    world.set("detach",lua.create_function(move |_,child:String|enqueue(&scene,Command::Detach(child)))?)?;
-    let scene=context.clone();
-    world.set("rotate",lua.create_function(move |_,(id,value):(String,mlua::Value)| {
-        let mut rotation=components::<4>(value)?;
-        let length=rotation.iter().map(|v|v*v).sum::<f32>().sqrt();
-        if !(0.0001..=100.0).contains(&length) {return Err(mlua::Error::RuntimeError("Invalid entity quaternion".into()));}
-        for component in &mut rotation {*component/=length;}
-        enqueue(&scene,Command::Rotate(id,rotation))
-    })?)?;
+    let scene = context.clone();
+    world.set(
+        "attach",
+        lua.create_function(
+            move |_, (child, parent, offset): (String, String, mlua::Value)| {
+                let offset = components::<3>(offset)?;
+                if offset.iter().any(|v| v.abs() > 100.0) {
+                    return Err(mlua::Error::RuntimeError(
+                        "Attachment offset exceeds 100 metres".into(),
+                    ));
+                }
+                enqueue(&scene, Command::Attach(child, parent, offset))
+            },
+        )?,
+    )?;
+    let scene = context.clone();
+    world.set(
+        "detach",
+        lua.create_function(move |_, child: String| enqueue(&scene, Command::Detach(child)))?,
+    )?;
+    let scene = context.clone();
+    world.set(
+        "rotate",
+        lua.create_function(move |_, (id, value): (String, mlua::Value)| {
+            let mut rotation = components::<4>(value)?;
+            let length = rotation.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if !(0.0001..=100.0).contains(&length) {
+                return Err(mlua::Error::RuntimeError(
+                    "Invalid entity quaternion".into(),
+                ));
+            }
+            for component in &mut rotation {
+                *component /= length;
+            }
+            enqueue(&scene, Command::Rotate(id, rotation))
+        })?,
+    )?;
     let scene = context.clone();
     world.set(
         "spawn",

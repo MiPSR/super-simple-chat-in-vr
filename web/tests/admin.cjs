@@ -11,7 +11,7 @@ class Element {
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, fn) { this.listeners.set(name, fn); }
 }
-async function page() {
+async function page(preferences = {}) {
   const html = readFileSync(join(__dirname,"../index.html"),"utf8");
   const elements = new Map();
   for (const match of html.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) {
@@ -26,7 +26,7 @@ async function page() {
       requests.push({path,options});
       if (options.headers.Authorization !== "Bearer " + "s".repeat(32)) return {ok:false,statusText:"Forbidden",json:async () => ({error:"Administrator authentication required"})};
       if (path === "/api/v1/admin/assets/gc") return gc();
-      const body = path === "/api/v1/me" ? {user:{id:"admin",admin:true},preferences:{}} : path === "/api/v1/admin/health" ? {uploads:{active:0,reserved_bytes:0},creator_vms:{active:0,limit:64}} : [];
+      const body = path === "/api/v1/me" ? {user:{id:"admin",admin:true},preferences} : path === "/api/v1/admin/health" ? {uploads:{active:0,reserved_bytes:0},creator_vms:{active:0,limit:64}} : [];
       return {ok:true,json:async () => body};
     },
   };
@@ -71,4 +71,23 @@ test("GC errors are displayed and do not leave the submit control disabled",asyn
   assert.equal(button.disabled,false);
   assert.equal(p.elements.get("admin").hidden,true);
   assert.match(p.elements.get("status").textContent,/Administrator authentication required/);
+});
+
+test("draw distance saves as a number without discarding untouched account preferences",async () => {
+  const p = await page({draw_distance:250,can_touch_me:true,voice_volume:0.5});
+  const distance = new Element(); distance.type = "number";
+  const radial = Array.from({length:8},() => { const element = new Element(); element.value = "none"; return element; });
+  p.elements.get("preferences").elements.namedItem = name => name === "draw_distance" ? distance : name.startsWith("radial_action_") ? radial[Number(name.slice(14))] : null;
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  assert.equal(Number(distance.value),250);
+  distance.value = "80";
+  await p.submit("preferences");
+  const request = p.requests.find(request => request.path === "/api/v1/preferences");
+  assert.equal(request.options.method,"PUT");
+  const payload = JSON.parse(request.options.body);
+  assert.equal(payload.draw_distance,80);
+  assert.equal(payload.can_touch_me,true);
+  assert.equal(payload.voice_volume,0.5);
+  assert.equal(payload.radial_actions.length,8);
 });

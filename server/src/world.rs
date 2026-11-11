@@ -8,17 +8,17 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 mod creator;
 #[path = "../../shared/creator_timers.rs"]
 mod creator_timers;
+#[path = "../../shared/error_message.rs"]
+mod error_message;
 pub mod media;
 mod physics;
 #[path = "../../shared/script_budget.rs"]
 mod script_budget;
-#[path = "../../shared/error_message.rs"]
-mod error_message;
 use creator::{Command, Context, Shared, Spawn};
 
 const MAX_CREATOR_VMS: usize = 64;
@@ -29,14 +29,18 @@ static LIVE_ENTITIES: AtomicUsize = AtomicUsize::new(0);
 struct EntitySlot;
 impl EntitySlot {
     fn reserve() -> anyhow::Result<Arc<Self>> {
-        LIVE_ENTITIES.try_update(Ordering::AcqRel,Ordering::Acquire,|count| {
-            (count < MAX_LIVE_ENTITIES).then_some(count + 1)
-        }).map_err(|_|anyhow::anyhow!("Global live entity budget exhausted"))?;
+        LIVE_ENTITIES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_LIVE_ENTITIES).then_some(count + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("Global live entity budget exhausted"))?;
         Ok(Arc::new(Self))
     }
 }
 impl Drop for EntitySlot {
-    fn drop(&mut self) { LIVE_ENTITIES.fetch_sub(1,Ordering::AcqRel); }
+    fn drop(&mut self) {
+        LIVE_ENTITIES.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 #[derive(Debug)]
 struct VmCapacityError;
@@ -69,7 +73,7 @@ pub fn creator_vm_usage() -> Value {
     json!({"active":CREATOR_VMS.load(Ordering::Acquire),"limit":MAX_CREATOR_VMS,"per_vm_bytes":CREATOR_MEMORY_BYTES,"entities":{"active":LIVE_ENTITIES.load(Ordering::Acquire),"limit":MAX_LIVE_ENTITIES}})
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Join {
     #[serde(default)]
@@ -84,6 +88,18 @@ pub struct Join {
     pub send_divisor: u32,
     #[serde(default = "one")]
     pub receive_divisor: u32,
+}
+impl Default for Join {
+    fn default() -> Self {
+        Self {
+            world: String::new(),
+            instance: String::new(),
+            private: false,
+            invitation: String::new(),
+            send_divisor: 1,
+            receive_divisor: 1,
+        }
+    }
 }
 fn one() -> u32 {
     1
@@ -132,7 +148,7 @@ pub fn valid_tracking(joints: &BTreeMap<String, TrackedJoint>) -> bool {
 #[derive(Serialize, Clone)]
 pub struct Entity {
     pub attached_to: Option<String>,
-    pub attachment_offset: [f32;3],
+    pub attachment_offset: [f32; 3],
     #[serde(skip)]
     pub last_motion: u64,
     #[serde(skip)]
@@ -233,7 +249,7 @@ static NEXT_SCRIPT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 struct ScriptJob {
     event: String,
     value: Value,
-    interaction: Option<(String,String)>,
+    interaction: Option<(String, String)>,
     after: u64,
     bytes: usize,
 }
@@ -329,10 +345,9 @@ impl Sandbox {
                     let value = declarations
                         .get(&key)
                         .ok_or_else(|| {
-                            mlua::Error::RuntimeError(
-                                "Undeclared replicated variable".into(),
-                            )
-                        })?.lua_value(value)?;
+                            mlua::Error::RuntimeError("Undeclared replicated variable".into())
+                        })?
+                        .lua_value(value)?;
                     let mut vars = variables.lock().unwrap();
                     if key.len() > 64
                         || (!vars.contains_key(&key) && vars.len() >= 128)
@@ -422,14 +437,22 @@ impl Sandbox {
 }
 impl Instance {
     fn report_script_diagnostic(&mut self, message: impl std::fmt::Display) {
-        if self.last_script_diagnostic.is_some_and(|last|last.elapsed()<Duration::from_secs(1)) {
-            self.suppressed_script_diagnostics=self.suppressed_script_diagnostics.saturating_add(1);
+        if self
+            .last_script_diagnostic
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            self.suppressed_script_diagnostics =
+                self.suppressed_script_diagnostics.saturating_add(1);
             return;
         }
-        eprintln!("World {}: {} ({} similar diagnostics suppressed)",self.id,
-            error_message::bounded(message),self.suppressed_script_diagnostics);
-        self.last_script_diagnostic=Some(Instant::now());
-        self.suppressed_script_diagnostics=0;
+        eprintln!(
+            "World {}: {} ({} similar diagnostics suppressed)",
+            self.id,
+            error_message::bounded(message),
+            self.suppressed_script_diagnostics
+        );
+        self.last_script_diagnostic = Some(Instant::now());
+        self.suppressed_script_diagnostics = 0;
     }
     fn create(
         id: String,
@@ -539,7 +562,7 @@ impl Instance {
                 object.id.clone(),
                 Entity {
                     attached_to: None,
-                    attachment_offset: [0.0;3],
+                    attachment_offset: [0.0; 3],
                     last_motion: 0,
                     _slot: slot,
                     id: object.id,
@@ -581,7 +604,10 @@ impl Instance {
             ) {
                 Ok(script) => instance.scripts.push(script),
                 Err(e) if e.is::<VmCapacityError>() => return Err(e),
-                Err(e) => eprintln!("Script initialization failed: {}",error_message::bounded(e)),
+                Err(e) => eprintln!(
+                    "Script initialization failed: {}",
+                    error_message::bounded(e)
+                ),
             }
         }
         instance.apply_commands();
@@ -599,54 +625,98 @@ impl Instance {
             return;
         }
         if self.scheduled_scripts {
-            self.queue_script_job(event,value,None);
+            self.queue_script_job(event, value, None);
             return;
         }
         self.refresh_context();
         for script in &mut self.scripts {
             if let Err(e) = script.event(event, &value) {
                 script.enabled = false;
-                eprintln!("Script {} ({event}) disabled: {}", self.id,error_message::bounded(e));
+                eprintln!(
+                    "Script {} ({event}) disabled: {}",
+                    self.id,
+                    error_message::bounded(e)
+                );
             }
         }
         self.scripts.retain(|script| script.enabled);
         self.apply_commands();
     }
-    fn queue_script_job(&mut self, event: &str, value: Value, interaction: Option<(String,String)>) {
-        let bytes = value.to_string().len() + event.len()
-            + interaction.as_ref().map_or(0, |(target,actor)| target.len() + actor.len()) + 128;
-        if self.script_jobs.len() >= 128 || bytes > 262144
-            || self.script_job_bytes + bytes > 2 * 1024 * 1024 {
-            self.report_script_diagnostic("Creator dispatch backlog exceeded; newest callback dropped");
+    fn queue_script_job(
+        &mut self,
+        event: &str,
+        value: Value,
+        interaction: Option<(String, String)>,
+    ) {
+        let bytes = value.to_string().len()
+            + event.len()
+            + interaction
+                .as_ref()
+                .map_or(0, |(target, actor)| target.len() + actor.len())
+            + 128;
+        if self.script_jobs.len() >= 128
+            || bytes > 262144
+            || self.script_job_bytes + bytes > 2 * 1024 * 1024
+        {
+            self.report_script_diagnostic(
+                "Creator dispatch backlog exceeded; newest callback dropped",
+            );
             return;
         }
         self.script_job_bytes += bytes;
-        self.script_jobs.push_back(ScriptJob { event: event.into(), value, interaction, after: 0, bytes });
+        self.script_jobs.push_back(ScriptJob {
+            event: event.into(),
+            value,
+            interaction,
+            after: 0,
+            bytes,
+        });
     }
     fn script_job_step(&mut self) -> bool {
-        let Some(mut job) = self.script_jobs.pop_front() else { return false; };
-        if let Some((target,actor)) = &job.interaction {
+        let Some(mut job) = self.script_jobs.pop_front() else {
+            return false;
+        };
+        if let Some((target, actor)) = &job.interaction {
             // Recheck presence/reach at execution, never retain a disconnected
             // user's authority in a delayed callback.
-            let valid = self.players.get(actor).zip(self.entities.get(target)).is_some_and(|(p,e)| {
-                p.input_active && p.pose.len() >= 3 && (0..3).map(|axis|(p.pose[axis]-e.position[axis]).powi(2)).sum::<f32>() < 16.0
-            });
+            let valid = self
+                .players
+                .get(actor)
+                .zip(self.entities.get(target))
+                .is_some_and(|(p, e)| {
+                    p.input_active
+                        && p.pose.len() >= 3
+                        && (0..3)
+                            .map(|axis| (p.pose[axis] - e.position[axis]).powi(2))
+                            .sum::<f32>()
+                            < 16.0
+                });
             if !valid {
                 self.script_job_bytes -= job.bytes;
                 return true;
             }
         }
         self.refresh_context();
-        let script = self.scripts.iter_mut().find(|script| script.enabled && script.serial > job.after
-            && (job.interaction.is_some() || script.has_event(&job.event)));
+        let script = self.scripts.iter_mut().find(|script| {
+            script.enabled
+                && script.serial > job.after
+                && (job.interaction.is_some() || script.has_event(&job.event))
+        });
         if let Some(script) = script {
             job.after = script.serial;
-            let result = if let Some((target,actor)) = &job.interaction {
-                script.interact(target,actor)
-            } else { script.event(&job.event,&job.value) };
+            let result = if let Some((target, actor)) = &job.interaction {
+                script.interact(target, actor)
+            } else {
+                script.event(&job.event, &job.value)
+            };
             if let Err(error) = result {
                 script.enabled = false;
-                eprintln!("Script {} ({}) disabled: {}",self.id,job.event,error_message::bounded(error));
+                eprintln!(
+                    "Script {} ({}) disabled: {}",
+                    self.id,
+                    job.event,
+                    error_message::bounded(error)
+                );
             }
             self.scripts.retain(|script| script.enabled);
             self.apply_commands();
@@ -661,10 +731,13 @@ impl Instance {
         for command in commands {
             let result: anyhow::Result<()> = (|| {
                 match command {
-                    Command::Call(actor,action)=>{
-                        anyhow::ensure!(self.call_requests.len()<8,"Creator call queue budget exceeded");
-                        self.call_requests.push((actor,action));
-                    },
+                    Command::Call(actor, action) => {
+                        anyhow::ensure!(
+                            self.call_requests.len() < 8,
+                            "Creator call queue budget exceeded"
+                        );
+                        self.call_requests.push((actor, action));
+                    }
                     Command::Radio(actor, request) => {
                         anyhow::ensure!(
                             self.radio_requests.len() < 64,
@@ -708,7 +781,10 @@ impl Instance {
                     }
                     Command::Move(id, position) => {
                         if let Some(e) = self.entities.get_mut(&id) {
-                            anyhow::ensure!(e.attached_to.is_none(),"Detach an entity before teleporting it");
+                            anyhow::ensure!(
+                                e.attached_to.is_none(),
+                                "Detach an entity before teleporting it"
+                            );
                             e.position = position;
                             e.last_motion = self.clock;
                             if let Some(b) = self.scene.body_mut(&id) {
@@ -737,16 +813,26 @@ impl Instance {
                     Command::Lease(id, user) => {
                         self.set_control(&id, &user, None, "script")?;
                     }
-                    Command::Rotate(id,rotation)=>{
-                        let entity=self.entities.get_mut(&id).ok_or_else(||anyhow::anyhow!("Unknown entity"))?;
-                        anyhow::ensure!(entity.attached_to.is_none(),"Detach an entity before rotating it directly");
-                        entity.rotation=rotation;
-                        entity.last_motion=self.clock;
-                        self.scene.rotate(&id,rotation);
-                        self.revision+=1;
-                    },
-                    Command::Attach(child,parent,offset)=>self.attach(&child,&parent,offset)?,
-                    Command::Detach(child)=>{self.detach(&child,"script");},
+                    Command::Rotate(id, rotation) => {
+                        let entity = self
+                            .entities
+                            .get_mut(&id)
+                            .ok_or_else(|| anyhow::anyhow!("Unknown entity"))?;
+                        anyhow::ensure!(
+                            entity.attached_to.is_none(),
+                            "Detach an entity before rotating it directly"
+                        );
+                        entity.rotation = rotation;
+                        entity.last_motion = self.clock;
+                        self.scene.rotate(&id, rotation);
+                        self.revision += 1;
+                    }
+                    Command::Attach(child, parent, offset) => {
+                        self.attach(&child, &parent, offset)?
+                    }
+                    Command::Detach(child) => {
+                        self.detach(&child, "script");
+                    }
                 }
                 Ok(())
             })();
@@ -820,7 +906,7 @@ impl Instance {
             id.clone(),
             Entity {
                 attached_to: None,
-                attachment_offset: [0.0;3],
+                attachment_offset: [0.0; 3],
                 last_motion: self.clock,
                 _slot: slot,
                 id: id.clone(),
@@ -895,7 +981,9 @@ impl Instance {
     }
     fn flush_creator_events(&mut self) {
         if std::mem::take(&mut self.creator_event_overflow) {
-            self.report_script_diagnostic("Creator event queue overflow; newest notifications dropped");
+            self.report_script_diagnostic(
+                "Creator event queue overflow; newest notifications dropped",
+            );
         }
         // Snapshot the batch length: handler-generated events cannot recursively
         // dispatch or consume another slot until the following simulation tick.
@@ -910,53 +998,100 @@ impl Instance {
             self.dispatch(&name, event);
         }
     }
-    fn attach(&mut self, child: &str, parent: &str, offset: [f32;3]) -> anyhow::Result<()> {
-        anyhow::ensure!(child!=parent && offset.iter().all(|v|v.is_finite() && v.abs()<=100.0),"Invalid attachment");
-        let entity=self.entities.get(child).ok_or_else(||anyhow::anyhow!("Unknown child entity"))?;
-        anyhow::ensure!(entity.spec.as_ref().is_some_and(|spec|spec.dynamic),"Attachment child must have dynamic physics");
-        anyhow::ensure!(self.entities.contains_key(parent),"Unknown attachment parent");
-        if entity.attached_to.as_deref()==Some(parent) && entity.attachment_offset==offset {return Ok(());}
+    fn attach(&mut self, child: &str, parent: &str, offset: [f32; 3]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            child != parent && offset.iter().all(|v| v.is_finite() && v.abs() <= 100.0),
+            "Invalid attachment"
+        );
+        let entity = self
+            .entities
+            .get(child)
+            .ok_or_else(|| anyhow::anyhow!("Unknown child entity"))?;
+        anyhow::ensure!(
+            entity.spec.as_ref().is_some_and(|spec| spec.dynamic),
+            "Attachment child must have dynamic physics"
+        );
+        anyhow::ensure!(
+            self.entities.contains_key(parent),
+            "Unknown attachment parent"
+        );
+        if entity.attached_to.as_deref() == Some(parent) && entity.attachment_offset == offset {
+            return Ok(());
+        }
         // Validate every affected path against the proposed edge before changing
         // leases, bodies or metadata. At most 512 dynamic bodies can be attached.
-        for entity in self.entities.values().filter(|entity|entity.attached_to.is_some() || entity.id==child) {
-            let mut current=Some(entity.id.as_str());
-            let mut depth=0;
-            while let Some(id)=current {
-                depth+=1;
-                anyhow::ensure!(depth<=16,"Attachment hierarchy is cyclic or exceeds 16 entities");
-                current=if id==child {Some(parent)} else {self.entities.get(id).and_then(|entity|entity.attached_to.as_deref())};
+        for entity in self
+            .entities
+            .values()
+            .filter(|entity| entity.attached_to.is_some() || entity.id == child)
+        {
+            let mut current = Some(entity.id.as_str());
+            let mut depth = 0;
+            while let Some(id) = current {
+                depth += 1;
+                anyhow::ensure!(
+                    depth <= 16,
+                    "Attachment hierarchy is cyclic or exceeds 16 entities"
+                );
+                current = if id == child {
+                    Some(parent)
+                } else {
+                    self.entities
+                        .get(id)
+                        .and_then(|entity| entity.attached_to.as_deref())
+                };
             }
         }
-        anyhow::ensure!(self.scene.body_mut(child).is_some() && self.scene.body_mut(parent).is_some(),"Attachments require physics bodies");
-        self.release_control(child,"attached");
-        self.detach(child,"reattached");
-        anyhow::ensure!(self.scene.attach(child,parent,offset),"Could not create physics attachment");
-        let pose=self.scene.transform(child);
-        let entity=self.entities.get_mut(child).unwrap();
-        entity.attached_to=Some(parent.into());
-        entity.attachment_offset=offset;
-        entity.last_motion=self.clock;
-        if let Some((position,rotation))=pose {entity.position=position;entity.rotation=rotation;}
-        self.revision+=1;
-        let event=json!({"event":"attach","target":child,"parent":parent,"offset":offset,"clock":self.clock});
+        anyhow::ensure!(
+            self.scene.body_mut(child).is_some() && self.scene.body_mut(parent).is_some(),
+            "Attachments require physics bodies"
+        );
+        self.release_control(child, "attached");
+        self.detach(child, "reattached");
+        anyhow::ensure!(
+            self.scene.attach(child, parent, offset),
+            "Could not create physics attachment"
+        );
+        let pose = self.scene.transform(child);
+        let entity = self.entities.get_mut(child).unwrap();
+        entity.attached_to = Some(parent.into());
+        entity.attachment_offset = offset;
+        entity.last_motion = self.clock;
+        if let Some((position, rotation)) = pose {
+            entity.position = position;
+            entity.rotation = rotation;
+        }
+        self.revision += 1;
+        let event = json!({"event":"attach","target":child,"parent":parent,"offset":offset,"clock":self.clock});
         self.queue_creator_event(event.clone());
         self.publish_creator_notification(event);
         Ok(())
     }
     fn detach(&mut self, child: &str, reason: &str) {
-        let Some(entity)=self.entities.get_mut(child) else {return;};
-        let Some(parent)=entity.attached_to.take() else {return;};
-        entity.attachment_offset=[0.0;3];
+        let Some(entity) = self.entities.get_mut(child) else {
+            return;
+        };
+        let Some(parent) = entity.attached_to.take() else {
+            return;
+        };
+        entity.attachment_offset = [0.0; 3];
         self.scene.detach(child);
-        self.revision+=1;
-        let event=json!({"event":"detach","target":child,"parent":parent,"reason":reason,"clock":self.clock});
+        self.revision += 1;
+        let event = json!({"event":"detach","target":child,"parent":parent,"reason":reason,"clock":self.clock});
         self.queue_creator_event(event.clone());
         self.publish_creator_notification(event);
     }
     fn destroy(&mut self, id: &str) {
-        let children:Vec<_>=self.entities.values().filter(|entity|entity.attached_to.as_deref()==Some(id)).map(|entity|entity.id.clone()).collect();
-        for child in children {self.detach(&child,"parent_destroyed");}
-        self.detach(id,"destroyed");
+        let children: Vec<_> = self
+            .entities
+            .values()
+            .filter(|entity| entity.attached_to.as_deref() == Some(id))
+            .map(|entity| entity.id.clone())
+            .collect();
+        for child in children {
+            self.detach(&child, "parent_destroyed");
+        }
+        self.detach(id, "destroyed");
         if let Some(entity) = self.entities.remove(id) {
             self.tag_bytes -= crate::assets::tag_bytes(&entity.tags);
             if let Some(event) = entity.control_event("release", "destroy", self.clock) {
@@ -1004,7 +1139,9 @@ impl Instance {
         let (avatar, version) =
             selected.map_or((None, None), |(id, version)| (Some(id), Some(version)));
         let changed = player.avatar != avatar || player.avatar_version != version;
-        if !changed {return Ok(());}
+        if !changed {
+            return Ok(());
+        }
         player.avatar = avatar;
         player.avatar_version = version;
         player.avatar_actions.clear();
@@ -1021,9 +1158,9 @@ impl Instance {
         Ok(())
     }
     fn reconnect(&mut self, user: &str, name: &str) {
-        self.release_player_constraints(user,"reconnect");
-        if let Some(player)=self.players.get_mut(user) {
-            player.input_active=true;
+        self.release_player_constraints(user, "reconnect");
+        if let Some(player) = self.players.get_mut(user) {
+            player.input_active = true;
         }
         if let Some(player) = self.players.get_mut(user)
             && player.name != name
@@ -1071,12 +1208,20 @@ impl Instance {
         hand: Option<usize>,
         reason: &str,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(self.players.get(user).is_some_and(|player|player.input_active), "Unknown or unfocused controller");
+        anyhow::ensure!(
+            self.players
+                .get(user)
+                .is_some_and(|player| player.input_active),
+            "Unknown or unfocused controller"
+        );
         let entity = self
             .entities
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("Unknown entity"))?;
-        anyhow::ensure!(entity.attached_to.is_none(),"Attached entities must be detached before control leasing");
+        anyhow::ensure!(
+            entity.attached_to.is_none(),
+            "Attached entities must be detached before control leasing"
+        );
         anyhow::ensure!(
             entity.spec.as_ref().is_some_and(|spec| spec.dynamic),
             "Entity cannot be controlled"
@@ -1117,7 +1262,7 @@ impl Instance {
             .players
             .get(user)
             .ok_or_else(|| anyhow::anyhow!("Not joined"))?;
-        anyhow::ensure!(player.input_active,"Gameplay input is suspended");
+        anyhow::ensure!(player.input_active, "Gameplay input is suspended");
         let entity = self
             .entities
             .get_mut(&target)
@@ -1256,8 +1401,8 @@ impl Instance {
         let contacts = self.scene.step(1.0 / self.tps as f32);
         for (id, entity) in &mut self.entities {
             if let Some((position, rotation)) = self.scene.transform(id) {
-                if entity.position!=position || entity.rotation!=rotation {
-                    entity.last_motion=self.clock;
+                if entity.position != position || entity.rotation != rotation {
+                    entity.last_motion = self.clock;
                 }
                 entity.position = position;
                 entity.rotation = rotation;
@@ -1309,11 +1454,11 @@ impl Instance {
         }
         self.flush_creator_events();
         if self.scheduled_scripts {
-            self.script_tick_elapsed = (self.script_tick_elapsed + 1.0/self.tps as f64).min(1.0);
+            self.script_tick_elapsed = (self.script_tick_elapsed + 1.0 / self.tps as f64).min(1.0);
             if !self.script_jobs.iter().any(|job| job.event == "tick") {
                 let dt = self.script_tick_elapsed;
                 self.script_tick_elapsed = 0.0;
-                self.dispatch("tick",json!({"dt":dt,"clock":self.clock}));
+                self.dispatch("tick", json!({"dt":dt,"clock":self.clock}));
             }
         } else {
             self.dispatch("tick", json!({"dt":1.0/self.tps as f32,"clock":self.clock}));
@@ -1338,11 +1483,14 @@ impl Instance {
             actor == self.owner || surface.public_controls,
             "Only the instance owner may control this player"
         );
-        let changed=self.media
+        let changed = self
+            .media
             .entry(request.target.clone())
             .or_default()
             .apply(&request)?;
-        if changed {self.revision += 1;}
+        if changed {
+            self.revision += 1;
+        }
         Ok(())
     }
     pub fn interact(&mut self, actor: &str, target: &str) -> anyhow::Result<()> {
@@ -1350,7 +1498,7 @@ impl Instance {
             .players
             .get(actor)
             .ok_or_else(|| anyhow::anyhow!("Not joined"))?;
-        anyhow::ensure!(player.input_active,"Gameplay input is suspended");
+        anyhow::ensure!(player.input_active, "Gameplay input is suspended");
         let entity = self
             .entities
             .get_mut(target)
@@ -1371,12 +1519,12 @@ impl Instance {
             }
         }
         if self.scheduled_scripts {
-            self.queue_script_job("interact",Value::Null,Some((target.into(),actor.into())));
+            self.queue_script_job("interact", Value::Null, Some((target.into(), actor.into())));
         } else {
             self.refresh_context();
             for script in &mut self.scripts {
                 if let Err(e) = script.interact(target, actor) {
-                    eprintln!("Script {}: {}", self.id,error_message::bounded(e));
+                    eprintln!("Script {}: {}", self.id, error_message::bounded(e));
                     script.enabled = false;
                 }
             }
@@ -1416,7 +1564,7 @@ pub struct Registry {
     pub tps: u32,
     scheduled_scripts: bool,
     script_cursor: usize,
-    avatar_changes: BTreeMap<String,Instant>,
+    avatar_changes: BTreeMap<String, Instant>,
 }
 impl Default for Registry {
     fn default() -> Self {
@@ -1432,7 +1580,10 @@ impl Default for Registry {
 }
 impl Registry {
     pub fn with_tps(tps: u32) -> Self {
-        Self { tps, ..Self::default() }
+        Self {
+            tps,
+            ..Self::default()
+        }
     }
     pub fn enable_script_scheduler(&mut self) {
         self.scheduled_scripts = true;
@@ -1440,22 +1591,45 @@ impl Registry {
             instance.scheduled_scripts = true;
         }
     }
-    pub fn select_avatar(&mut self, user: &str, selection: Option<(String,String)>) -> anyhow::Result<()> {
-        let instance=self.instances.iter().find(|(_,instance)|instance.players.contains_key(user))
-            .map(|(id,_)|id.clone()).ok_or_else(||anyhow::anyhow!("Not joined"))?;
-        let player=&self.instances[&instance].players[user];
-        if player.avatar.as_ref()==selection.as_ref().map(|(id,_)|id)
-            && player.avatar_version.as_ref()==selection.as_ref().map(|(_,version)|version) {
+    pub fn select_avatar(
+        &mut self,
+        user: &str,
+        selection: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
+        let instance = self
+            .instances
+            .iter()
+            .find(|(_, instance)| instance.players.contains_key(user))
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| anyhow::anyhow!("Not joined"))?;
+        let player = &self.instances[&instance].players[user];
+        if player.avatar.as_ref() == selection.as_ref().map(|(id, _)| id)
+            && player.avatar_version.as_ref() == selection.as_ref().map(|(_, version)| version)
+        {
             return Ok(());
         }
-        let loading=selection.is_some();
+        let loading = selection.is_some();
         if loading {
-            self.avatar_changes.retain(|_,last|last.elapsed()<Duration::from_secs(60));
-            anyhow::ensure!(self.avatar_changes.get(user).is_none_or(|last|last.elapsed()>=Duration::from_secs(2)),"Avatar selection cooldown (two seconds)");
-            anyhow::ensure!(self.avatar_changes.contains_key(user) || self.avatar_changes.len()<4096,"Avatar selection capacity reached");
+            self.avatar_changes
+                .retain(|_, last| last.elapsed() < Duration::from_secs(60));
+            anyhow::ensure!(
+                self.avatar_changes
+                    .get(user)
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(2)),
+                "Avatar selection cooldown (two seconds)"
+            );
+            anyhow::ensure!(
+                self.avatar_changes.contains_key(user) || self.avatar_changes.len() < 4096,
+                "Avatar selection capacity reached"
+            );
         }
-        self.instances.get_mut(&instance).unwrap().set_avatar(user,selection)?;
-        if loading {self.avatar_changes.insert(user.into(),Instant::now());}
+        self.instances
+            .get_mut(&instance)
+            .unwrap()
+            .set_avatar(user, selection)?;
+        if loading {
+            self.avatar_changes.insert(user.into(), Instant::now());
+        }
         Ok(())
     }
     pub fn admit(
@@ -1617,24 +1791,37 @@ impl Registry {
             instance.tick();
         }
         if self.scheduled_scripts {
-            self.advance_scripts(256,Duration::from_secs_f64((0.5 / self.tps as f64).min(0.008)));
+            self.advance_scripts(
+                256,
+                Duration::from_secs_f64((0.5 / self.tps as f64).min(0.008)),
+            );
         }
     }
     fn advance_scripts(&mut self, maximum_steps: usize, budget: Duration) {
         let ids: Vec<_> = self.instances.keys().cloned().collect();
-        if ids.is_empty() { return; }
+        if ids.is_empty() {
+            return;
+        }
         let started = Instant::now();
         let mut idle = 0;
         for _ in 0..maximum_steps {
-            if started.elapsed() >= budget { break; }
+            if started.elapsed() >= budget {
+                break;
+            }
             self.script_cursor %= ids.len();
             let id = &ids[self.script_cursor];
             self.script_cursor = (self.script_cursor + 1) % ids.len();
-            if self.instances.get_mut(id).is_some_and(Instance::script_job_step) {
+            if self
+                .instances
+                .get_mut(id)
+                .is_some_and(Instance::script_job_step)
+            {
                 idle = 0;
             } else {
                 idle += 1;
-                if idle >= ids.len() { break; }
+                if idle >= ids.len() {
+                    break;
+                }
             }
         }
     }
@@ -1647,14 +1834,23 @@ impl Registry {
     }
     pub fn input_focus(&mut self, user: &str, active: bool) {
         for instance in self.instances.values_mut() {
-            let changed=instance.players.get(user).is_some_and(|player|player.input_active!=active);
-            if !changed {continue;}
-            if !active {instance.release_player_constraints(user,"focus_lost");}
-            if let Some(player)=instance.players.get_mut(user) {
-                player.input_active=active;
-                if !active {player.tracking.clear();}
+            let changed = instance
+                .players
+                .get(user)
+                .is_some_and(|player| player.input_active != active);
+            if !changed {
+                continue;
             }
-            instance.revision+=1;
+            if !active {
+                instance.release_player_constraints(user, "focus_lost");
+            }
+            if let Some(player) = instance.players.get_mut(user) {
+                player.input_active = active;
+                if !active {
+                    player.tracking.clear();
+                }
+            }
+            instance.revision += 1;
         }
     }
     pub fn list(&self, user: &str) -> Value {
@@ -1667,20 +1863,22 @@ mod tests {
     use super::*;
     #[test]
     fn attachment_and_rotation_bindings_are_capability_gated_and_flat() {
-        let variables=Arc::new(Mutex::new(BTreeMap::new()));
-        assert!(Sandbox::new("world.detach('child')",variables.clone(),&[]).is_err());
+        let variables = Arc::new(Mutex::new(BTreeMap::new()));
+        assert!(Sandbox::new("world.detach('child')", variables.clone(), &[]).is_err());
         for source in [
             "local t={}; t[1]=t; t[2]=0; t[3]=0; world.attach('child','parent',t)",
             "world.attach('child','parent',{101,0,0})",
             "world.rotate('parent',{0,0,0,0})",
             "world.move('parent',{'1',0,0})",
         ] {
-            assert!(Sandbox::new(source,variables.clone(),&["objects".into()]).is_err());
+            assert!(Sandbox::new(source, variables.clone(), &["objects".into()]).is_err());
         }
         let vm=Sandbox::new("world.attach('child','parent',{1,0,0}); world.rotate('parent',{0,0,0,1}); world.detach('child')",variables,&["objects".into()]).unwrap();
-        let context=vm.context.lock().unwrap();
-        let commands=&context.commands;
-        assert!(matches!(&commands[0],Command::Attach(child,parent,_) if child=="child" && parent=="parent"));
+        let context = vm.context.lock().unwrap();
+        let commands = &context.commands;
+        assert!(
+            matches!(&commands[0],Command::Attach(child,parent,_) if child=="child" && parent=="parent")
+        );
         assert!(matches!(&commands[1],Command::Rotate(id,_) if id=="parent"));
         assert!(matches!(&commands[2],Command::Detach(id) if id=="child"));
     }
@@ -1689,85 +1887,215 @@ mod tests {
         let definition:Manifest=serde_json::from_value(json!({"schema":1,"kind":"world","name":"Attachments","scene":"world.glb",
             "objects":[{"id":"parent","component":"prop","position":[0,0,0],"physics":{"gravity_scale":0}},
                 {"id":"child","component":"prop","position":[1,0,0],"physics":{"gravity_scale":0}}]})).unwrap();
-        let mut registry=Registry::default();
-        let id=registry.admit(&Join {world:"world".into(),..Default::default()},"a","A","hash",definition,vec![]).unwrap();
-        let instance=registry.instances.get_mut(&id).unwrap();
-        instance.action("a",Action::Grab {target:"child".into(),hand:0}).unwrap();
-        instance.attach("child","parent",[1.0,0.0,0.0]).unwrap();
+        let mut registry = Registry::default();
+        let id = registry
+            .admit(
+                &Join {
+                    world: "world".into(),
+                    ..Default::default()
+                },
+                "a",
+                "A",
+                "hash",
+                definition,
+                vec![],
+            )
+            .unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "child".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        instance.attach("child", "parent", [1.0, 0.0, 0.0]).unwrap();
         assert!(instance.entities["child"].controller.is_none());
-        assert_eq!(instance.entities["child"].attached_to.as_deref(),Some("parent"));
-        let revision=instance.revision;
-        assert!(instance.attach("parent","child",[0.0;3]).is_err());
-        assert_eq!(instance.revision,revision);
-        assert!(instance.set_control("child","a",None,"script").is_err());
-        let snapshot=instance.snapshot(1);
-        assert_eq!(snapshot["entities"]["child"]["attached_to"],json!("parent"));
-        assert_eq!(snapshot["entities"]["child"]["attachment_offset"],json!([1.0,0.0,0.0]));
+        assert_eq!(
+            instance.entities["child"].attached_to.as_deref(),
+            Some("parent")
+        );
+        let revision = instance.revision;
+        assert!(instance.attach("parent", "child", [0.0; 3]).is_err());
+        assert_eq!(instance.revision, revision);
+        assert!(instance.set_control("child", "a", None, "script").is_err());
+        let snapshot = instance.snapshot(1);
+        assert_eq!(
+            snapshot["entities"]["child"]["attached_to"],
+            json!("parent")
+        );
+        assert_eq!(
+            snapshot["entities"]["child"]["attachment_offset"],
+            json!([1.0, 0.0, 0.0])
+        );
         instance.destroy("parent");
         assert!(instance.entities["child"].attached_to.is_none());
-        assert!(instance.events.iter().any(|event|event["event"]=="detach" && event["reason"]=="parent_destroyed"));
-        instance.action("a",Action::Grab {target:"child".into(),hand:0}).unwrap();
+        assert!(
+            instance
+                .events
+                .iter()
+                .any(|event| event["event"] == "detach" && event["reason"] == "parent_destroyed")
+        );
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "child".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
     }
     #[test]
     fn avatar_selection_is_idempotent_rate_limited_and_always_allows_removal() {
-        let mut registry=Registry::default();
-        let join=Join {world:"world".into(),..Default::default()};
-        let id=registry.admit(&join,"a","A","hash",manifest(),vec![]).unwrap();
-        registry.select_avatar("a",Some(("first".into(),"v1".into()))).unwrap();
-        let instance=registry.instances.get_mut(&id).unwrap();
-        instance.players.get_mut("a").unwrap().avatar_actions.insert("happy".into(),1.0);
-        let revision=instance.revision;
-        registry.select_avatar("a",Some(("first".into(),"v1".into()))).unwrap();
-        assert_eq!(registry.instances[&id].revision,revision);
-        assert_eq!(registry.instances[&id].players["a"].avatar_actions["happy"],1.0);
-        assert!(registry.select_avatar("a",Some(("second".into(),"v2".into()))).is_err());
-        registry.select_avatar("a",None).unwrap();
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            ..Default::default()
+        };
+        let id = registry
+            .admit(&join, "a", "A", "hash", manifest(), vec![])
+            .unwrap();
+        registry
+            .select_avatar("a", Some(("first".into(), "v1".into())))
+            .unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance
+            .players
+            .get_mut("a")
+            .unwrap()
+            .avatar_actions
+            .insert("happy".into(), 1.0);
+        let revision = instance.revision;
+        registry
+            .select_avatar("a", Some(("first".into(), "v1".into())))
+            .unwrap();
+        assert_eq!(registry.instances[&id].revision, revision);
+        assert_eq!(
+            registry.instances[&id].players["a"].avatar_actions["happy"],
+            1.0
+        );
+        assert!(
+            registry
+                .select_avatar("a", Some(("second".into(), "v2".into())))
+                .is_err()
+        );
+        registry.select_avatar("a", None).unwrap();
         assert!(registry.instances[&id].players["a"].avatar.is_none());
         registry.leave("a");
-        registry.admit(&join,"a","A","hash",manifest(),vec![]).unwrap();
-        assert!(registry.select_avatar("a",Some(("second".into(),"v2".into()))).is_err());
-        registry.avatar_changes.insert("a".into(),Instant::now()-Duration::from_secs(3));
-        registry.select_avatar("a",Some(("second".into(),"v2".into()))).unwrap();
+        registry
+            .admit(&join, "a", "A", "hash", manifest(), vec![])
+            .unwrap();
+        assert!(
+            registry
+                .select_avatar("a", Some(("second".into(), "v2".into())))
+                .is_err()
+        );
+        registry
+            .avatar_changes
+            .insert("a".into(), Instant::now() - Duration::from_secs(3));
+        registry
+            .select_avatar("a", Some(("second".into(), "v2".into())))
+            .unwrap();
     }
     #[test]
     fn focus_loss_releases_constraints_holds_pose_and_does_not_reacquire_on_resume() {
         let definition:Manifest=serde_json::from_value(json!({"schema":1,"kind":"world","name":"Focus","scene":"world.glb",
             "objects":[{"id":"prop","component":"prop","position":[0,0,0],"physics":{"size":[0.2,0.2,0.2]}}]})).unwrap();
-        let mut registry=Registry::default();
-        let join=Join {world:"world".into(),..Default::default()};
-        let id=registry.admit(&join,"a","A","hash",definition,vec![]).unwrap();
-        let instance=registry.instances.get_mut(&id).unwrap();
-        instance.players.get_mut("a").unwrap().pose[..3].copy_from_slice(&[0.0;3]);
-        instance.players.get_mut("a").unwrap().tracking.insert("Hips".into(),TrackedJoint {pose:[0.0,1.0,0.0,0.0,0.0,0.0,1.0],source:"tracked".into()});
-        instance.action("a",Action::Grab {target:"prop".into(),hand:0}).unwrap();
-        instance.interactions.insert("a:0".into(),Interaction {actor:"a".into(),target:"b".into(),bone:"Head".into(),segment:"hair".into(),hand:0});
-        let pose=instance.players["a"].pose.clone();
-        registry.input_focus("a",false);
-        let instance=registry.instances.get_mut(&id).unwrap();
+        let mut registry = Registry::default();
+        let join = Join {
+            world: "world".into(),
+            ..Default::default()
+        };
+        let id = registry
+            .admit(&join, "a", "A", "hash", definition, vec![])
+            .unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance.players.get_mut("a").unwrap().pose[..3].copy_from_slice(&[0.0; 3]);
+        instance.players.get_mut("a").unwrap().tracking.insert(
+            "Hips".into(),
+            TrackedJoint {
+                pose: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                source: "tracked".into(),
+            },
+        );
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
+        instance.interactions.insert(
+            "a:0".into(),
+            Interaction {
+                actor: "a".into(),
+                target: "b".into(),
+                bone: "Head".into(),
+                segment: "hair".into(),
+                hand: 0,
+            },
+        );
+        let pose = instance.players["a"].pose.clone();
+        registry.input_focus("a", false);
+        let instance = registry.instances.get_mut(&id).unwrap();
         assert!(!instance.players["a"].input_active && instance.players["a"].tracking.is_empty());
-        assert_eq!(instance.players["a"].pose,pose);
+        assert_eq!(instance.players["a"].pose, pose);
         assert!(instance.entities["prop"].controller.is_none() && instance.interactions.is_empty());
-        assert!(instance.set_control("prop","a",None,"script").is_err());
-        assert!(instance.action("a",Action::Grab {target:"prop".into(),hand:0}).is_err());
-        let revision=instance.revision;
-        registry.input_focus("a",false);
-        assert_eq!(registry.instances[&id].revision,revision);
-        registry.input_focus("a",true);
-        let instance=registry.instances.get_mut(&id).unwrap();
-        assert!(instance.players["a"].input_active && instance.entities["prop"].controller.is_none());
-        instance.action("a",Action::Grab {target:"prop".into(),hand:0}).unwrap();
+        assert!(instance.set_control("prop", "a", None, "script").is_err());
+        assert!(
+            instance
+                .action(
+                    "a",
+                    Action::Grab {
+                        target: "prop".into(),
+                        hand: 0
+                    }
+                )
+                .is_err()
+        );
+        let revision = instance.revision;
+        registry.input_focus("a", false);
+        assert_eq!(registry.instances[&id].revision, revision);
+        registry.input_focus("a", true);
+        let instance = registry.instances.get_mut(&id).unwrap();
+        assert!(
+            instance.players["a"].input_active && instance.entities["prop"].controller.is_none()
+        );
+        instance
+            .action(
+                "a",
+                Action::Grab {
+                    target: "prop".into(),
+                    hand: 0,
+                },
+            )
+            .unwrap();
     }
     #[test]
     fn creator_calls_bind_only_authenticated_interaction_actors() {
-        let variables=Arc::new(Mutex::new(BTreeMap::new()));
-        assert!(Sandbox::new("world.call_invite('b')",variables.clone(),&["voice".into()]).is_err());
-        assert!(Sandbox::new("world.call_invite('b')",variables.clone(),&[]).is_err());
+        let variables = Arc::new(Mutex::new(BTreeMap::new()));
+        assert!(
+            Sandbox::new(
+                "world.call_invite('b')",
+                variables.clone(),
+                &["voice".into()]
+            )
+            .is_err()
+        );
+        assert!(Sandbox::new("world.call_invite('b')", variables.clone(), &[]).is_err());
         let vm=Sandbox::new("world.on_interact('phone',function(player) world.call_invite('b'); world.after(0,function() world.call_invite('b') end) end)",variables,&["voice".into()]).unwrap();
-        vm.interact("phone","a").unwrap();
-        let commands=std::mem::take(&mut vm.context.lock().unwrap().commands);
-        assert!(matches!(&commands[0],Command::Call(actor,crate::realtime::CallAction::Invite {user}) if actor=="a" && user=="b"));
+        vm.interact("phone", "a").unwrap();
+        let commands = std::mem::take(&mut vm.context.lock().unwrap().commands);
+        assert!(
+            matches!(&commands[0],Command::Call(actor,crate::realtime::CallAction::Invite {user}) if actor=="a" && user=="b")
+        );
         assert!(vm.context.lock().unwrap().interaction_actor.is_none());
-        assert!(vm.event("tick",&json!({"dt":0.01})).is_err());
+        assert!(vm.event("tick", &json!({"dt":0.01})).is_err());
         assert!(vm.context.lock().unwrap().commands.is_empty());
     }
     fn manifest() -> Manifest {
@@ -1776,33 +2104,57 @@ mod tests {
     }
     #[test]
     fn global_entity_admission_preserves_membership_and_releases_reservations() {
-        let output = std::process::Command::new("timeout").arg("15")
+        let output = std::process::Command::new("timeout")
+            .arg("15")
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact","world::tests::entity_capacity_child","--ignored","--nocapture"])
-            .output().unwrap();
-        assert!(output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "{}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            .args([
+                "--exact",
+                "world::tests::entity_capacity_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
     #[ignore = "isolated process: exhausts aggregate entity admission"]
     fn entity_capacity_child() {
         let mut registry = Registry::default();
-        let join = Join { world:"world".into(), ..Default::default() };
-        let old = registry.admit(&join,"a","A","old",manifest(),vec![]).unwrap();
-        let reservations: Vec<_> = (0..MAX_LIVE_ENTITIES).map(|_|EntitySlot::reserve().unwrap()).collect();
+        let join = Join {
+            world: "world".into(),
+            ..Default::default()
+        };
+        let old = registry
+            .admit(&join, "a", "A", "old", manifest(), vec![])
+            .unwrap();
+        let reservations: Vec<_> = (0..MAX_LIVE_ENTITIES)
+            .map(|_| EntitySlot::reserve().unwrap())
+            .collect();
         let retained = reservations[0].clone();
         assert!(EntitySlot::reserve().is_err());
         let definition: Manifest = serde_json::from_value(json!({"schema":1,"kind":"world","name":"New","scene":"world.glb","objects":[{"id":"prop","component":"prop","size":[1,1,1]}]})).unwrap();
-        assert!(registry.admit(&join,"a","A","new",definition.clone(),vec![]).is_err());
+        assert!(
+            registry
+                .admit(&join, "a", "A", "new", definition.clone(), vec![])
+                .is_err()
+        );
         assert!(registry.instances[&old].players.contains_key("a"));
-        assert_eq!(registry.instances.len(),1);
+        assert_eq!(registry.instances.len(), 1);
         drop(reservations);
-        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire),1);
+        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire), 1);
         drop(retained);
-        registry.admit(&join,"a","A","new",definition,vec![]).unwrap();
-        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire),1);
+        registry
+            .admit(&join, "a", "A", "new", definition, vec![])
+            .unwrap();
+        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire), 1);
         drop(registry);
-        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire),0);
+        assert_eq!(LIVE_ENTITIES.load(Ordering::Acquire), 0);
     }
     #[test]
     fn scheduled_scripts_rotate_preserve_callbacks_coalesce_ticks_and_recheck_actor() {
@@ -1817,37 +2169,81 @@ mod tests {
         let source = "world.on('join',function() world.state.set('joined',true) end); world.on('tick',function() world.state.set('ticks',world.state.get('ticks')+1) end); world.on_interact('switch',function(player) world.state.set('actor',player.id) end)";
         let mut registry = Registry::default();
         registry.enable_script_scheduler();
-        let join = Join { world:"world".into(), ..Default::default() };
-        let first = registry.admit(&join,"a","A","hash",definition.clone(),vec![source.into()]).unwrap();
-        let second = registry.admit(&join,"b","B","hash",definition,vec![source.into()]).unwrap();
-        assert_eq!(registry.instances[&first].variables.lock().unwrap()["joined"],json!(false));
-        assert_eq!(registry.instances[&second].variables.lock().unwrap()["joined"],json!(false));
-        registry.advance_scripts(2,Duration::from_secs(1));
-        assert_eq!(registry.instances[&first].variables.lock().unwrap()["joined"],json!(true));
-        assert_eq!(registry.instances[&second].variables.lock().unwrap()["joined"],json!(true));
+        let join = Join {
+            world: "world".into(),
+            ..Default::default()
+        };
+        let first = registry
+            .admit(
+                &join,
+                "a",
+                "A",
+                "hash",
+                definition.clone(),
+                vec![source.into()],
+            )
+            .unwrap();
+        let second = registry
+            .admit(&join, "b", "B", "hash", definition, vec![source.into()])
+            .unwrap();
+        assert_eq!(
+            registry.instances[&first].variables.lock().unwrap()["joined"],
+            json!(false)
+        );
+        assert_eq!(
+            registry.instances[&second].variables.lock().unwrap()["joined"],
+            json!(false)
+        );
+        registry.advance_scripts(2, Duration::from_secs(1));
+        assert_eq!(
+            registry.instances[&first].variables.lock().unwrap()["joined"],
+            json!(true)
+        );
+        assert_eq!(
+            registry.instances[&second].variables.lock().unwrap()["joined"],
+            json!(true)
+        );
         for instance in registry.instances.values_mut() {
-            for _ in 0..10 { instance.tick(); }
-            assert_eq!(instance.script_jobs.iter().filter(|job|job.event=="tick").count(),1);
+            for _ in 0..10 {
+                instance.tick();
+            }
+            assert_eq!(
+                instance
+                    .script_jobs
+                    .iter()
+                    .filter(|job| job.event == "tick")
+                    .count(),
+                1
+            );
         }
-        registry.advance_scripts(100,Duration::ZERO);
-        assert_eq!(registry.instances[&first].variables.lock().unwrap()["ticks"].as_f64(),Some(0.0));
-        registry.advance_scripts(100,Duration::from_secs(1));
-        assert_eq!(registry.instances[&first].variables.lock().unwrap()["ticks"].as_f64(),Some(1.0));
+        registry.advance_scripts(100, Duration::ZERO);
+        assert_eq!(
+            registry.instances[&first].variables.lock().unwrap()["ticks"].as_f64(),
+            Some(0.0)
+        );
+        registry.advance_scripts(100, Duration::from_secs(1));
+        assert_eq!(
+            registry.instances[&first].variables.lock().unwrap()["ticks"].as_f64(),
+            Some(1.0)
+        );
         let instance = registry.instances.get_mut(&first).unwrap();
-        instance.players.get_mut("a").unwrap().pose[0..3].copy_from_slice(&[0.0;3]);
-        instance.interact("a","switch").unwrap();
-        assert_eq!(instance.variables.lock().unwrap()["actor"],json!(""));
-        instance.players.get_mut("a").unwrap().pose[0]=100.0;
-        registry.advance_scripts(100,Duration::from_secs(1));
-        assert_eq!(registry.instances[&first].variables.lock().unwrap()["actor"],json!(""));
+        instance.players.get_mut("a").unwrap().pose[0..3].copy_from_slice(&[0.0; 3]);
+        instance.interact("a", "switch").unwrap();
+        assert_eq!(instance.variables.lock().unwrap()["actor"], json!(""));
+        instance.players.get_mut("a").unwrap().pose[0] = 100.0;
+        registry.advance_scripts(100, Duration::from_secs(1));
+        assert_eq!(
+            registry.instances[&first].variables.lock().unwrap()["actor"],
+            json!("")
+        );
         let instance = registry.instances.get_mut(&first).unwrap();
-        instance.players.get_mut("a").unwrap().pose[0]=0.0;
-        instance.interact("a","switch").unwrap();
-        registry.advance_scripts(100,Duration::from_secs(1));
+        instance.players.get_mut("a").unwrap().pose[0] = 0.0;
+        instance.interact("a", "switch").unwrap();
+        registry.advance_scripts(100, Duration::from_secs(1));
         let instance = &registry.instances[&first];
-        assert_eq!(instance.variables.lock().unwrap()["actor"],json!("a"));
+        assert_eq!(instance.variables.lock().unwrap()["actor"], json!("a"));
         assert!(instance.context.lock().unwrap().interaction_actor.is_none());
-        assert!(instance.script_jobs.is_empty() && instance.script_job_bytes==0);
+        assert!(instance.script_jobs.is_empty() && instance.script_job_bytes == 0);
         registry.leave("a");
         assert!(!registry.instances.contains_key(&first));
     }

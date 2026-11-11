@@ -47,6 +47,7 @@ struct Output {
     position: f64,
     error: String,
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 enum Command {
     Load(String),
     Pause(bool),
@@ -72,6 +73,7 @@ impl Drop for Worker {
     }
 }
 struct Player {
+    diagnostic: String,
     local_fixture: bool,
     loaded: bool,
     pending_seek: Option<f64>,
@@ -162,6 +164,7 @@ impl Player {
         let stop = audio_stop.clone();
         let audio_thread = thread::spawn(move || read_audio(reader, shared_audio, stop));
         let mut player = Self {
+            diagnostic: String::new(),
             local_fixture,
             loaded: false,
             pending_seek: None,
@@ -180,6 +183,7 @@ impl Player {
         for (name, value) in [
             ("config", "no"),
             ("terminal", "no"),
+            ("input-terminal", "no"),
             ("idle", "yes"),
             ("vo", "libmpv"),
             ("ao", "pcm"),
@@ -201,7 +205,10 @@ impl Player {
             ("autoload-files", "no"),
             ("load-unsafe-playlists", "no"),
             ("tls-verify", "yes"),
-            ("ytdl-format", "best[height<=720]/best"),
+            (
+                "ytdl-format",
+                "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            ),
         ] {
             player.option(name, value)?;
         }
@@ -236,6 +243,10 @@ impl Player {
         )?;
         unsafe {
             check(mpv::mpv_initialize(player.handle))?;
+            check(mpv::mpv_request_log_messages(
+                player.handle,
+                c"warn".as_ptr(),
+            ))?;
             check(mpv::mpv_hook_add(player.handle, 0, c"on_load".as_ptr(), 50))?;
         }
         let mut params = [
@@ -296,6 +307,14 @@ impl Player {
     fn apply(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::Load(url) => {
+                self.diagnostic.clear();
+                if !self.local_fixture
+                    && (url.len() > 4096
+                        || url.contains(['\0', '\n', '\r'])
+                        || !(url.starts_with("https://") || url.starts_with("http://")))
+                {
+                    return Err("Only validated HTTP(S) video URLs are accepted".into());
+                }
                 self.loaded = false;
                 self.pending_seek = None;
                 self.command(&["loadfile", &url, "replace"])
@@ -330,6 +349,18 @@ impl Player {
                 let event = mpv::mpv_wait_event(self.handle, 0.0);
                 if event.is_null() || (*event).event_id == mpv::mpv_event_id_MPV_EVENT_NONE {
                     break;
+                }
+                if (*event).event_id == mpv::mpv_event_id_MPV_EVENT_LOG_MESSAGE
+                    && !(*event).data.is_null()
+                {
+                    let log = &*(*event).data.cast::<mpv::mpv_event_log_message>();
+                    if !log.text.is_null() {
+                        self.diagnostic = crate::error_message::bounded(format_args!(
+                            "{}{}",
+                            self.diagnostic,
+                            CStr::from_ptr(log.text).to_string_lossy()
+                        ));
+                    }
                 }
                 if (*event).event_id == mpv::mpv_event_id_MPV_EVENT_HOOK && !(*event).data.is_null()
                 {
@@ -375,7 +406,10 @@ impl Player {
                 {
                     let end = &*(*event).data.cast::<mpv::mpv_event_end_file>();
                     if let Err(error) = check(end.error) {
-                        output.error = error;
+                        output.error = crate::error_message::bounded(format_args!(
+                            "{error}: {}",
+                            self.diagnostic
+                        ));
                     }
                 }
             }
@@ -500,6 +534,16 @@ impl Worker {
         let join = thread::Builder::new()
             .name("media-decoder".into())
             .spawn(move || {
+                if !local_fixture {
+                    if let Err(error) = isolated::run(width, height, &receiver, &running, &shared) {
+                        let mut output = shared.lock().unwrap();
+                        if output.error.is_empty() {
+                            output.error = crate::error_message::bounded(error);
+                        }
+                    }
+                    PLAYERS.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
                 match Player::new(width, height, local_fixture) {
                     Ok(mut player) => {
                         while !running.load(Ordering::Acquire) {
@@ -566,6 +610,12 @@ impl Worker {
             join,
         })
     }
+}
+
+#[path = "video_process.rs"]
+mod isolated;
+pub fn media_worker_main() -> Result<(), String> {
+    isolated::entry().map_err(|error| error.to_string())
 }
 
 #[derive(GodotClass)]

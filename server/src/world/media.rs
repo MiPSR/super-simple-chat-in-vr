@@ -1,6 +1,6 @@
 //! Ephemeral authoritative timelines. The game server never downloads media.
 use serde::{Deserialize, Serialize};
-use std::time::{Duration,Instant};
+use std::time::{Duration, Instant};
 #[path = "../../../shared/media_request.rs"]
 mod request;
 pub use request::{Request, valid_source};
@@ -73,40 +73,49 @@ impl Session {
             }
             "play" | "pause" | "seek" | "rate" => {
                 anyhow::ensure!(!self.source.is_empty(), "No media loaded");
-                if request.action=="seek" {
-                anyhow::ensure!(
-                    request.value.is_finite() && (0.0..=604800.0).contains(&request.value),
-                    "Invalid seek"
-                );
+                if request.action == "seek" {
+                    anyhow::ensure!(
+                        request.value.is_finite() && (0.0..=604800.0).contains(&request.value),
+                        "Invalid seek"
+                    );
                 }
-                if request.action=="rate" {
-                anyhow::ensure!(
-                    request.value.is_finite() && (0.25..=2.0).contains(&request.value),
-                    "Invalid media rate"
-                );
+                if request.action == "rate" {
+                    anyhow::ensure!(
+                        request.value.is_finite() && (0.25..=2.0).contains(&request.value),
+                        "Invalid media rate"
+                    );
                 }
             }
             "stop" => (),
             _ => anyhow::bail!("Unknown media action"),
         }
-        let noop=match request.action.as_str() {
-            "stop"=>self.source.is_empty(),
-            "play"=>self.playing,
-            "pause"=>!self.playing,
-            "rate"=>self.rate==request.value,
-            "seek"=>!self.playing && self.position==request.value,
-            _=>false,
+        let noop = match request.action.as_str() {
+            "stop" => self.source.is_empty(),
+            "play" => self.playing,
+            "pause" => !self.playing,
+            "rate" => self.rate == request.value,
+            "seek" => !self.playing && self.position == request.value,
+            _ => false,
         };
-        if noop {return Ok(false);}
-        let now=Instant::now();
-        if request.action!="stop" {
-            if self.request_window.elapsed()>=Duration::from_secs(1) {self.request_window=now;self.requests=0;}
-            anyhow::ensure!(self.requests<16,"Media surface command rate exceeded");
-            if request.action=="load" {
-                anyhow::ensure!(self.last_load.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)),"Media surface load cooldown");
-                self.last_load=Some(now);
+        if noop {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if request.action != "stop" {
+            if self.request_window.elapsed() >= Duration::from_secs(1) {
+                self.request_window = now;
+                self.requests = 0;
             }
-            self.requests+=1;
+            anyhow::ensure!(self.requests < 16, "Media surface command rate exceeded");
+            if request.action == "load" {
+                anyhow::ensure!(
+                    self.last_load
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)),
+                    "Media surface load cooldown"
+                );
+                self.last_load = Some(now);
+            }
+            self.requests += 1;
         }
         self.position = self.target();
         self.changed = Instant::now();
@@ -137,20 +146,27 @@ mod tests {
     use super::*;
     #[test]
     fn media_load_cooldown_noops_and_stop_preserve_resource_policy() {
-        let mut session=Session::default();
-        let request=|action:&str,value|Request {target:"screen".into(),action:action.into(),source:"https://example.com/video.mp4".into(),value};
-        assert!(session.apply(&request("seek",1.0)).is_err());
-        assert!(session.apply(&request("load",0.0)).unwrap());
-        let generation=session.generation;
-        assert!(session.apply(&request("load",0.0)).is_err());
-        assert_eq!(session.generation,generation);
-        assert!(!session.apply(&request("play",0.0)).unwrap());
-        for index in 1..16 {session.apply(&request("seek",index as f64)).unwrap();}
-        let position=session.position;
-        assert!(session.apply(&request("seek",100.0)).is_err());
-        assert_eq!(session.position,position);
-        assert!(session.apply(&request("stop",0.0)).unwrap());
-        assert!(!session.apply(&request("stop",0.0)).unwrap());
+        let mut session = Session::default();
+        let request = |action: &str, value| Request {
+            target: "screen".into(),
+            action: action.into(),
+            source: "https://example.com/video.mp4".into(),
+            value,
+        };
+        assert!(session.apply(&request("seek", 1.0)).is_err());
+        assert!(session.apply(&request("load", 0.0)).unwrap());
+        let generation = session.generation;
+        assert!(session.apply(&request("load", 0.0)).is_err());
+        assert_eq!(session.generation, generation);
+        assert!(!session.apply(&request("play", 0.0)).unwrap());
+        for index in 1..16 {
+            session.apply(&request("seek", index as f64)).unwrap();
+        }
+        let position = session.position;
+        assert!(session.apply(&request("seek", 100.0)).is_err());
+        assert_eq!(session.position, position);
+        assert!(session.apply(&request("stop", 0.0)).unwrap());
+        assert!(!session.apply(&request("stop", 0.0)).unwrap());
     }
     #[test]
     fn timeline_and_sources() {

@@ -32,8 +32,16 @@ static func reserve(root: Node, textures_owned: bool = true) -> Dictionary:
 			else:
 				return {"error":"Unsupported mesh type for renderer accounting"}
 			if textures_owned:
-				var material := node.get_active_material(index) as StandardMaterial3D
-				if material:
+				var materials: Array[StandardMaterial3D] = []
+				var active := node.get_active_material(index) as StandardMaterial3D
+				if active:
+					materials.append(active)
+				var sources: Array = node.get_meta("ssc_original_materials",[])
+				if index < sources.size() and sources[index] is StandardMaterial3D:
+					materials.append(sources[index])
+				# Disabled normal/emission features may disappear from Godot's
+				# duplicated unlit material but remain retained for later tiers.
+				for material in materials:
 					for texture in [material.albedo_texture,material.emission_texture,material.normal_texture]:
 						if texture and not textures.has(texture.get_instance_id()):
 							textures[texture.get_instance_id()] = true

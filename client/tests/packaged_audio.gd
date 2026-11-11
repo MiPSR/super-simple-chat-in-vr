@@ -35,6 +35,7 @@ func _run() -> void:
 	assert(is_equal_approx(audio.clips.bell.decoder.duration(), 0.3))
 	var creator := Creator.new()
 	scope.add_child(creator)
+	creator.set_process(false) # Commands below deliberately assert synchronous results.
 	creator.script_error.connect(func(message: String): push_error(message); quit(2))
 	creator.load_package(path, {"scripts":[{"path":"scripts/audio.luau","side":"client","attachment":"world","capabilities":["audio"]}]}, scope)
 	var playbacks: Array[WeakRef] = []

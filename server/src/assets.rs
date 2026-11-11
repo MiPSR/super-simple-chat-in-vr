@@ -2,12 +2,13 @@ use crate::creator_objects::valid_tag;
 pub(crate) use crate::creator_objects::{MAX_TAG_BYTES as MAX_ENTITY_TAG_BYTES, tag_bytes};
 use crate::http::{ApiError, ApiResult};
 use serde::{Deserialize, Serialize};
-mod state;
-mod gltf_scene;
 mod gltf_binary;
+mod gltf_scene;
+mod state;
 #[path = "../../shared/visual_properties.rs"]
 mod visual_properties;
-pub type MaterialStyles = std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>;
+pub type MaterialStyles =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>;
 // Publication uses the same maintained container/header/duration validation as
 // playback; PCM read/seek methods are only needed by the native client.
 #[allow(dead_code)]
@@ -449,9 +450,14 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
                 || z.size
                     .iter()
                     .any(|v| !v.is_finite() || !(0.1..=1000.0).contains(v))
-                || [z.effects.reverb, z.effects.echo, z.effects.distortion, z.effects.noise]
-                    .iter()
-                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                || [
+                    z.effects.reverb,
+                    z.effects.echo,
+                    z.effects.distortion,
+                    z.effects.noise,
+                ]
+                .iter()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
         })
     {
         return Err(ApiError::bad("Invalid acoustic zone or effect range"));
@@ -548,10 +554,18 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
             || script.capabilities.iter().any(|c| {
                 !matches!(
                     c.as_str(),
-                    "state" | "objects" | "visual" | "audio" | "media" | "radio" | "queries" | "voice"
+                    "state"
+                        | "objects"
+                        | "visual"
+                        | "audio"
+                        | "media"
+                        | "radio"
+                        | "queries"
+                        | "voice"
                 )
             })
-            || (script.capabilities.iter().any(|c|c=="voice") && (script.side!="server" || script.attachment!="world"))
+            || (script.capabilities.iter().any(|c| c == "voice")
+                && (script.side != "server" || script.attachment != "world"))
             || (script.attachment != "world"
                 && !(kind == "avatar" && script.attachment == "avatar")
                 && !ids.contains(&script.attachment))
@@ -573,7 +587,11 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
     for path in &files {
         let mut f = zip.by_name(path).map_err(ApiError::internal)?;
         if path.ends_with(".glb") || path.ends_with(".vrm") {
-            image_bytes += validate_glb_with_budget(&mut f, kind == "avatar" && path == &manifest.scene,&mut glb_budget)?;
+            image_bytes += validate_glb_with_budget(
+                &mut f,
+                kind == "avatar" && path == &manifest.scene,
+                &mut glb_budget,
+            )?;
         } else if path.ends_with(".png")
             || path.ends_with(".jpg")
             || path.ends_with(".jpeg")
@@ -613,35 +631,57 @@ fn validate_material_styles(styles: &MaterialStyles) -> ApiResult<()> {
         return Err(ApiError::bad("At most 256 material style targets"));
     }
     for (target, properties) in styles {
-        if target.is_empty() || target.len() > 64 || target.contains('/') || target == ".."
-            || properties.len() > 13 {
-            return Err(ApiError::bad("Invalid material style target/property count"));
+        if target.is_empty()
+            || target.len() > 64
+            || target.contains('/')
+            || target == ".."
+            || properties.len() > 13
+        {
+            return Err(ApiError::bad(
+                "Invalid material style target/property count",
+            ));
         }
         for (property, value) in properties {
-            visual_properties::validate("material",property,value).map_err(ApiError::bad)?;
+            visual_properties::validate("material", property, value).map_err(ApiError::bad)?;
         }
     }
     Ok(())
 }
 
 #[derive(Default)]
-struct GlbBudget { encoded: u64, arrays: u64 }
+struct GlbBudget {
+    encoded: u64,
+    arrays: u64,
+}
 impl GlbBudget {
     fn encoded(&mut self, bytes: u64) -> ApiResult<()> {
-        self.encoded=self.encoded.checked_add(bytes).filter(|total|*total<=256*1024*1024)
-            .ok_or_else(||ApiError::bad("Package GLB bytes exceed 256 MiB"))?;
+        self.encoded = self
+            .encoded
+            .checked_add(bytes)
+            .filter(|total| *total <= 256 * 1024 * 1024)
+            .ok_or_else(|| ApiError::bad("Package GLB bytes exceed 256 MiB"))?;
         Ok(())
     }
     fn arrays(&mut self, doc: &serde_json::Value) -> ApiResult<()> {
-        if let Some(accessors)=doc["accessors"].as_array() {
+        if let Some(accessors) = doc["accessors"].as_array() {
             for accessor in accessors {
-                let components=match accessor["type"].as_str() {
-                    Some("SCALAR")=>1,Some("VEC2")=>2,Some("VEC3")=>3,Some("VEC4"|"MAT2")=>4,
-                    Some("MAT3")=>9,Some("MAT4")=>16,_=>return Err(ApiError::bad("Invalid accessor shape")),
+                let components = match accessor["type"].as_str() {
+                    Some("SCALAR") => 1,
+                    Some("VEC2") => 2,
+                    Some("VEC3") => 3,
+                    Some("VEC4" | "MAT2") => 4,
+                    Some("MAT3") => 9,
+                    Some("MAT4") => 16,
+                    _ => return Err(ApiError::bad("Invalid accessor shape")),
                 };
-                self.arrays=accessor["count"].as_u64().and_then(|count|count.checked_mul(components*4))
-                    .and_then(|bytes|self.arrays.checked_add(bytes)).filter(|total|*total<=256*1024*1024)
-                    .ok_or_else(||ApiError::bad("Package decoded accessor arrays exceed 256 MiB"))?;
+                self.arrays = accessor["count"]
+                    .as_u64()
+                    .and_then(|count| count.checked_mul(components * 4))
+                    .and_then(|bytes| self.arrays.checked_add(bytes))
+                    .filter(|total| *total <= 256 * 1024 * 1024)
+                    .ok_or_else(|| {
+                        ApiError::bad("Package decoded accessor arrays exceed 256 MiB")
+                    })?;
             }
         }
         Ok(())
@@ -649,9 +689,13 @@ impl GlbBudget {
 }
 #[cfg(test)]
 fn validate_glb(r: &mut impl Read, avatar: bool) -> ApiResult<u64> {
-    validate_glb_with_budget(r,avatar,&mut GlbBudget::default())
+    validate_glb_with_budget(r, avatar, &mut GlbBudget::default())
 }
-fn validate_glb_with_budget(r: &mut impl Read, avatar: bool, budget: &mut GlbBudget) -> ApiResult<u64> {
+fn validate_glb_with_budget(
+    r: &mut impl Read,
+    avatar: bool,
+    budget: &mut GlbBudget,
+) -> ApiResult<u64> {
     let mut head = [0u8; 20];
     r.read_exact(&mut head)
         .map_err(|_| ApiError::bad("Truncated GLB"))?;
@@ -695,7 +739,7 @@ fn validate_glb_with_budget(r: &mut impl Read, avatar: bool, budget: &mut GlbBud
         }
         validate_glb_structure(&doc, Some(size))?;
         let mut chunk_reader = (&mut *r).take(size);
-        let mut checked = gltf_binary::Checked::new(&mut chunk_reader,&doc)?;
+        let mut checked = gltf_binary::Checked::new(&mut chunk_reader, &doc)?;
         validate_embedded_images(&mut checked, &doc, &mut image_bytes)?;
         let remaining = size - checked.position();
         let actual = std::io::copy(&mut checked, &mut std::io::sink())
@@ -738,8 +782,8 @@ fn validate_glb_with_budget(r: &mut impl Read, avatar: bool, budget: &mut GlbBud
                         | "VRMC_springBone"
                         | "VRMC_materials_mtoon"
                         | "KHR_materials_unlit"
-                         | "KHR_texture_transform"
-                         | "KHR_lights_punctual"
+                        | "KHR_texture_transform"
+                        | "KHR_lights_punctual"
                         | "EXT_texture_webp"
                 )
             ) {
@@ -1114,14 +1158,14 @@ fn validate_accessor_range(
 mod tests {
     #[test]
     fn package_glb_budgets_aggregate_across_prefabs_without_allocating_arrays() {
-        let mut budget=super::GlbBudget::default();
-        let doc=serde_json::json!({"accessors":[{"type":"SCALAR","count":32*1024*1024}]});
+        let mut budget = super::GlbBudget::default();
+        let doc = serde_json::json!({"accessors":[{"type":"SCALAR","count":32*1024*1024}]});
         budget.arrays(&doc).unwrap();
         budget.arrays(&doc).unwrap();
         assert!(budget.arrays(&doc).is_err());
-        let mut budget=super::GlbBudget::default();
-        budget.encoded(128*1024*1024).unwrap();
-        budget.encoded(128*1024*1024).unwrap();
+        let mut budget = super::GlbBudget::default();
+        budget.encoded(128 * 1024 * 1024).unwrap();
+        budget.encoded(128 * 1024 * 1024).unwrap();
         assert!(budget.encoded(1).is_err());
     }
     #[test]

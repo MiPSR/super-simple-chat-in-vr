@@ -477,7 +477,7 @@ func _clear_instance() -> void:
 	voice.clear()
 	avatar_queue.clear()
 	if avatar_loader:
-		avatar_loader.queue_free()
+		avatar_loader.retire()
 		avatar_loader = null
 	if world_root:
 		if world_root.has_meta("ssc_audio"):
@@ -963,7 +963,7 @@ func _apply_preferences() -> void:
 	for entity in entity_nodes.values():
 		Materials.apply(entity, quality)
 	settings_panel.configure(preferences)
-	var notices := SettingsPanel.apply_local(preferences, get_viewport(), voice, radios)
+	var notices := SettingsPanel.apply_local(preferences, get_viewport(), voice, radios, camera)
 	settings_panel.report(notices)
 	if not notices.is_empty():
 		_status("\n".join(notices))

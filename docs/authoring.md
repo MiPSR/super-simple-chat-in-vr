@@ -240,7 +240,7 @@ scores. Reliable spawn/destruction/damage events accompany state changes;
 unreliable transform streams are independently rate-controlled. All of this is
 discarded when an instance empties.
 
-### Client material and light controls (unverified)
+### Client material and light controls
 
 Client scripts with `visual` can enqueue fixed presentation-only setters:
 
@@ -284,10 +284,9 @@ and do not reimport assets or rebuild normalized materials. Instance teardown
 clears pending work and resets ambient color. This is a cheap presentation
 control, not an authoritative light simulation or an access-control mechanism.
 
-This implementation and its new regression cases have **not been compiled or
-executed**.
+Local native/headless regression cases pass. GPU/visual acceptance remains separate.
 
-#### Standardized advanced material schema (unverified)
+#### Standardized advanced material schema
 
 The same fixed material properties are usable from scripts and a package's
 optional `materials` map, including avatar packages. Prefab definitions can carry
@@ -330,7 +329,15 @@ an API for adding arbitrary host nodes.
 
 Renderer/audio admission limits are documented in [resource-policy.md](resource-policy.md).
 
-### Supplied client animations (unverified)
+Tier 0 converts blended transparency to alpha-hash dithering while retaining
+authored alpha; cutout materials retain their threshold. Returning to higher tiers
+restores the original blend mode. Normalization preserves authored UV transforms
+and roughness, and interprets the pinned MToon importer's fixed color, alpha,
+normal and emission uniforms without retaining its uploaded material/pass graph.
+Local headless regressions cover alpha/cutoff/UV/emission and shader color variants;
+actual dithered transparency and outline quality still require GPU/VR acceptance.
+
+### Supplied client animations
 
 Client `visual` scripts can call `play_animation(target, clip, speed?)`,
 `stop_animation(target)`, and `seek_animation(target, seconds)`. World/avatar
@@ -348,9 +355,9 @@ shared/discrete behavior must be driven from authoritative replicated state or
 the avatar's declared server-replicated actions, not client-authored outcomes.
 The pre-existing avatar `animation(name)` helper remains available.
 
-These controls and new sanitization tests are written but not executed.
+Local headless control/sanitization regressions pass.
 
-### Client acoustic-zone controls (unverified)
+### Client acoustic-zone controls
 
 World-attached client scripts with `audio` can call
 `world.set_zone(id, property, value)` for a declared acoustic zone. Properties
@@ -363,9 +370,9 @@ Writes to the same zone coalesce, identical writes do nothing, and at most two
 zone effect chains rebuild per render frame with a rotating cursor. Private-call
 dry routing and the final limiter remain unchanged. The host configures declared
 zones before script initialization so startup setters are meaningful. Shared
-changes should be driven from replicated state. New coverage is unexecuted.
+changes should be driven from replicated state. Local headless regressions pass.
 
-### Client callback scheduling (unverified)
+### Client callback scheduling
 
 Live callbacks are queued and processed in order by a fair client-wide render
 frame scheduler. A busy script does not make every other VM run a full watchdog
@@ -375,7 +382,7 @@ not assume presentation commands have already reached the renderer synchronously
 when the input packet arrives. See [resource-policy.md](resource-policy.md) for
 ceilings, initialization exceptions and remaining cooperative-budget limits.
 
-### Creator call requests (unverified)
+### Creator call requests
 
 Server-world scripts may request the `voice` capability and call
 `world.call_invite(user_id)` or `world.call_leave()` **only inside an authenticated
@@ -392,10 +399,10 @@ voice blocks override requests, and the recipient must explicitly accept through
 their UI before receiving private audio. World bypass policies and user call modes
 still govern actual routing. Invite limits are four per actor per ten seconds
 and one per recipient per five seconds, with cooldowns surviving disconnect.
-The instance's creator call queue is bounded to eight requests. New authorization,
-timer, cooldown and acceptance tests are written but unexecuted.
+The instance's creator call queue is bounded to eight requests. Local authorization,
+timer, cooldown and recipient-acceptance policy regressions pass.
 
-### Authoritative entity attachments and rotation (unverified)
+### Authoritative entity attachments and rotation
 
 Server scripts with `objects` can enqueue:
 
@@ -422,8 +429,8 @@ bounded deferred notifications on both creator hosts. Detached object queries
 and authoritative snapshots expose `attached_to` and `attachment_offset`.
 
 Rotation uses a normalized finite quaternion; flat numeric vectors/quaternions
-are decoded without recursively walking arbitrary Lua tables. These commands and
-the new Rapier/cycle/lease/snapshot regression cases have not been executed.
+are decoded without recursively walking arbitrary Lua tables. Local command and
+Rapier/cycle/lease/snapshot regression cases pass.
 
 Replicated `world.state.set` writes likewise decode only the variable's declared
 boolean/number/integer/string/vector shape. Numeric strings and truthy non-boolean
@@ -621,10 +628,10 @@ Effect amounts are in `[0,1]` and clamped to the administrator's
 `SSC_AUDIO_EFFECT_MAX` (default `0.9`). Geometry only defines membership: a large
 room may be dry, and a small room may be very reverberant. Voice and video audio
 use Godot's native bus effects and a final limiter. Buses are released when the
-world changes. The new noise/occlusion implementation below is unverified;
+world changes. The noise/occlusion implementation below passes local regressions;
 scripts cannot arbitrarily reroute sources or private calls.
 
-### Optional occlusion and zone noise (unverified)
+### Optional occlusion and zone noise
 
 World manifests can set `"realistic_acoustics":true` (default false). This enables
 a bounded single-ray obstruction approximation, not a room-acoustics simulation:
@@ -647,7 +654,7 @@ disables it. One lazy generator fills at most 4,800 stereo frames per render
 frame, stops outside noisy zones, reuses its player on re-entry, and is released
 on world teardown. `world.set_zone(id,"noise",value)` uses the same `[0,1]` bounds
 as other scalar effects. Ray/exclusion/dry-route and generator lifecycle fixtures
-are written but have not been executed; audible and hardware acceptance remain.
+pass locally; audible and hardware acceptance remain.
 
 ### Packaged standalone audio
 

@@ -610,7 +610,7 @@ async fn admin_health(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiRes
     auth::admin(&app, &headers)?;
     let w = app.worlds.lock().unwrap();
     Ok(Json(
-        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage()}),
+        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage(),"realtime_output":realtime::output_usage()}),
     ))
 }
 

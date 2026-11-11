@@ -33,7 +33,7 @@ static func apply(material: StandardMaterial3D, values: Dictionary, tier: int) -
 		outline = StandardMaterial3D.new()
 		outline.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		outline.cull_mode = BaseMaterial3D.CULL_FRONT
-		outline.grow_enabled = true
+		outline.grow = true
 		outline.grow_amount = float(values.outline_width)
 		var color: Array = values.get("outline_color",[0,0,0])
 		outline.albedo_color = Color(float(color[0]),float(color[1]),float(color[2]),material.albedo_color.a)

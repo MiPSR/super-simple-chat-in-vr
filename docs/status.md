@@ -6,6 +6,78 @@ Headless tests establish integration behavior, not headset comfort or complete
 production security. There is no development account-login bypass in the app;
 tests seed their own isolated temporary database sessions.
 
+## Current verification update
+
+Compilation/testing has resumed. The former deferred implementation batch now
+passes local Clippy and its native/server unit regressions (43 native tests,
+86 server tests; isolated child probes are launched by their parent tests).
+The headless settings suite passes material/light/ambient/animation, acoustic
+noise/occlusion, renderer admission, fair scheduling, focus, transport transitions,
+cache pins and import-queue/cancellation fixtures. Local actual-GLB/VRM, packaged
+audio and helper-process video/PCM regression runs also pass. Older "unverified"
+notes below describe the prior verification state, not new passing evidence for
+hardware or deployment acceptance.
+
+New implementation includes packet-owned outgoing ENet reservations (4 MiB/peer,
+64 MiB/process), real slow-peer queue teardown coverage, serialized FIFO GLTF
+imports, and a separate Landlock-confined media helper with bounded IPC and
+per-process resource limits. Helper initialization/file-source rejection and
+HTTP video/PCM tests pass. An opt-in live YouTube helper run also passes after
+enabling separate bounded-height video/audio format selection.
+
+Two actual headless Godot peers now also pass the refreshed isolated-helper
+YouTube **and** public HTTPS MP4 synchronization paths, including pause/seek,
+late join and resume. The latest full local workspace/all-targets run passes 43 native
+unit tests, 86 server unit tests, two helper integrations and three server
+integrations (including the website DOM tests). A later rendering refinement adds
+alpha-hash Tier-0 transparency, authored cutoff/UV/roughness restoration, fixed
+MToon uniform interpretation and tier-independent retained texture accounting;
+its focused headless fixtures pass. Persistent draw-distance control (10–2000 m,
+default 250 m) now has server bounds/default migration, phone/camera and website
+numeric-preservation regressions.
+
+The latest full local pass also includes non-blocking avatar-import retirement
+(with a semaphore-blocked worker regression), finite/depth-bounded material
+uniform validation, safe normalized color defaults and composed-transform
+overflow/affine checks. A preceding all-targets attempt exceeded the tool's
+wall-clock limit while compiling/testing alongside a release build; the rerun
+completed successfully without that external limit. This timeout was not counted
+as a passing run.
+
+The newest health change exposes packet-owned realtime-output reservations and
+both byte ceilings through the authenticated administrator endpoint, with unit
+and real HTTP integration assertions. Media-worker regressions cover the
+fork-to-exec parent-death race, expired read/write deadlines and nonfinite PCM.
+The full pass includes real descendant descriptor teardown and explicit
+process-group escape-denial probes. Client/server
+packages pass for this lifecycle/health snapshot and the subsequent loader and
+cache-lock regression corrections.
+
+That refresh exposed a cache-lock test race under concurrent subprocess startup:
+a forked child briefly inherits an OFD pin until exec despite `CLOEXEC`. The
+evictor correctly returns busy in this interval. The regression now requires
+bounded eventual release after the final reader closes, and an additional
+descriptor-clone test explicitly checks retained OFD ownership. This correction
+passes Clippy, the full local workspace suite and refreshed client/server package
+checks. Ten consecutive native-unit-suite runs also pass (43 tests each), including
+parallel subprocess startup and cache pin retirement. The failed package attempt
+is not a pass.
+
+The subsequent loader reentrancy fix queues replacement requests made from
+completion/failure callbacks until old import cleanup finishes, and binds failed
+cache removal to the completed path. Its headless cancellation/retirement/cache
+fixture and the full workspace regression pass for this addition.
+
+The real encrypted ENet integration now passes through GLB/VRM imports, headless
+settings, positional video/PCM/failure recovery, contact/avatar policies,
+cross-world radio, physics, GC and ephemeral instance teardown. A separate fresh
+1,000-cycle avatar/audio/Luau replacement stress run passes. Combined Nix client/
+server packages now also pass for the rendering/draw-distance, asynchronous
+retirement and material/composed-transform hardening snapshot. The packaged launcher
+also starts headlessly from a fresh writable cache without script errors.
+Importer crash/peak-memory isolation, aggregate decoder-descendant resource guarantees, GPU/headset/audio
+acceptance, long sessions and live OAuth/NixOS deployment remain separate gaps.
+
 ## Working and exercised by automated integration tests
 
 - Real low-level Godot 4.7.2 ↔ rusty_enet traffic, payload encryption/MAC,
@@ -270,23 +342,23 @@ No row below waives any part of the corresponding scenario.
 | 5 | GLB and ephemeral instances tested; private invitation/search matrix needs expansion. |
 | 6 | Real peers exercise doors, tanks, projectiles, spawning, damage and scores. |
 | 7 | Real peers exercise late join, reconnect and last-player destruction. |
-| 8 | Full/quarter rates independently tested; broader TPS/rate combinations and load tests remain. |
+| 8 | Full/quarter real-peer traffic and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; packet-loss/load acceptance remains. |
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
 | 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |
 | 12 | Both bounded Luau hosts tested; complete typed API/event coverage and security audit remain. |
-| 13 | Opus, text and private calls tested; native zones/effects added; noise/occlusion, radio and full policy coverage incomplete. |
+| 13 | Opus/text/calls/radio and native zone effects pass locally, including noise lifecycle, obstruction/exclusions, private dry routing and creator-call consent; real audio/headset and full policy acceptance remain. |
 | 14 | Cross-instance Opus/SSTV/FT8-style routing, blocking, channel denial and no-radio opt-out tested; client-world creator requests/presets locally tested; complete policy and real-audio checks remain. |
-| 15 | Two real peers decode public MP4/YouTube, converge to server time, pause/seek, late join and resume; long sessions, failure cases and package revalidation remain. |
+| 15 | Historical two-peer public MP4/YouTube synchronization plus current isolated-helper YouTube and HTTP/failure recovery pass; long sessions and new-helper multi-peer/package revalidation remain. |
 | 16 | Hand-switchable phone and configurable eight-sector long-press radial menu have local persistence/gesture tests; XR usability remains. |
-| 17 | Persistent scale/MSAA and conservative upscaler fallback tested; import-time texture reduction has targeted tests; full advanced schema and visual/GPU/XR checks remain. |
+| 17 | Persistent scale/MSAA, conservative upscalers, texture reduction, fixed advanced schema, tier persistence and ambient darkness pass headless tests; visual/GPU/XR acceptance remains. |
 | 18 | Voice/contact blocks tested; complete block/script capability matrix remains. |
-| 19 | Bounded queues and repeated decoder shutdown tests; long-session/leak/interruption testing remains. |
+| 19 | Packet-owned queue bounds, isolated media helper/IPC, FIFO imports and 1,000 synthetic replacement cycles pass locally; importer isolation, aggregate descendant budgets and extended headset/RSS/leak acceptance remain. |
 | 20 | Real encrypted Godot↔Rust ENet suite covers reliable/sequenced/reduced-rate/reconnect traffic. |
 
-The latest completed local workspace tests and Clippy passed **before the current
-unverified implementation batch**. Compilation/testing is deferred until the
-remaining implementation is complete, as requested. The most recent verified
+Compilation/testing has resumed; see the current update above for new evidence.
+The following records **historical packaged snapshots**, not verification of
+every subsequent change. The most recent previously verified
 `nix build .#server .#client --no-link` snapshot includes media hardening,
 asynchronous DNS cancellation, joined decoder shutdown, CPU-time watchdogs,
 typed replicated variables, packaged Opus, client radio APIs/presets, the admin

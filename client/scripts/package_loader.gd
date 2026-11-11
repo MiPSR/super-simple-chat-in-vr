@@ -4,6 +4,7 @@ signal failed(message: String)
 signal cache_notice(message: String)
 const Materials = preload("res://scripts/materials.gd")
 const Cache = preload("res://scripts/asset_cache.gd")
+const ImportQueue = preload("res://scripts/import_queue.gd")
 var request: HTTPRequest
 var credentials := ""
 var base_url := ""
@@ -21,9 +22,22 @@ var local_avatar := false
 var pinned_cache_path := ""
 var cache_directory := "user://cache"
 var import_cancelled := false
+var import_waiting := false
+var finishing_import := false
+var retiring := false
 var queued_load: Dictionary = {}
 var request_generation := 0
 var download_limit := 1_000_000_000
+
+func retire() -> void:
+	# Keep the owner alive until its worker completes; queue_free() would enter
+	# _exit_tree and join a running importer on the XR/main thread.
+	retiring = true
+	cancel()
+	if worker:
+		set_process(true)
+	else:
+		queue_free()
 
 func cancel(clear_queued: bool = true) -> void:
 	request_generation += 1
@@ -34,10 +48,15 @@ func cancel(clear_queued: bool = true) -> void:
 		if not request.download_file.is_empty():
 			DirAccess.remove_absolute(request.download_file)
 			request.download_file = ""
-	if worker:
+	if worker or finishing_import:
 		# Never join a running GLTF importer from a focus/leave/UI callback.
 		# Its completed result is discarded on the main thread before publication.
 		import_cancelled = true
+	elif import_waiting:
+		import_waiting = false
+		ImportQueue.release(self)
+		Cache.release(pinned_cache_path)
+		pinned_cache_path = ""
 
 func _ready() -> void:
 	_renew_request()
@@ -67,9 +86,9 @@ func _load_asset(id: String, version: String, metadata: Dictionary) -> void:
 	if not Cache.valid_hash(version):
 		failed.emit("Invalid immutable package hash")
 		return
-	if worker or request.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+	if worker or finishing_import or import_waiting or request.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		cancel(false)
-		if worker:
+		if worker or finishing_import:
 			queued_load = {"id":id,"version":version,"metadata":metadata.duplicate(true)}
 			return
 	asset_id = id
@@ -116,6 +135,8 @@ func _trim_cache() -> void:
 		cache_notice.emit("Asset cache eviction deferred: active imports or filesystem errors")
 
 func _start_import() -> void:
+	if worker or import_waiting:
+		return
 	import_cancelled = false
 	pinned_cache_path = staging
 	if not Cache.acquire(pinned_cache_path):
@@ -123,10 +144,18 @@ func _start_import() -> void:
 		failed.emit("Could not pin completed package for import; retry the load")
 		return
 	_trim_cache()
+	import_waiting = true
+	_try_start_import()
+
+func _try_start_import() -> void:
+	if not ImportQueue.request(self):
+		return
+	import_waiting = false
 	worker = Thread.new()
 	var error := worker.start(_import.bind(staging, expected, str(manifest.get("scene", "")), manifest.get("prefabs", {}).duplicate(true), local_avatar, texture_reduction))
 	if error != OK:
 		worker = null
+		ImportQueue.release(self)
 		Cache.release(pinned_cache_path)
 		pinned_cache_path = ""
 		failed.emit("Could not start package importer")
@@ -172,7 +201,10 @@ func _import(path: String, hash: String, scene: String, definitions: Dictionary,
 	result_mutex.unlock()
 
 func _process(_delta: float) -> void:
+	if import_waiting:
+		_try_start_import()
 	if worker and not worker.is_alive():
+		finishing_import = true
 		worker.wait_to_finish()
 		worker = null
 		var imported_path := pinned_cache_path
@@ -181,6 +213,7 @@ func _process(_delta: float) -> void:
 		var result := pending_result
 		pending_result = {}
 		result_mutex.unlock()
+		var discard_failed_cache := result.has("error") and not import_cancelled
 		if import_cancelled:
 			pass # Inactive generations never create scenes, scripts or audio.
 		elif result.has("error"):
@@ -240,10 +273,15 @@ func _process(_delta: float) -> void:
 				failed.emit(construction_error if not construction_error.is_empty() else "GLB scene construction failed")
 		# Loaded listeners synchronously read Luau/Opus before this pin retires.
 		Cache.release(imported_path)
-		if result.has("error") and not import_cancelled:
-			Cache.remove_completed(staging)
+		if discard_failed_cache:
+			Cache.remove_completed(imported_path)
 		import_cancelled = false
+		ImportQueue.release(self)
 		_trim_cache()
+		finishing_import = false
+		if retiring:
+			queue_free()
+			return
 		if not queued_load.is_empty():
 			var next := queued_load
 			queued_load = {}
@@ -256,6 +294,8 @@ func _exit_tree() -> void:
 			DirAccess.remove_absolute(request.download_file)
 	if worker:
 		worker.wait_to_finish()
+	ImportQueue.release(self)
+	import_waiting = false
 	var was_pinned := not pinned_cache_path.is_empty()
 	Cache.release(pinned_cache_path)
 	pinned_cache_path = ""

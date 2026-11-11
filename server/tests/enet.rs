@@ -428,6 +428,13 @@ async fn encrypted_godot_enet() -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+            ensure!(health["realtime_output"]["peer_limit_bytes"] == 4 * 1024 * 1024);
+            ensure!(health["realtime_output"]["process_limit_bytes"] == 64 * 1024 * 1024);
+            ensure!(
+                health["realtime_output"]["reserved_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes <= 64 * 1024 * 1024)
+            );
             if health["uploads"]["active"] == 2 {
                 ensure!(health["uploads"]["reserved_bytes"] == 2_000_000_000u64);
                 break;
@@ -1307,14 +1314,16 @@ async fn encrypted_godot_enet() -> Result<()> {
         .await?;
     let first_grab_revision = snapshot(&grabbed)["revision"].as_f64().unwrap();
     b.command(json!({"action":"command","kind":8,"data":{"avatar":avatar_asset["id"]}}))?;
+    // Idempotent selection no longer changes revisions/actions. A subsequent
+    // ordered benign state change provides a fresh authoritative observation.
+    b.command(json!({"action":"command","kind":7,"data":{"sleeping":true}}))?;
     let same_avatar = a
         .wait(|e| {
             snapshot(e)["revision"]
                 .as_f64()
                 .is_some_and(|r| r > first_grab_revision)
-                && snapshot(e)["players"][users[1]]["avatar_actions"]
-                    .as_object()
-                    .is_some_and(|actions| actions.is_empty())
+                && snapshot(e)["players"][users[1]]["avatar_actions"]["happy"].as_f64() == Some(1.0)
+                && snapshot(e)["players"][users[1]]["sleeping"] == true
                 && snapshot(e)["interactions"]
                     .as_object()
                     .is_some_and(|grabs| !grabs.is_empty())
@@ -1322,6 +1331,7 @@ async fn encrypted_godot_enet() -> Result<()> {
         .await
         .context("Same immutable avatar selection must retain grabs")?;
     let same_revision = snapshot(&same_avatar)["revision"].as_f64().unwrap();
+    b.command(json!({"action":"command","kind":7,"data":{"sleeping":false}}))?;
     b.command(json!({"action":"command","kind":8,"data":{"avatar":""}}))?;
     let removed = a
         .wait(|e| {
@@ -1336,6 +1346,9 @@ async fn encrypted_godot_enet() -> Result<()> {
         .await
         .context("Removing an avatar must release old-bone grabs")?;
     let removed_revision = snapshot(&removed)["revision"].as_f64().unwrap();
+    // Removal always bypasses admission, but reloading still observes the
+    // per-account two-second cooldown established by the initial selection.
+    tokio::time::sleep(Duration::from_millis(2050)).await;
     b.command(json!({"action":"command","kind":8,"data":{"avatar":avatar_asset["id"]}}))?;
     let equipped = a
         .wait(|e| {

@@ -18,6 +18,7 @@ static func run() -> void:
 	Engine.get_main_loop().root.add_child(scope)
 	var creator := Creator.new()
 	scope.add_child(creator)
+	creator.set_process(false) # Exercise the synchronous tooling path explicitly.
 	creator.scope = scope
 	var vm = ClassDB.instantiate("CreatorVm")
 	assert(vm.load_script("avatar.on('release', function(e) assert(e.reason == 'snapshot' and e.target == 'b'); avatar.expression('released', 1) end)", PackedStringArray(["visual"])) == "")

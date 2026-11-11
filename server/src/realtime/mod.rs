@@ -1,11 +1,13 @@
 mod calls;
 mod contact;
 mod crypto;
+mod output_budget;
+pub use output_budget::usage as output_usage;
 mod radio;
 pub(crate) mod rates;
 use crate::{App, assets::Manifest, auth, db, world::Join};
-pub(crate) use radio::Request as RadioRequest;
 pub(crate) use calls::Action as CallAction;
+pub(crate) use radio::Request as RadioRequest;
 use rusty_enet::{Event, Host, HostSettings, Packet, PacketKind, PeerID};
 use serde_json::{Value, json};
 use std::{
@@ -31,6 +33,8 @@ pub struct Grant {
     pub expires: i64,
 }
 struct Session {
+    output: output_budget::Budget,
+    output_failed: bool,
     user: String,
     session: String,
     instance: String,
@@ -76,15 +80,28 @@ fn send_bytes(
     kind: u8,
     payload: &[u8],
 ) {
+    if session.output_failed {
+        return;
+    }
     let bytes = session.cipher.seal(channel, 1, kind, payload);
+    let Some(bytes) = session.output.packet(bytes, peer.mtu() as usize) else {
+        if channel == 0 {
+            session.output_failed = true;
+            peer.disconnect_now(5);
+        }
+        return;
+    };
     let delivery = if channel == 0 {
         PacketKind::Reliable
     } else {
-        PacketKind::Unreliable {
+        PacketKind::AlwaysUnreliable {
             sequenced: channel != 2,
         }
     };
-    let _ = peer.send(channel, &Packet::new(bytes, delivery));
+    if peer.send(channel, &Packet::new(bytes, delivery)).is_err() && channel == 0 {
+        session.output_failed = true;
+        peer.disconnect_now(5);
+    }
 }
 fn send(
     peer: &mut rusty_enet::Peer<UdpSocket>,
@@ -93,14 +110,16 @@ fn send(
     kind: u8,
     value: &Value,
 ) {
-    if channel==0 && kind==21 && value["event"]=="state" {
-        session.call_state=value.clone();
+    if channel == 0 && kind == 21 && value["event"] == "state" {
+        session.call_state = value.clone();
     }
     let payload = serde_json::to_vec(value).unwrap();
-    if let Some(fragment_kind) = fragment_kind(channel,kind,payload.len()) {
+    if let Some(fragment_kind) = fragment_kind(channel, kind, payload.len()) {
         let count = payload.len().div_ceil(24000);
         if count > 256 {
-            if channel == 0 { peer.disconnect_later(5); }
+            if channel == 0 {
+                peer.disconnect_later(5);
+            }
             return;
         }
         let id = session.cipher.sent[channel as usize] + 1;
@@ -121,10 +140,12 @@ fn send(
     send_bytes(peer, session, channel, kind, &payload);
 }
 fn fragment_kind(channel: u8, kind: u8, bytes: usize) -> Option<u8> {
-    if bytes <= 48000 { return None; }
-    match (channel,kind) {
-        (0,kind) if kind!=10 => Some(10),
-        (1,3) => Some(27),
+    if bytes <= 48000 {
+        return None;
+    }
+    match (channel, kind) {
+        (0, kind) if kind != 10 => Some(10),
+        (1, 3) => Some(27),
         _ => None,
     }
 }
@@ -180,12 +201,12 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                             // A rejected transition must leave its session/world intact.
                             let old:Vec<_>=sessions.iter().filter(|(_,s)|s.user==g.user).map(|(id,_)|*id).collect();
                             let result=app.worlds.lock().unwrap().admit(&g.join,&g.user,&g.name,&g.version,g.manifest,g.sources);
-                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {user:g.user,session:g.session,instance:String::new(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,1,1),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:0,input_suspended:false,call_state:Value::Null};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
+                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:String::new(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,1,1),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:0,input_suspended:false,call_state:Value::Null};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
                             // No leave here: admit already transitioned or resnapshotted
                             // membership, so a stale disconnect cannot remove the new one.
                             for old in old {sessions.remove(&old);pending.insert(old,Instant::now()-Duration::from_secs(6));}
                             next_voice_epoch+=1;
-                             let mut session=Session {user:g.user,session:g.session,instance:instance.clone(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,g.join.send_divisor,g.join.receive_divisor),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:next_voice_epoch,input_suspended:false,call_state:Value::Null};
+                             let mut session=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:instance.clone(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,g.join.send_divisor,g.join.receive_divisor),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:next_voice_epoch,input_suspended:false,call_state:Value::Null};
                             let worlds=app.worlds.lock().unwrap();
                             let mut snapshot=worlds.instances[&instance].snapshot(worlds.tick);
                             filter_snapshot_players(&mut snapshot, &session.user, &app.db.lock().unwrap());
@@ -244,7 +265,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                 if let Ok(tracking)=serde_json::from_slice::<std::collections::BTreeMap<String,crate::world::TrackedJoint>>(&payload)
                                     && crate::world::valid_tracking(&tracking)
                                     && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance)
-                                     && let Some(p)=i.players.get_mut(&session.user) {if p.tracking!=tracking {p.tracking=tracking;p.last_motion=i.clock;}}
+                                     && let Some(p)=i.players.get_mut(&session.user) && p.tracking!=tracking {p.tracking=tracking;p.last_motion=i.clock;}
                             } else if kind==12 && channel_id==1 && payload.len()<=512 {
                                 if let Ok(action)=serde_json::from_slice::<crate::world::Action>(&payload)
                                     && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance) {let _=i.action(&session.user,action);}
@@ -253,7 +274,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                 let pose:Vec<f32>=payload.as_chunks::<4>().0.iter().map(|s|f32::from_le_bytes(*s)).collect();
                                 if !pose.iter().all(|v|v.is_finite() && v.abs()<100000.0) {continue;}
                                 let mut worlds=app.worlds.lock().unwrap();
-                                 if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {if p.pose!=pose {p.pose=pose;p.last_motion=i.clock;}}
+                                 if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) && p.pose!=pose {p.pose=pose;p.last_motion=i.clock;}
                             } else if channel_id==0 {
                                 if payload.len()>8192 {continue;}
                                 let Ok(value)=serde_json::from_slice::<Value>(&payload) else {continue;};
@@ -298,7 +319,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                          let result=serde_json::from_value::<calls::Action>(value).map_err(anyhow::Error::from).and_then(|action|calls.action(&actor,action,&online,&app.db.lock().unwrap()));
                                          match result {
                                              Ok(messages)=>for (user,value) in messages {for (id,s) in &mut sessions {if s.user==user {send(host.peer_mut(*id),s,0,21,&value);}}},
-                                             Err(error)=>send(peer,session,0,255,&json!({"error":error.to_string()})),
+                                             Err(error)=>if let Some(session)=sessions.get_mut(&id) {send(peer,session,0,255,&json!({"error":error.to_string()}));},
                                          }
                                     }
                                     22=>{
@@ -311,16 +332,16 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                     }
                                      23=>{
                                         if let Some(sent)=value["sent"].as_f64() && sent.is_finite() {
-                                            send(peer,session,0,23,&json!({"sent":sent,"server":crate::world::media::now()}));
+                                             send(peer,session,0,23,&json!({"sent":sent,"server":crate::world::media::now()}));
                                      }
-                                     28=>{
+                                     }
+                                      28=>{
                                          if let Some(active)=value["active"].as_bool() {
-                                             session.input_suspended=!active;
+                                              session.input_suspended = !active;
                                              app.worlds.lock().unwrap().input_focus(&session.user,active);
                                          }
                                      }
-                                    }
-                                    _=>{}
+                                     _=>{}
                                 }
                             }
                         }
@@ -329,7 +350,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
             }
             if Instant::now()>=next {
                 next+=step;if next<Instant::now()-step*4 {next=Instant::now()+step;}
-                let expired:Vec<_>=sessions.iter().filter(|(_,s)|s.last_seen.elapsed()>Duration::from_secs(15) || !auth::session_valid(&app,&s.user,&s.session)).map(|(id,_)|*id).collect();
+                let expired:Vec<_>=sessions.iter().filter(|(_,s)|s.output_failed || s.last_seen.elapsed()>Duration::from_secs(15) || !auth::session_valid(&app,&s.user,&s.session)).map(|(id,_)|*id).collect();
                 for id in expired {if let Some(s)=sessions.remove(&id) {app.worlds.lock().unwrap().leave(&s.user);calls.leave(&s.user);}host.peer_mut(id).disconnect_now(4);}
                 calls.clean(&sessions.values().map(|s|s.user.clone()).collect());
                 radios.clean(&sessions.values().map(|s|s.user.clone()).collect());
@@ -436,14 +457,14 @@ mod tests {
     use super::*;
     #[test]
     fn bounded_fragment_envelopes_are_never_recursively_fragmented() {
-        for (channel,kind,output) in [(0,2,10),(1,3,27)] {
-            assert_eq!(fragment_kind(channel,kind,60001),Some(output));
-            let part=json!({"id":u64::MAX,"index":255,"count":256,"kind":kind,"data":hex::encode(vec![0;24000])});
-            let bytes=part.to_string().len();
-            assert!(bytes>48000 && bytes<=60000);
-            assert_eq!(fragment_kind(channel,output,bytes),None);
+        for (channel, kind, output) in [(0, 2, 10), (1, 3, 27)] {
+            assert_eq!(fragment_kind(channel, kind, 60001), Some(output));
+            let part = json!({"id":u64::MAX,"index":255,"count":256,"kind":kind,"data":hex::encode(vec![0;24000])});
+            let bytes = part.to_string().len();
+            assert!(bytes > 48000 && bytes <= 60000);
+            assert_eq!(fragment_kind(channel, output, bytes), None);
         }
-        assert_eq!(fragment_kind(2,20,60001),None);
+        assert_eq!(fragment_kind(2, 20, 60001), None);
     }
     #[test]
     fn membership_notifications_respect_bilateral_avatar_visibility_blocks() {

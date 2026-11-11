@@ -11,6 +11,7 @@ defaults for newly introduced fields. The server rejects invalid ranges/options.
 | `voice_volume` | Live proximity/call/radio voice gain 0–1; 1 |
 | `microphone_gain` | Microphone gain 0–2; 1; does not unmute |
 | `resolution_scale` | 3D render scale 0.5–1.5; 1 |
+| `draw_distance` | Camera far clipping distance 10–2000 metres; 250; visuals only |
 | `antialiasing` | `off`, `msaa_2x`, `msaa_4x`, `msaa_8x`; 2× |
 | `upscaler` | `bilinear`, `fsr1`; bilinear |
 | `texture_lod_bias` | Coarser texture sampling bias 0–3; 0 |
@@ -23,6 +24,7 @@ defaults for newly introduced fields. The server rejects invalid ranges/options.
 | `phone_hand`, `sleeping` | Left/right phone and sleeping pose; left, awake |
 | `can_touch_me`, `can_touch_others` | Independent opt-ins; both false |
 | `call_mode` | `automatic`, `spatial`, `private`; automatic |
+| `allow_creator_calls` | Permit authenticated world interactions to request invites/leaves; false; recipients still accept explicitly |
 
 ## Safety and application
 
@@ -39,6 +41,10 @@ defaults for newly introduced fields. The server rejects invalid ranges/options.
 - Material tier, phone-hand and sleeping controls now persist rather than only
   changing the current client session. Preferred radio profiles are stored but
   fall back to an allowed profile when an administrator restricts the list.
+- Draw distance applies immediately to the active desktop/OpenXR camera. It does
+  not shorten voice routing, server interaction reach, simulation or network
+  interest. Extremely large geometry crossing the near/far planes still follows
+  the renderer's ordinary clipping behavior; this is not mesh simplification.
 - Rate divisors apply to the next browser-generated connection grant. This UI
   does not implement live rate adaptation, administrator rate ceilings or tick
   aggregation. An already open website may need refreshing to load newer account
@@ -73,8 +79,9 @@ divided by 2/4/8, floored and clamped to at least one pixel. Source ZIPs are not
 rewritten, and no original-size texture is retained for material-tier switching.
 The original image must still be decoded transiently on the CPU; this is not a
 reduction in download size or a complete peak-memory budget. Headless tests check
-actual texture dimensions, not physical VRAM usage. The complete advanced
-material schema, GPU/renderer quality comparisons and XR AA comfort remain unfinished.
+actual texture dimensions, not physical VRAM usage. The fixed advanced material
+schema now has local regressions; GPU/renderer quality and XR AA comfort remain
+acceptance work.
 These controls never alter server physics, interactions or reliable delivery,
 and do not promise a minimum frame rate for arbitrarily complex assets.
 

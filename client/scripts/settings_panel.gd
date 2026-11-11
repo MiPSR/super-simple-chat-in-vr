@@ -26,6 +26,7 @@ func configure(preferences: Dictionary) -> void:
 	_choices("allow_creator_calls", "Allow world interaction scripts to invite/leave calls", [false,true], preferences, ["No (default)","Allow authenticated interactions"])
 	_choices("quality", "Material tier", [0,1,2], preferences, ["Basic", "Standard", "Advanced"])
 	_number("resolution_scale", "3D resolution scale", 0.5, 1.5, 0.05, preferences, 1)
+	_number("draw_distance", "Draw distance (metres; visuals only)", 10, 2000, 10, preferences, 250)
 	_choices("antialiasing", "Antialiasing", ["off","msaa_2x","msaa_4x","msaa_8x"], preferences)
 	_choices("upscaler", "Upscaling (unsupported choices fall back)", ["bilinear","fsr1"], preferences)
 	_number("texture_lod_bias", "Texture LOD bias (not VRAM reduction)", 0, 3, 0.5, preferences, 0)
@@ -89,7 +90,7 @@ func _number(key: String, title: String, minimum: float, maximum: float, step: f
 	controls[key] = spin
 	add_child(spin)
 
-static func apply_local(preferences: Dictionary, viewport: Viewport, voice: Node, radio: Node) -> Array[String]:
+static func apply_local(preferences: Dictionary, viewport: Viewport, voice: Node, radio: Node, camera: Camera3D = null) -> Array[String]:
 	var notices: Array[String] = []
 	var input := str(preferences.get("input_device", "Default"))
 	var output := str(preferences.get("output_device", "Default"))
@@ -126,4 +127,7 @@ static func apply_local(preferences: Dictionary, viewport: Viewport, voice: Node
 	viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR if upscale == "fsr1" else Viewport.SCALING_3D_MODE_BILINEAR
 	viewport.scaling_3d_scale = scale
 	viewport.texture_mipmap_bias = clampf(float(preferences.get("texture_lod_bias", 0)), 0, 3)
+	if camera:
+		var distance := float(preferences.get("draw_distance",250))
+		camera.far = clampf(distance,10,2000) if is_finite(distance) else 250.0
 	return notices

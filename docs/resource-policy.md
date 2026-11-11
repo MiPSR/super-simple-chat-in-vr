@@ -23,6 +23,9 @@ Each surface is charged three passes (base, optional outline, optional matcap)
 regardless of the current material tier. Geometry elements are the greater of
 vertex/index counts per ArrayMesh surface, or generated primitive vertices.
 Textures are deduplicated within an import and charged at `width*height*16/3`.
+Both active materials and retained normalized source materials are counted:
+disabled emission/normal textures cannot escape admission merely because Godot
+omits unused unlit properties when duplicating a material.
 Shared textures are not charged again for prefab instances; those instances keep
 the source PackedScene alive so its asset/texture reservation cannot disappear
 early. Instance geometry/pass/node work is still charged. Costs are conservative
@@ -108,7 +111,9 @@ and no-op controls do not increment the authoritative revision.
 
 Video retains its four
 decoder ceiling, fixed output dimensions, finite demux/PCM buffers and bounded
-worker threads, but has no general decoder/resolver process memory sandbox.
+worker threads. Production decoding now uses separate Landlock-confined helper
+processes with a 2-GiB per-process address-space ceiling and bounded IPC deadlines.
+This is not an aggregate resolver-descendant cgroup memory/CPU/process budget.
 See [media-security.md](media-security.md), [asset-storage.md](asset-storage.md)
 and [asset-cache.md](asset-cache.md) for their distinct boundaries.
 
@@ -116,15 +121,58 @@ Optional acoustic obstruction retains at most 512 weak source records and makes
 at most four ray queries per physics tick, with a 200-ms per-source minimum
 interval. Listener-zone noise uses one lazy 100-ms generator, bounded to 4,800
 stereo frames produced per render frame. Noise and bus effects respect the
-administrator's effect ceiling. New lifecycle/ray fixtures are unexecuted.
+administrator's effect ceiling. Lifecycle/ray fixtures pass headlessly; audible
+acceptance still requires hardware.
 
-### Outstanding transport queue boundary
+### Outgoing transport ownership
 
-Incoming ENet packet/assembly quotas and authenticated input pacing do **not**
-bound outgoing reliable storage. The pinned rusty_enet public API exposes traffic
-totals, not retained outgoing queue bytes or acknowledgement retirement. A traffic
-token bucket or application-level acknowledgement would not by itself prove a
-hard queue bound against a peer that selectively acknowledges ENet traffic.
-Explicit retained-byte admission in the transport, with deterministic slow-peer
-disconnect/cleanup coverage, remains required. Do not treat this audit as an
-implemented outgoing queue limit.
+Server outgoing packet buffers now hold RAII reservations through rusty_enet's
+public `Box<T: AsRef<[u8]>>` packet-data ownership API. The reservation retires
+only when ENet releases its last packet reference (acknowledgement, discard,
+disconnect or host teardown), not on an application acknowledgement or a traffic
+counter reset. Each peer has a 4-MiB ceiling and the process a 64-MiB ceiling.
+Charges include buffer allocation capacity plus conservative per-packet and
+MTU-dependent fragment-command overhead; these are admission estimates, not a
+complete allocator/RSS accounting guarantee.
+
+Authenticated administrator health exposes `realtime_output.reserved_bytes`,
+`peer_limit_bytes` and `process_limit_bytes`. Reserved bytes are a live atomic
+sample of packet-owned charges, not wire throughput or total ENet memory.
+
+Reliable admission/send failure disconnects the slow peer and marks membership
+for cleanup on the next authoritative tick. Unreliable admission failure drops
+that sample. Non-control channels use `AlwaysUnreliable` so a large pose/voice
+packet cannot silently become reliable while fragmenting. Unit packet-clone and
+real unacknowledged ENet queue teardown regressions are included; verification
+results are recorded separately in status documentation. Incoming ENet control
+bookkeeping and client-side Godot transport allocation remain distinct boundaries.
+
+### Import concurrency
+
+OFD cache pins conservatively survive duplicated or fork-inherited descriptors.
+`CLOEXEC` releases inherited copies at exec, not at fork; eviction can therefore
+briefly report busy after the originating reader closes. It skips such entries
+until a later bounded pass rather than deleting a potentially live package.
+
+Completion/failure callbacks cannot start a replacement import until the old
+import's cache pin and FIFO slot retire. Replacement requests are queued during
+completion dispatch, and failed-cache removal uses the completed path rather
+than mutable next-load state. This prevents reentrant listeners from releasing
+the new import's slot or deleting the new package.
+
+World and avatar package loaders now share one FIFO GLTF import/construction
+slot per Godot process. Waiting loaders retain their completed-ZIP pins, do not
+start decoder threads, and release their queue entry and pin when cancelled or
+destroyed. The slot spans parsing, prefab/main scene construction and synchronous
+load listeners; cancelled running imports retire before the next begins. Weak
+ownership prevents a deleted loader from wedging the queue. This avoids multiplying
+peak allocations across simultaneous avatar/world imports, but does **not** impose
+a per-import allocator/RSS ceiling or isolate a Godot importer crash. Those remain
+separate release limitations. FIFO/dead-owner/cancellation fixtures are included.
+
+Leaving an instance now retires an active avatar loader asynchronously: it cancels
+publication immediately, retains its thread/cache ownership until work finishes,
+then frees the loader. It no longer destroys that loader (and joins an active
+importer) on an ordinary world-leave frame. Final application/tree shutdown still
+joins remaining threads before unloading engine/native code. A semaphore-blocked
+fixture checks that retirement returns before a worker is permitted to finish.

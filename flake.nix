@@ -23,6 +23,7 @@
       buildInputs = [ pkgs.sqlite pkgs.libopus pkgs.opusfile ];
       nativeCheckInputs = [ pkgs.godot_4 pkgs.ffmpeg pkgs.nodejs ];
       SSC_TEST_CLIENT = clientSource;
+      SSC_MEDIA_WORKER = "${native}/bin/ssc-media-worker";
       doCheck = true;
       preCheck = ''
         export HOME="$(mktemp -d)"
@@ -47,14 +48,15 @@
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped ];
       installPhase = ''
         runHook preInstall
-        mkdir -p "$out/lib"
+        mkdir -p "$out/lib" "$out/bin"
         cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/libsuper_simple_chat_native.so "$out/lib/"
+        cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/ssc-media-worker "$out/bin/"
         runHook postInstall
       '';
     };
     ytResolver = pkgs.writeShellScript "ssc-yt-dlp" ''
       unset no_proxy NO_PROXY
-      exec ${pkgs.coreutils}/bin/timeout --kill-after=5s 30s ${pkgs.yt-dlp}/bin/yt-dlp "$@"
+      exec ${pkgs.coreutils}/bin/timeout --foreground --kill-after=5s 30s ${pkgs.yt-dlp}/bin/yt-dlp "$@"
     '';
     clientSource = pkgs.runCommand "super-simple-chat-client-project" {} ''
       mkdir -p "$out/addons"
@@ -69,12 +71,13 @@
       runtimeInputs = [ pkgs.godot_4 ];
       text = ''
         export SSC_YTDLP=${ytResolver}
+        export SSC_MEDIA_WORKER=${native}/bin/ssc-media-worker
         unset no_proxy NO_PROXY SSC_TEST_MEDIA_ORIGIN
         # Import data belongs in a writable cache, never in the Nix store.
         cache="''${XDG_CACHE_HOME:-$HOME/.cache}/super-simple-chat/${builtins.substring 0 16 (builtins.hashString "sha256" (toString clientSource))}"
         mkdir -p "$cache"
         cp -ru --no-preserve=mode ${clientSource}/. "$cache/"
-        if [ ! -d "$cache/.godot" ]; then
+        if [ ! -f "$cache/.godot/global_script_class_cache.cfg" ]; then
           godot4 --headless --path "$cache" --editor --import --xr-mode off >/dev/null 2>&1
         fi
         exec godot4 --path "$cache" "$@"
@@ -90,6 +93,7 @@
     default = pkgs.mkShell {
       SSC_TEST_CLIENT = clientSource;
       SSC_YTDLP = "${ytResolver}";
+      SSC_MEDIA_WORKER = "${native}/bin/ssc-media-worker";
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
       packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config sqlite godot_4 ffmpeg nixfmt nodejs ];
       shellHook = ''
@@ -103,7 +107,10 @@
       SSC_YTDLP = "${ytResolver}";
       packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config godot_4 ffmpeg nodejs ];
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
-      shellHook = ''export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0'';
+      shellHook = ''
+        export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+        export SSC_MEDIA_WORKER="$PWD/target/debug/ssc-media-worker"
+      '';
     };
     };
     checks.${system} = {

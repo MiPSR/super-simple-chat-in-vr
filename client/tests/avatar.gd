@@ -3,6 +3,7 @@ const Runtime = preload("res://scripts/vrm_runtime.gd")
 const Loader = preload("res://scripts/package_loader.gd")
 const Avatar = preload("res://scripts/avatar.gd")
 const BodyTracking = preload("res://scripts/body_tracking.gd")
+const Cache = preload("res://scripts/asset_cache.gd")
 var runtime: RefCounted
 var avatar: Node3D
 var loader: Node
@@ -28,8 +29,11 @@ func _initialize() -> void:
 	assert(tracking.size() == 1, "Unconfigured synthetic joints appeared valid: " + str(tracking))
 	var config: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(OS.get_environment("SSC_TEST_CONFIG")))
 	loader = Loader.new()
+	loader.cache_directory = "user://avatar-import-%s-%s" % [OS.get_process_id(),Time.get_ticks_usec()]
+	assert(DirAccess.make_dir_recursive_absolute(loader.cache_directory) == OK)
 	root.add_child.call_deferred(loader)
-	loader.staging = str(config.package)
+	loader.staging = loader.cache_directory.path_join(str(config.hash) + ".zip")
+	assert(DirAccess.copy_absolute(str(config.package),loader.staging) == OK)
 	loader.expected = str(config.hash)
 	loader.manifest = config.manifest
 	loader.failed.connect(func(message: String): push_error(message); quit(1))
@@ -97,6 +101,9 @@ func _process(delta: float) -> bool:
 		if Time.get_ticks_msec() - started > 300:
 			assert(bone_checks > 0, "Imported skeleton modifiers never processed")
 			print("PASS VRM expressions/springs, creator bones after springs, native IK, tracker fallback and sleeping poses")
+			assert(Cache.remove_completed(loader.staging) == 0)
+			assert(DirAccess.remove_absolute(loader.cache_directory.path_join(".ssc-cache.lock")) == OK)
+			assert(DirAccess.remove_absolute(loader.cache_directory) == OK)
 			runtime.close()
 			quit()
 	elif Time.get_ticks_msec() - started > 5000:

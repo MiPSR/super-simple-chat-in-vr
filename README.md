@@ -84,6 +84,14 @@ and the in-progress libmpv bridge. Ordinary gameplay remains GDScript. The
 `nix develop .#native` shell permits editing/checking that extension without
 rebuilding its release package just to enter the shell.
 
+Production video decoding runs in a separate `ssc-media-worker`, built alongside
+the extension and selected automatically by the packaged launcher. Its filesystem
+and signal sandbox requires Linux 6.12+ with Landlock enabled; media fails closed
+if that boundary is unavailable. See [media isolation](docs/media-security.md)
+for resource limits and remaining security boundaries. In the lightweight edit
+shell, build both artifacts with `cargo build -p super-simple-chat-native` before
+testing video.
+
 ## NixOS integration
 
 Import `inputs.super-simple-chat.nixosModules.server` and configure:

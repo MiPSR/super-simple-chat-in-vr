@@ -97,7 +97,7 @@ action("admin-login", async () => { adminSecret = $("admin-secret").value; $("ad
 action("search", refresh);
 action("preferences", async () => {
   const p = { ...me.preferences };
-  for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "texture_lod_bias", "texture_reduction", "radial_hold_seconds"].includes(key) ? Number(el.value) : el.value; }
+  for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "draw_distance", "texture_lod_bias", "texture_reduction", "radial_hold_seconds"].includes(key) ? Number(el.value) : el.value; }
   p.radial_actions = Array.from({length:8}, (_, index) => $("preferences").elements.namedItem(`radial_action_${index}`).value);
   await api("/preferences", {method:"PUT",body:p}); me.preferences = p; status("Preferences saved.");
 });

@@ -16,7 +16,7 @@ static func run() -> void:
 	assert(material.rim_enabled and is_equal_approx(material.rim,0.4))
 	assert(is_equal_approx(material.metallic_specular,0.6))
 	var outline := material.next_pass as StandardMaterial3D
-	assert(outline != null and outline.grow_enabled and is_equal_approx(outline.grow_amount,0.005))
+	assert(outline != null and outline.grow and is_equal_approx(outline.grow_amount,0.005))
 	var matcap := outline.next_pass as ShaderMaterial
 	assert(matcap != null and matcap.shader == Advanced.MatcapShader)
 	assert(matcap.get_shader_parameter("matcap_texture") == Advanced.matcap("pearl"))

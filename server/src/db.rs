@@ -41,6 +41,7 @@ pub struct Preferences {
     pub voice_volume: f32,
     pub microphone_gain: f32,
     pub resolution_scale: f32,
+    pub draw_distance: f32,
     pub antialiasing: String,
     pub upscaler: String,
     pub texture_lod_bias: f32,
@@ -66,6 +67,7 @@ impl Default for Preferences {
             voice_volume: 1.0,
             microphone_gain: 1.0,
             resolution_scale: 1.0,
+            draw_distance: 250.0,
             antialiasing: "msaa_2x".into(),
             upscaler: "bilinear".into(),
             texture_lod_bias: 0.0,
@@ -106,6 +108,8 @@ impl Preferences {
             && (0.0..=2.0).contains(&self.microphone_gain)
             && self.resolution_scale.is_finite()
             && (0.5..=1.5).contains(&self.resolution_scale)
+            && self.draw_distance.is_finite()
+            && (10.0..=2000.0).contains(&self.draw_distance)
             && matches!(
                 self.antialiasing.as_str(),
                 "off" | "msaa_2x" | "msaa_4x" | "msaa_8x"
@@ -163,12 +167,15 @@ mod tests {
         assert!(old.valid() && old.can_touch_me && old.quality == 2);
         assert_eq!(old.input_device, "Default");
         assert_eq!(old.texture_reduction, 0);
+        assert_eq!(old.draw_distance, 250.0);
         assert_eq!(old.radial_actions.len(), 8);
         assert_eq!(old.radial_hold_seconds, 0.45);
         let defaults = serde_json::to_value(Preferences::default()).unwrap();
         for (key, value) in [
             ("resolution_scale", json!(0.49)),
             ("resolution_scale", json!(1.51)),
+            ("draw_distance", json!(9.9)),
+            ("draw_distance", json!(2000.1)),
             ("voice_volume", json!(1.1)),
             ("microphone_gain", json!(-1)),
             ("texture_lod_bias", json!(4)),

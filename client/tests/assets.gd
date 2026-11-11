@@ -40,9 +40,13 @@ func _initialize() -> void:
 
 func _process(_delta: float) -> bool:
 	if received and Time.get_ticks_msec() - started > 300:
+		received = false # An assertion failure must not flood stderr every frame.
 		assert(not Cache.active.has(loader.staging))
 		assert(not Cache.trim(loader.cache_directory, 0, 0).over_budget)
 		assert(not FileAccess.file_exists(loader.staging))
+		# This uniquely owned fixture directory has no remaining pins/readers.
+		# Production cache cleanup deliberately retains the coordination inode.
+		assert(DirAccess.remove_absolute(loader.cache_directory.path_join(".ssc-cache.lock")) == OK)
 		assert(DirAccess.remove_absolute(loader.cache_directory) == OK)
 		assert(entity.position.distance_to(Vector3(0,1,0)) < 0.001, "Entity extrapolated beyond the last known sample")
 		print("PASS world GLB, packaged prefab meshes, pinned VRM importer, and hold-last-sample presentation")
