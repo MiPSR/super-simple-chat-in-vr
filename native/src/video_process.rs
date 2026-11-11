@@ -9,6 +9,42 @@ use std::{
 };
 
 struct ChildGuard(Child);
+extern "C" fn terminate_worker_group(_: libc::c_int) {
+    // Async-signal-safe, including after Landlock installation. The worker must
+    // be its private group's leader before this handler is installed.
+    unsafe {
+        libc::kill(0, libc::SIGKILL);
+        libc::_exit(128 + libc::SIGTERM);
+    }
+}
+
+fn worker_parent_guard(parent: libc::pid_t) -> io::Result<()> {
+    unsafe {
+        if libc::getpgrp() != libc::getpid() {
+            return Err(io::Error::other(
+                "Media worker requires a private process group",
+            ));
+        }
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = terminate_worker_group as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGTERM);
+        if libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) != 0
+            || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getppid() != parent {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
+    }
+    Ok(())
+}
 fn parent_death_guard(parent: libc::pid_t) -> io::Result<()> {
     // Only async-signal-safe syscalls and raw OS errors: used after fork.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
@@ -85,9 +121,32 @@ pub(super) fn run(
     let (mut socket, child_socket) = UnixStream::pair()?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     socket.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let mut process = std::process::Command::new(executable);
+    let parent = std::process::id() as libc::pid_t;
+    let mut process = if let Some(scope) = std::env::var_os("SSC_MEDIA_SCOPE") {
+        let mut command = std::process::Command::new(scope);
+        command
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--property=MemoryMax=1073741824",
+                "--property=MemorySwapMax=0",
+                "--property=TasksMax=128",
+                "--property=CPUQuota=200%",
+                "--property=OOMPolicy=kill",
+                "--",
+            ])
+            .arg(executable);
+        command
+    } else {
+        // Direct helpers are used by offline package fixtures without a user
+        // service manager. Packaged clients and development shells set the
+        // immutable scope runner; failure never falls back to an unscoped run.
+        std::process::Command::new(executable)
+    };
     process
-        .args([width.to_string(), height.to_string()])
+        .args([width.to_string(), height.to_string(), parent.to_string()])
         .env_clear()
         .env("HOME", "/nonexistent")
         .env("PATH", "")
@@ -100,12 +159,13 @@ pub(super) fn run(
         "SSL_CERT_FILE",
         "NIX_SSL_CERT_FILE",
         "SSC_TEST_MEDIA_ORIGIN",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
     ] {
         if let Some(value) = std::env::var_os(name) {
             process.env(name, value);
         }
     }
-    let parent = std::process::id() as libc::pid_t;
     unsafe {
         process.pre_exec(move || {
             // Keep only mapped standard descriptors across exec, including any
@@ -159,6 +219,12 @@ pub(super) fn entry() -> io::Result<()> {
     let (width, height) = dimensions()
         .filter(|(width, height)| (64..=1280).contains(width) && (64..=720).contains(height))
         .ok_or_else(|| io::Error::other("Invalid decoder dimensions"))?;
+    let parent = args
+        .get(2)
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+        .filter(|parent| *parent > 0)
+        .ok_or_else(|| io::Error::other("Missing decoder parent identity"))?;
+    worker_parent_guard(parent)?;
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut player = match crate::process_sandbox::install()
@@ -267,6 +333,49 @@ fn read_output(input: &mut impl Read, width: i32, height: i32) -> io::Result<Out
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_death_terminates_worker_and_resolver_group() {
+        use std::io::{BufRead, BufReader};
+        let (socket, child_socket) = UnixStream::pair().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "video::isolated::tests::client_parent_probe", "--ignored", "--nocapture"])
+            .stdout(Stdio::from(OwnedFd::from(child_socket)))
+            .process_group(0)
+            .spawn().unwrap();
+        let mut guard = ChildGuard(child);
+        let mut output = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            assert!(output.read_line(&mut line).unwrap() > 0, "Worker did not report readiness");
+            if line.trim() == "GUARDED" { break; }
+        }
+        guard.0.kill().unwrap();
+        drop(guard);
+        // Both the worker and its resolver inherit stdout. EOF proves neither
+        // retains the descriptor after abrupt client death.
+        let mut remainder = String::new();
+        output.read_to_string(&mut remainder).unwrap();
+    }
+    #[test]
+    #[ignore = "isolated parent of the parent-death worker fixture"]
+    fn client_parent_probe() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "video::isolated::tests::guarded_group_probe", "--ignored", "--nocapture"])
+            .process_group(0)
+            .spawn().unwrap();
+        let _ = child.wait();
+    }
+    #[test]
+    #[ignore = "isolated worker: installs terminal parent-death and sandbox policies"]
+    fn guarded_group_probe() {
+        worker_parent_guard(unsafe { libc::getppid() }).unwrap();
+        crate::process_sandbox::install().unwrap();
+        let _resolver = std::process::Command::new("sleep").arg("20").spawn().unwrap();
+        println!("GUARDED");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_secs(20));
+    }
     #[test]
     fn parent_guard_fails_before_exec_if_expected_client_has_disappeared() {
         let mut child = std::process::Command::new("true");

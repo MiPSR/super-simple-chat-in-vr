@@ -72,6 +72,7 @@
       text = ''
         export SSC_YTDLP=${ytResolver}
         export SSC_MEDIA_WORKER=${native}/bin/ssc-media-worker
+        export SSC_MEDIA_SCOPE=${pkgs.systemd}/bin/systemd-run
         unset no_proxy NO_PROXY SSC_TEST_MEDIA_ORIGIN
         # Import data belongs in a writable cache, never in the Nix store.
         cache="''${XDG_CACHE_HOME:-$HOME/.cache}/super-simple-chat/${builtins.substring 0 16 (builtins.hashString "sha256" (toString clientSource))}"
@@ -94,6 +95,7 @@
       SSC_TEST_CLIENT = clientSource;
       SSC_YTDLP = "${ytResolver}";
       SSC_MEDIA_WORKER = "${native}/bin/ssc-media-worker";
+      SSC_MEDIA_SCOPE = "${pkgs.systemd}/bin/systemd-run";
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
       packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config sqlite godot_4 ffmpeg nixfmt nodejs ];
       shellHook = ''
@@ -105,6 +107,7 @@
     native = pkgs.mkShell {
       SSC_VRM_SOURCE = vrm;
       SSC_YTDLP = "${ytResolver}";
+      SSC_MEDIA_SCOPE = "${pkgs.systemd}/bin/systemd-run";
       packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config godot_4 ffmpeg nodejs ];
       buildInputs = [ pkgs.libopus pkgs.opusfile pkgs.mpv-unwrapped pkgs.sqlite ];
       shellHook = ''

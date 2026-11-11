@@ -37,7 +37,11 @@ impl Helper {
             .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_ssc-media-worker"));
         command
-            .args(["64", "64"])
+            .args([
+                "64".to_string(),
+                "64".to_string(),
+                std::process::id().to_string(),
+            ])
             .env_clear()
             .env("HOME", "/nonexistent")
             .env("PATH", "")
