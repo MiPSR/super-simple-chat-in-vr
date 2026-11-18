@@ -12,6 +12,7 @@ pub struct Spawn {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
     pub owner: Option<String>,
+    pub tags: Option<Vec<String>>,
 }
 impl Default for Spawn {
     fn default() -> Self {
@@ -19,6 +20,7 @@ impl Default for Spawn {
             position: [0.0; 3],
             velocity: [0.0; 3],
             owner: None,
+            tags: None,
         }
     }
 }
@@ -33,6 +35,7 @@ pub enum Command {
     Active(String, bool),
     Move(String, [f32; 3]),
     Rotate(String, [f32; 4]),
+    Visual(String, super::Visual),
     Attach(String, String, [f32; 3]),
     Detach(String),
     Velocity(String, [f32; 3]),
@@ -74,8 +77,33 @@ impl Command {
                 )
             }
             Self::Spawn(id, prefab, options) => (
-                valid(id) && valid(prefab) && optional(&options.owner),
-                id.len() + prefab.len() + options.owner.as_ref().map_or(0, String::len),
+                valid(id)
+                    && valid(prefab)
+                    && optional(&options.owner)
+                    && options
+                        .tags
+                        .as_deref()
+                        .is_none_or(|tags| {
+                            tags.len() <= 8
+                                && tags
+                                    .iter()
+                                    .all(|tag| !tag.is_empty() && tag.len() <= 32)
+                        }),
+                id.len()
+                    + prefab.len()
+                    + options.owner.as_ref().map_or(0, String::len)
+                    + options
+                        .tags
+                        .as_deref()
+                        .map_or(0, |tags| tags.iter().map(String::len).sum::<usize>()),
+            ),
+            Self::Visual(id, visual) => (
+                valid(id) && visual.valid(),
+                id.len()
+                    + visual
+                        .animation
+                        .as_deref()
+                        .map_or(0, str::len),
             ),
             Self::Damage(id, _, actor) => (
                 valid(id) && optional(actor),
@@ -99,6 +127,7 @@ impl Command {
 pub struct Context {
     pub interaction_actor: Option<String>,
     pub objects: BTreeMap<String, Value>,
+    pub visual: BTreeMap<String, Value>,
     pub commands: Vec<Command>,
     pub next_entity: u64,
     pub state_dirty: bool,
@@ -398,6 +427,28 @@ pub fn install(
     )?;
     let scene = context.clone();
     world.set(
+        "set_visual",
+        lua.create_function(move |lua, (id, value): (String, mlua::Value)| {
+            let visual: super::Visual = lua.from_value(value)?;
+            enqueue(&scene, Command::Visual(id, visual))
+        })?,
+    )?;
+    let scene = context.clone();
+    world.set(
+        "get_visual",
+        lua.create_function(move |lua, id: String| {
+            let visual = scene
+                .lock()
+                .unwrap()
+                .visual
+                .get(&id)
+                .cloned()
+                .unwrap_or(Value::Null);
+            lua.to_value(&visual)
+        })?,
+    )?;
+    let scene = context.clone();
+    world.set(
         "move",
         lua.create_function(move |lua, (id, value): (String, mlua::Value)| {
             enqueue(&scene, Command::Move(id, vector(lua, value)?))
@@ -476,5 +527,102 @@ mod tests {
                 .sum::<usize>()
                 <= 65536
         );
+    }
+    #[test]
+    fn visual_and_spawn_customization_commands_are_bounded() {
+        let context: Shared = Default::default();
+        assert!(enqueue(
+            &context,
+            Command::Visual("x".repeat(65), crate::world::Visual::default())
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Visual(
+                "lamp".into(),
+                crate::world::Visual {
+                    tint: Some([3.0, 0.0, 0.0]),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Visual(
+                "lamp".into(),
+                crate::world::Visual {
+                    light: Some([0.5, 0.5, 0.5, 500.0]),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Visual(
+                "lamp".into(),
+                crate::world::Visual {
+                    animation: Some("x".repeat(65)),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Visual(
+                "lamp".into(),
+                crate::world::Visual {
+                    tint: Some([1.0, 1.0, 1.0]),
+                    animation_playing: Some(false),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_ok());
+        assert!(enqueue(
+            &context,
+            Command::Visual("lamp".into(), crate::world::Visual::default())
+        )
+        .is_ok());
+        assert_eq!(context.lock().unwrap().commands.len(), 2);
+        // Spawn customization: at most eight declared-length tags.
+        assert!(enqueue(
+            &context,
+            Command::Spawn(
+                "id".into(),
+                "prefab".into(),
+                Spawn {
+                    tags: Some((0..9).map(|_| "x".into()).collect()),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Spawn(
+                "id".into(),
+                "prefab".into(),
+                Spawn {
+                    tags: Some(vec!["x".repeat(33)]),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_err());
+        assert!(enqueue(
+            &context,
+            Command::Spawn(
+                "id".into(),
+                "prefab".into(),
+                Spawn {
+                    tags: Some(vec!["crate".into()]),
+                    ..Default::default()
+                }
+            )
+        )
+        .is_ok());
     }
 }

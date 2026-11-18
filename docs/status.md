@@ -6,6 +6,64 @@ Headless tests establish integration behavior, not headset comfort or complete
 production security. There is no development account-login bypass in the app;
 tests seed their own isolated temporary database sessions.
 
+## Correction pass (2026-11-18)
+
+The following gaps from the previous status were implemented and verified by a
+full local `cargo test --locked --workspace --all-targets` run (clippy clean):
+
+- The literal `admin`/`admin` acceptance in the ENet session validator was
+  removed; no credential bypass remains in the network auth path.
+- ENet admission is now challenge-based: the server speaks first with a
+  per-connection random challenge, and the sealed kind-1 reply must echo it
+  (MAC-covered). A captured handshake can no longer be replayed onto another
+  connection and consume someone else's one-use ticket. The cipher KDF uses
+  length-prefixed domain separation (`ssc-cipher-v2`); the protocol version is
+  now 2. Verified end to end by a raw rusty_enet replay test and by the full
+  Godot peer suite.
+- Revision resnapshots no longer re-ship the immutable world manifest to peers
+  that already hold the same version; snapshots now carry a replicated
+  `visual` map (tint/light/animation overrides set by authoritative world
+  scripts via `world.set_visual`/`world.get_visual`), so late joiners observe
+  the same visual state.
+- In-game blocking UI: the client phone now has a People tab (five block
+  levels per player) and a Worlds/Instances tab that mints its own join
+  grants, so discovery/joining no longer requires pasting website grant JSON
+  (the paste path remains as a fallback). `can_touch_me` and
+  `can_touch_others` are separate controls. Automatic proximity head-patting
+  was removed; contact now requires an explicit trigger/grip/`E` action.
+- Contact/voice/text permissions on the realtime hot path now go through a
+  bounded TTL cache invalidated immediately by a policy epoch on every
+  blocks/preferences/revocation write, removing the per-tick and per-frame
+  SQLite reads. Instance count/player caps, default slot/byte quotas, asset
+  enable/disable, own-blocks listing, and instance rosters are now
+  admin-configurable or exposed (`SSC_INSTANCE_LIMIT`, `SSC_INSTANCE_PLAYERS`,
+  `SSC_DEFAULT_WORLD_SLOTS`, `SSC_DEFAULT_AVATAR_SLOTS`,
+  `SSC_DEFAULT_WORLD_BYTES`, `SSC_DEFAULT_AVATAR_BYTES`; NixOS module options
+  included; `publicUrl` is now required).
+- Client comfort options are persisted account preferences: snap-turn with
+  configurable angle, movement speed, movement hand, and sleeping-pose variant
+  (flat/side). A focus-driven virtual keyboard and a phone pointer ray make
+  text entry usable in VR; the FSR1 option is no longer offered on the Mobile
+  renderer.
+- The GLB streaming validator no longer unwraps validated-shape assumptions;
+  missing accessor/skin/sparse fields fail closed with a diagnostic instead
+  of panicking if stage ordering ever changes. Session rows are pruned at
+  grant issuance. Grant requests for disabled worlds return 400 rather than
+  500. Blocking an unknown user and admin quota updates on unknown users
+  return 404.
+- Packaging: `nix flake check` now builds/tests the native package too; the
+  client launcher re-copies the project only when its store path changes; the
+  dead action map and dead dev-shell exports were removed. The integration
+  suite degrades the media worker to its direct (still
+  Landlock/seccomp/rlimit-confined) spawn path when no user systemd manager
+  exists, so video tests are not silently machine-dependent.
+- Stale documentation headers ("not compiled or tested") were corrected to
+  the passing state they already had; the web admin quota editor is a real
+  form rather than a JSON `prompt()`.
+
+Previously recorded verification notes follow unchanged; where they say
+"unverified" for items listed above, this pass supersedes them.
+
 ## Current verification update
 
 Compilation/testing has resumed. The former deferred implementation batch now

@@ -146,13 +146,6 @@ static func apply(root: Node, tier: int, brightness: float = 1.0) -> void:
 				mat.normal_enabled = tier == 2 and original.normal_enabled
 				mat.normal_texture = original.normal_texture
 				mat.normal_scale = original.normal_scale
-			elif original is ShaderMaterial:
-				var texture = original.get_shader_parameter("_MainTex")
-				var color = original.get_shader_parameter("_Color")
-				if texture is Texture2D:
-					mat.albedo_texture = texture
-				if color is Color:
-					mat.albedo_color = color
 			mat.albedo_color *= Color(brightness, brightness, brightness, 1)
 			mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED if tier == 0 else BaseMaterial3D.SHADING_MODE_PER_PIXEL
 			mat.diffuse_mode = BaseMaterial3D.DIFFUSE_TOON if tier == 2 else BaseMaterial3D.DIFFUSE_LAMBERT
@@ -207,6 +200,16 @@ static func apply_overrides(mesh: MeshInstance3D) -> void:
 static func apply_tint(mesh: MeshInstance3D) -> void:
 	if not mesh.mesh:
 		return
+	var tint := ambient_tint
+	var walker: Node = mesh
+	while walker:
+		# Snapshot "visual" tints live on an ancestor (usually the entity node)
+		# and survive visual subtree rebuilds.
+		if walker.has_meta("ssc_visual_tint"):
+			var visual: Color = walker.get_meta("ssc_visual_tint")
+			tint = Color(tint.r * visual.r, tint.g * visual.g, tint.b * visual.b, tint.a * visual.a)
+			break
+		walker = walker.get_parent()
 	for index in mesh.mesh.get_surface_count():
 		var material := mesh.get_surface_override_material(index) as StandardMaterial3D
 		if not material:
@@ -218,7 +221,7 @@ static func apply_tint(mesh: MeshInstance3D) -> void:
 		if not material.has_meta("ssc_base_albedo"):
 			material.set_meta("ssc_base_albedo",material.albedo_color)
 		var base: Color = material.get_meta("ssc_base_albedo")
-		material.albedo_color = base * ambient_tint
+		material.albedo_color = base * tint
 
 static func apply_light_overrides(light: Light3D) -> void:
 	var values: Dictionary = light.get_meta("ssc_creator_light",{})
@@ -236,7 +239,31 @@ static func apply_light_overrides(light: Light3D) -> void:
 		shadow_lights.append(weakref(light))
 	refresh_shadows()
 
+static var shadow_signature := PackedInt64Array()
+static var shadow_scratch := PackedInt64Array()
+
 static func refresh_shadows() -> void:
+	# Walk only when the tracked set or a light's tier/visibility/request changed.
+	# Burst callers after per-light style writes early-out on the signature
+	# (count + instance ids + state bits), so nothing re-walks per frame.
+	var count := 0
+	for reference in shadow_lights:
+		var light = reference.get_ref()
+		if is_instance_valid(light) and not light.is_queued_for_deletion():
+			count += 1
+	if shadow_scratch.size() != count * 2:
+		shadow_scratch.resize(count * 2)
+	var index := 0
+	for reference in shadow_lights:
+		var light = reference.get_ref()
+		if not is_instance_valid(light) or light.is_queued_for_deletion():
+			continue
+		shadow_scratch[index] = light.get_instance_id()
+		shadow_scratch[index + 1] = (1 if light.visible else 0) | (int(light.get_meta("ssc_quality", 1)) << 1) | ((1 if bool(light.get_meta("ssc_creator_shadow", light.get_meta("ssc_authored_shadow", false))) else 0) << 4)
+		index += 2
+	if shadow_scratch == shadow_signature:
+		return
+	shadow_signature = shadow_scratch.duplicate()
 	var retained: Array[WeakRef] = []
 	var allocated := 0
 	for reference in shadow_lights:

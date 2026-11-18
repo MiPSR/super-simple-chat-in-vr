@@ -706,10 +706,19 @@ async fn encrypted_godot_enet() -> Result<()> {
         .await
     });
     // Don't block the async executor that serves the test's media source.
+    // Headless test machines may have no user systemd manager; the packaged
+    // launcher always sets the scope runner, but the worker's own
+    // Landlock/seccomp/rlimit confinement does not depend on it.
+    let scoped_media = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
     let video_project = project.clone();
     let video_url = media_url.clone();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["25", "godot4"])
             .args(["--headless", "--xr-mode", "off", "--path"])
             .arg(video_project)
@@ -717,8 +726,11 @@ async fn encrypted_godot_enet() -> Result<()> {
             .env("SSC_TEST_VIDEO", &video_url)
             .env("SSC_TEST_MEDIA_ORIGIN", &video_url)
             .env_remove("no_proxy")
-            .env_remove("NO_PROXY")
-            .output()
+            .env_remove("NO_PROXY");
+        if !scoped_media {
+            command.env_remove("SSC_MEDIA_SCOPE");
+        }
+        command.output()
     })
     .await??;
     ensure!(
@@ -732,7 +744,8 @@ async fn encrypted_godot_enet() -> Result<()> {
     println!("{}", String::from_utf8_lossy(&output.stdout));
     let video_project = project.clone();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .args(["50", "godot4", "--headless", "--xr-mode", "off", "--path"])
             .arg(video_project)
             .args(["--script", "res://tests/video_failures.gd"])
@@ -748,8 +761,11 @@ async fn encrypted_godot_enet() -> Result<()> {
             .env("SSC_TEST_VIDEO", &media_url)
             .env("SSC_TEST_MEDIA_ORIGIN", &media_url)
             .env_remove("no_proxy")
-            .env_remove("NO_PROXY")
-            .output()
+            .env_remove("NO_PROXY");
+        if !scoped_media {
+            command.env_remove("SSC_MEDIA_SCOPE");
+        }
+        command.output()
     })
     .await??;
     media_server.abort();
@@ -1577,6 +1593,29 @@ async fn encrypted_godot_enet() -> Result<()> {
             .is_some_and(|m| m.is_empty()),
         "Fresh instance retained a previous media session"
     );
+    // Revision resnapshots omit the immutable manifest for peers that already
+    // hold the same world version; state-only bumps stay cheap on reliable ch0.
+    ensure!(
+        snapshot(&state).get("manifest").is_some(),
+        "Join snapshot lacked the world manifest"
+    );
+    fresh.command(json!({"action":"command","kind":7,"data":{"sleeping":true}}))?;
+    let bump = fresh
+        .wait(|e| {
+            e["kind"].as_f64() == Some(2.0)
+                && e["data"].get("user").is_none()
+                && e["data"]["snapshot"].is_object()
+        })
+        .await?;
+    ensure!(
+        snapshot(&bump).get("manifest").is_none(),
+        "Revision resnapshot re-shipped the manifest"
+    );
+    ensure!(
+        snapshot(&bump)["visual"].as_object().is_some(),
+        "Snapshot lacked the replicated visual map"
+    );
+    println!("PASS manifest-optional revision resnapshots with replicated visual state");
     let pending_gc_grant = api
         .json(
             "/api/v1/game-grants",
@@ -1690,5 +1729,373 @@ async fn encrypted_godot_enet() -> Result<()> {
     println!(
         "PASS late join, reconnect, empty-instance destruction including media, persistent catalog"
     );
+    Ok(())
+}
+
+/// Minimal mirror of the realtime cipher used only by this test binary to
+/// exercise admission at the raw ENet level. The construction must stay in
+/// lockstep with server/src/realtime/crypto.rs and client/scripts/cipher.gd.
+fn test_key(secret: &[u8], direction: u8, purpose: u8) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update([direction, purpose]);
+    hash.update((secret.len() as u32).to_le_bytes());
+    hash.update(secret);
+    hash.update(b"ssc-cipher-v2");
+    hash.finalize().into()
+}
+fn test_seal(secret: &[u8], channel: u8, direction: u8, kind: u8, payload: &[u8]) -> Vec<u8> {
+    use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use hmac::{Hmac, Mac};
+    let iv = rand::random::<[u8; 16]>();
+    let mut plain = vec![kind];
+    plain.extend_from_slice(payload);
+    let sealed = cbc::Encryptor::<aes::Aes256>::new(
+        &test_key(secret, direction, 0).into(),
+        &iv.into(),
+    )
+    .encrypt_padded_vec_mut::<Pkcs7>(&plain);
+    let mut frame = vec![1u8, channel, direction];
+    frame.extend_from_slice(&1u64.to_le_bytes());
+    frame.extend_from_slice(&iv);
+    frame.extend_from_slice(&sealed);
+    let mut mac = Hmac::<Sha256>::new_from_slice(&test_key(secret, direction, 1)).unwrap();
+    mac.update(&frame);
+    frame.extend_from_slice(&mac.finalize().into_bytes());
+    frame
+}
+fn test_open(secret: &[u8], channel: u8, frame: &[u8]) -> Option<(u8, Vec<u8>)> {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+    use hmac::{Hmac, Mac};
+    if frame.len() < 75 || frame[..3] != [1, channel, 1] {
+        return None;
+    }
+    let body = &frame[..frame.len() - 32];
+    let mut mac = Hmac::<Sha256>::new_from_slice(&test_key(secret, 1, 1)).unwrap();
+    mac.update(body);
+    mac.verify_slice(&frame[frame.len() - 32..]).ok()?;
+    let plain = cbc::Decryptor::<aes::Aes256>::new(
+        &test_key(secret, 1, 0).into(),
+        frame[11..27].into(),
+    )
+    .decrypt_padded_vec_mut::<Pkcs7>(&frame[27..frame.len() - 32])
+    .ok()?;
+    Some((plain[0], plain[1..].to_vec()))
+}
+
+#[tokio::test]
+async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("ssc-wire-")
+        .tempdir_in(std::env::temp_dir())?;
+    let http_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let http_address = http_socket.local_addr()?;
+    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let udp_address = udp_socket.local_addr()?;
+    let api = Api {
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+        base: format!("http://{http_address}"),
+        admin: token(),
+    };
+    drop(http_socket);
+    drop(udp_socket);
+    let _server = Process(
+        Command::new(env!("CARGO_BIN_EXE_super-simple-chat-server"))
+            .env("SSC_ADMIN_TOKEN", &api.admin)
+            .env("SSC_DATA", directory.path())
+            .env("SSC_LISTEN", http_address.to_string())
+            .env("SSC_ENET", udp_address.to_string())
+            .env("SSC_PUBLIC_URL", &api.base)
+            .env("SSC_TPS", "60")
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if api.json("/health", None, &api.admin).await.is_ok() {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "Backend did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let users = ["123456789", "987654321"];
+    let tokens = [token(), token()];
+    for user in users {
+        api.json("/api/v1/admin/users", Some(json!({"id":user})), &api.admin)
+            .await?;
+    }
+    {
+        let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            + 3600;
+        for (user, token) in users.iter().zip(&tokens) {
+            db.execute(
+                "INSERT INTO sessions VALUES(?,?,?)",
+                rusqlite::params![hex::encode(Sha256::digest(token.as_bytes())), user, expires],
+            )?;
+        }
+    }
+    // Block listing, unknown-target rejection, and flag round-trip.
+    ensure!(
+        api.json("/api/v1/blocks", None, &tokens[0]).await?["blocks"]
+            .as_array()
+            .is_some_and(|blocks| blocks.is_empty())
+    );
+    ensure!(
+        api.client
+            .put(format!("{}/api/v1/blocks/000000000", api.base))
+            .bearer_auth(&tokens[0])
+            .json(&json!({"flags":1}))
+            .send()
+            .await?
+            .status()
+            == 404
+    );
+    api.client
+        .put(format!("{}/api/v1/blocks/{}", api.base, users[1]))
+        .bearer_auth(&tokens[0])
+        .json(&json!({"flags":3}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let listed = api.json("/api/v1/blocks", None, &tokens[0]).await?;
+    ensure!(
+        listed["blocks"][0]["voice"] == true
+            && listed["blocks"][0]["text"] == true
+            && listed["blocks"][0]["touch"] == false
+            && listed["blocks"][0]["avatar"] == false
+            && listed["blocks"][0]["complete"] == false
+            && listed["blocks"][0]["target"] == users[1]
+    );
+    api.client
+        .put(format!("{}/api/v1/blocks/{}", api.base, users[1]))
+        .bearer_auth(&tokens[0])
+        .json(&json!({"flags":0}))
+        .send()
+        .await?
+        .error_for_status()?;
+    ensure!(
+        api.json("/api/v1/blocks", None, &tokens[0]).await?["blocks"][0]["flags"] == 0
+    );
+    // Admin quota updates on unknown users fail with 404, not silence.
+    ensure!(
+        api.client
+            .put(format!("{}/api/v1/admin/users/000000000", api.base))
+            .bearer_auth(&api.admin)
+            .json(&json!({"world_slots":1,"avatar_slots":1,"world_bytes":1000,"avatar_bytes":1000}))
+            .send()
+            .await?
+            .status()
+            == 404
+    );
+    // Instance limits and default quotas are visible to the administrator.
+    let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+    ensure!(health["limits"]["instances"] == 64 && health["limits"]["instance_players"] == 64);
+    ensure!(
+        health["defaults"]["world_slots"] == 4
+            && health["defaults"]["avatar_slots"] == 8
+            && health["defaults"]["world_bytes"] == 1_000_000_000u64
+            && health["defaults"]["avatar_bytes"] == 100_000_000u64
+    );
+    // A disabled asset disappears from user catalogs and grants, and can be
+    // re-enabled without losing the immutable version.
+    let mut package = Cursor::new(Vec::new());
+    example_world::write(&mut package)?;
+    let asset = api
+        .upload("world", &package.into_inner(), &tokens[0])
+        .await?;
+    api.json(
+        &format!("/api/v1/admin/assets/{}/enabled", asset["id"].as_str().unwrap()),
+        Some(json!({"enabled":false})),
+        &api.admin,
+    )
+    .await?;
+    ensure!(
+        api.response(
+            &format!("/api/v1/admin/assets/{}/enabled", asset["id"].as_str().unwrap()),
+            Some(json!({"enabled":false})),
+            &api.admin
+        )
+        .await?
+        .status()
+            == 200
+    );
+    ensure!(
+        !api
+            .json("/api/v1/assets?kind=world", None, &tokens[1])
+            .await?
+            .as_array()
+            .is_some_and(|assets| assets.iter().any(|entry| entry["id"] == asset["id"])),
+        "Disabled world stayed visible to a normal user"
+    );
+    ensure!(
+        api.response(
+            "/api/v1/game-grants",
+            Some(json!({"world":asset["id"]})),
+            &tokens[0]
+        )
+        .await?
+        .status()
+            == 400
+    );
+    api.json(
+        &format!("/api/v1/admin/assets/{}/enabled", asset["id"].as_str().unwrap()),
+        Some(json!({"enabled":true})),
+        &api.admin,
+    )
+    .await?;
+    let grant = api
+        .json(
+            "/api/v1/game-grants",
+            Some(json!({"world":asset["id"]})),
+            &tokens[0],
+        )
+        .await?;
+    ensure!(grant["protocol"] == 2, "Grant did not advertise protocol 2");
+    // Raw ENet admission: the server speaks first with a per-connection
+    // challenge; a captured handshake from another connection must fail.
+    let secret = hex::decode(grant["secret"].as_str().unwrap())?;
+    let ticket = grant["ticket"].as_str().unwrap().as_bytes();
+    let drain = |host: &mut rusty_enet::Host<std::net::UdpSocket>| -> Result<Vec<Value>> {
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+                match event {
+                    rusty_enet::Event::Connect { .. } => {
+                        seen.push(json!({"event":"connect"}));
+                    }
+                    rusty_enet::Event::Receive { channel_id, packet, .. } => {
+                        seen.push(json!({"event":"receive","channel":channel_id,
+                            "data":hex::encode(packet.data())}));
+                    }
+                    rusty_enet::Event::Disconnect { .. } => {
+                        seen.push(json!({"event":"disconnect"}));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(seen)
+    };
+    let connect = || -> Result<(rusty_enet::Host<std::net::UdpSocket>, rusty_enet::PeerID)> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut host = rusty_enet::Host::new(
+            socket,
+            rusty_enet::HostSettings {
+                peer_limit: 1,
+                channel_limit: 3,
+                ..Default::default()
+            },
+        )?;
+        let peer_id = {
+            let peer = host.connect(udp_address, 3, 0)?;
+            peer.id()
+        };
+        Ok((host, peer_id))
+    };
+    let challenge_of = |events: &[Value]| -> Option<Vec<u8>> {
+        events
+            .iter()
+            .filter(|e| e["event"] == "receive" && e["channel"] == 0)
+            .find_map(|e| {
+                let data = hex::decode(e["data"].as_str().unwrap()).ok()?;
+                (data.len() == 17 && data[0] == 0).then(|| data[1..].to_vec())
+            })
+    };
+    // First connection: receive a challenge and abandon it.
+    let (mut host, peer) = connect()?;
+    let mut events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while challenge_of(&events).is_none() {
+        events.extend(drain(&mut host)?);
+        ensure!(Instant::now() < deadline, "No challenge greeting arrived");
+    }
+    let _ = peer;
+    drop(host);
+    // Second connection: answer the fresh challenge and get admitted.
+    let (mut host, peer) = connect()?;
+    let mut events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut challenge = Vec::new();
+    while challenge.is_empty() {
+        events.extend(drain(&mut host)?);
+        if let Some(found) = challenge_of(&events) {
+            challenge = found;
+            break;
+        }
+        ensure!(Instant::now() < deadline, "No challenge for the second connection");
+    }
+    let mut reply = ticket.to_vec();
+    reply.extend_from_slice(&challenge);
+    reply.extend_from_slice(&test_seal(&secret, 0, 0, 1, ticket));
+    host.peer_mut(peer)
+        .send(0, &rusty_enet::Packet::new(reply.clone(), rusty_enet::PacketKind::Reliable))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut admitted = Value::Null;
+    while admitted.is_null() {
+        for event in drain(&mut host)? {
+            if event["event"] == "receive" && event["channel"] == 0 {
+                let data = hex::decode(event["data"].as_str().unwrap())?;
+                if let Some((2, payload)) = test_open(&secret, 0, &data) {
+                    let value: Value = serde_json::from_slice(&payload)?;
+                    if value["user"].is_string() {
+                        admitted = value;
+                    }
+                }
+            }
+        }
+        ensure!(Instant::now() < deadline, "Correct handshake was not admitted");
+    }
+    ensure!(
+        admitted["snapshot"]["manifest"].is_object(),
+        "Admission snapshot lacked the manifest"
+    );
+    drop(host);
+    // Third connection: replay the second connection's captured reply bytes.
+    // The stale challenge must reject it before the one-use ticket is touched.
+    let (mut host, peer) = connect()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    // Wait for the server's challenge greeting so the replay lands after it.
+    while challenge_of(&events).is_none() {
+        events.extend(drain(&mut host)?);
+        ensure!(
+            Instant::now() < deadline,
+            "No challenge greeting for the replay connection"
+        );
+    }
+    host.peer_mut(peer)
+        .send(0, &rusty_enet::Packet::new(reply, rusty_enet::PacketKind::Reliable))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut outcome = Value::Null;
+    while outcome.is_null() {
+        for event in drain(&mut host)? {
+            match event["event"].as_str() {
+                Some("disconnect") => outcome = event,
+                Some("receive") => {
+                    let data = hex::decode(event["data"].as_str().unwrap())?;
+                    // The unauthenticated challenge greeting is expected; any
+                    // other packet would mean the replay was admitted.
+                    if data.len() == 17 && data[0] == 0 {
+                        continue;
+                    }
+                    outcome = event;
+                }
+                _ => {}
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Replayed handshake was neither rejected nor disconnected"
+        );
+    }
+    ensure!(
+        outcome["event"] == "disconnect",
+        "Replayed handshake was accepted or answered: {outcome}"
+    );
+    println!("PASS challenge admission, ticket binding, and stale-handshake rejection");
     Ok(())
 }

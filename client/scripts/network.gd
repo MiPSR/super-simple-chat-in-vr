@@ -179,12 +179,23 @@ func _process(delta: float) -> void:
 				status.emit("Finishing the new authenticated connection…" if candidate != null else "Disconnected. Obtain a fresh grant; the instance survives only if someone remained.")
 				return
 			ENetConnection.EVENT_CONNECT:
-				var first: PackedByteArray = str(grant.ticket).to_utf8_buffer()
-				first.append_array(cipher.seal(0, 0, 1, PackedByteArray()))
-				peer.send(0, first, ENetPacketPeer.FLAG_RELIABLE)
-				grant.clear()
+				pass
 			ENetConnection.EVENT_RECEIVE:
 				var packet: PackedByteArray = event[1].get_packet()
+				if not joined and packet.size() == 17 and packet[0] == 0:
+					# Pre-admission the server speaks first: a one-byte-tagged
+					# cleartext challenge. Our sealed reply echoes ticket and
+					# challenge inside the MAC, so captured handshakes cannot
+					# be replayed onto another connection. Sealed server frames
+					# still flow through the normal decrypt path so admission
+					# snapshots are never swallowed.
+					if grant.has("ticket"):
+						var reply: PackedByteArray = str(grant.ticket).to_utf8_buffer()
+						reply.append_array(packet.slice(1))
+						reply.append_array(cipher.seal(0, 0, 1, str(grant.ticket).to_utf8_buffer()))
+						peer.send(0, reply, ENetPacketPeer.FLAG_RELIABLE)
+						grant.clear()
+					continue
 				var plain: PackedByteArray = cipher.open(int(event[3]), 1, packet)
 				if plain.is_empty():
 					continue

@@ -16,6 +16,9 @@ const RadialMenu = preload("res://scripts/radial_menu.gd")
 const Radio = preload("res://scripts/radio.gd")
 const ContactEvents = preload("res://scripts/contact_events.gd")
 const AmbientVisuals = preload("res://scripts/ambient_visuals.gd")
+const PeopleTab = preload("res://scripts/people_tab.gd")
+const WorldsTab = preload("res://scripts/worlds_tab.gd")
+const Visuals = preload("res://scripts/visual_overrides.gd")
 var ambient_visuals := AmbientVisuals.new()
 var network: Node
 var loader: Node
@@ -59,7 +62,6 @@ var interactions: Dictionary = {}
 var contact_events := ContactEvents.new()
 var preferences: Dictionary = {}
 var preferences_request: HTTPRequest
-var touch_elapsed := 0.0
 var call_user: LineEdit
 var last_call_invitation := ""
 var video_surfaces: Dictionary = {}
@@ -83,6 +85,22 @@ var preference_save_pending := false
 var input_focused := true
 var phone_before_focus := false
 var xr_interface: OpenXRInterface
+var people_tab: VBoxContainer
+var worlds_tab: VBoxContainer
+var visual_states: Dictionary = {}
+var keyboard_panel: PanelContainer
+var keyboard_target: LineEdit
+var pointer_ray: MeshInstance3D
+var phone_hit := Vector3.ZERO
+var turn_armed := false
+var avatar_action_choices: OptionButton
+var avatar_catalog: Array = []
+var local_avatar_id := ""
+var snap_turn_on := true
+var turn_angle_deg := 30.0
+var move_speed_value := 1.5
+var move_hand_index := 1
+var sleep_pose := "flat"
 
 func _update_xr_focus() -> void:
 	if xr_interface:
@@ -209,8 +227,8 @@ func _build_rig() -> void:
 		controller.tracker = &"left_hand" if i == 0 else &"right_hand"
 		origin.add_child(controller)
 		controllers.append(controller)
-		controller.button_pressed.connect(_controller_pressed)
-		controller.button_released.connect(_controller_released)
+		controller.button_pressed.connect(_controller_pressed.bind(i))
+		controller.button_released.connect(_controller_released.bind(i))
 
 func _build_lobby() -> void:
 	var floor_mesh := MeshInstance3D.new()
@@ -256,26 +274,20 @@ func _build_phone() -> void:
 	var panel := PanelContainer.new()
 	panel.size = Vector2(560, 960)
 	phone_viewport.add_child(panel)
-	var scroll := ScrollContainer.new()
-	scroll.custom_minimum_size = Vector2(540, 920)
-	panel.add_child(scroll)
-	var column := VBoxContainer.new()
-	column.add_theme_constant_override("separation", 12)
-	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	scroll.add_child(column)
+	var frame := VBoxContainer.new()
+	panel.add_child(frame)
 	var title := Label.new()
 	title.text = "Super Simple Chat in VR"
 	title.add_theme_font_size_override("font_size", 29)
-	column.add_child(title)
+	frame.add_child(title)
 	status_label = Label.new()
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_label.custom_minimum_size = Vector2(520, 100)
-	column.add_child(status_label)
-	grant_input = TextEdit.new()
-	grant_input.placeholder_text = "Paste one-use connection grant JSON"
-	grant_input.custom_minimum_size = Vector2(520, 160)
-	column.add_child(grant_input)
-	_button(column, "Connect", _connect)
+	frame.add_child(status_label)
+	var tabs := TabContainer.new()
+	tabs.custom_minimum_size = Vector2(556, 796)
+	frame.add_child(tabs)
+	var column := _phone_tab(tabs, "Phone")
 	_button(column, "Toggle microphone mute", func(): voice.set_microphone(not voice.microphone_enabled))
 	radio_choices = OptionButton.new()
 	column.add_child(radio_choices)
@@ -372,12 +384,11 @@ func _build_phone() -> void:
 	preference_save_timer.wait_time = 0.25
 	preference_save_timer.timeout.connect(_flush_preferences)
 	add_child(preference_save_timer)
-	network.negotiated.connect(func(_bitrate: int): preferences_request.request(loader.base_url + "/api/v1/me", PackedStringArray(["Authorization: Bearer " + loader.credentials])))
-	_button(column, "Toggle my touch permissions", func():
-		if not preferences.is_empty():
-			preferences.can_touch_me = not bool(preferences.can_touch_me)
-			preferences.can_touch_others = preferences.can_touch_me
-			_save_preferences()
+	network.negotiated.connect(func(_bitrate: int):
+		preferences_request.request(loader.base_url + "/api/v1/me", PackedStringArray(["Authorization: Bearer " + loader.credentials]))
+		people_tab.join(loader.base_url, loader.credentials)
+		if avatar_request.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
+			avatar_request.request(loader.base_url + "/api/v1/assets?kind=avatar", PackedStringArray(["Authorization: Bearer " + loader.credentials]))
 	)
 	_button(column, "Head pat nearest avatar", func(): _contact_nearest("touch"))
 	_button(column, "Grab nearest hair / accessory", func(): _contact_nearest("grab"))
@@ -390,25 +401,51 @@ func _build_phone() -> void:
 		if network.joined:
 			avatar_request.request(loader.base_url + "/api/v1/assets?kind=avatar", PackedStringArray(["Authorization: Bearer " + loader.credentials]))
 	)
+	avatar_action_choices = OptionButton.new()
+	avatar_action_choices.visible = false
+	column.add_child(avatar_action_choices)
 	avatar_action_input = LineEdit.new()
 	avatar_action_input.placeholder_text = "Authored avatar action name"
 	column.add_child(avatar_action_input)
-	_button(column, "Apply avatar action", func(): network.command(13, {"name":avatar_action_input.text, "weight":1.0}))
-	_button(column, "Reset avatar action", func(): network.command(13, {"name":avatar_action_input.text, "weight":0.0}))
+	_button(column, "Apply avatar action", func(): _avatar_action(1.0))
+	_button(column, "Reset avatar action", func(): _avatar_action(0.0))
 	_button(column, "Switch phone hand", _switch_phone_hand)
 	_button(column, "Toggle sleeping pose", _sleep)
 	settings_panel = SettingsPanel.new()
 	column.add_child(settings_panel)
-	settings_panel.configure(preferences)
+	settings_panel.configure(preferences, xr_active)
 	settings_panel.changed.connect(func(updates: Dictionary):
 		if preferences.is_empty():
 			return
-		# Merge only controlled fields: stale UI cannot re-enable touch permissions.
+		# Merge only controlled fields; stale UI cannot invent unknown ones.
 		preferences.merge(updates, true)
 		_apply_preferences()
 		_save_preferences()
 	)
 	_button(column, "Disconnect", func(): network.close(); _clear_instance(); _status("Disconnected"))
+	var people_scroll := ScrollContainer.new()
+	people_scroll.custom_minimum_size = Vector2(540, 740)
+	tabs.add_child(people_scroll)
+	people_tab = PeopleTab.new()
+	people_tab.status.connect(_status)
+	people_scroll.add_child(people_tab)
+	tabs.set_tab_title(tabs.get_tab_count() - 1, "People")
+	var worlds_scroll := ScrollContainer.new()
+	worlds_scroll.custom_minimum_size = Vector2(540, 740)
+	tabs.add_child(worlds_scroll)
+	worlds_tab = WorldsTab.new()
+	worlds_tab.status.connect(_status)
+	worlds_tab.join_requested.connect(_apply_grant)
+	worlds_scroll.add_child(worlds_tab)
+	tabs.set_tab_title(tabs.get_tab_count() - 1, "Worlds")
+	var grant := _phone_tab(tabs, "Grant")
+	grant_input = TextEdit.new()
+	grant_input.placeholder_text = "Paste one-use connection grant JSON"
+	grant_input.custom_minimum_size = Vector2(520, 160)
+	grant.add_child(grant_input)
+	_button(grant, "Connect", _connect)
+	_build_keyboard()
+	phone_viewport.gui_focus_changed.connect(_phone_focus_changed)
 	radial = RadialMenu.new()
 	radial.position = Vector2(20,220)
 	radial.size = Vector2(520,520)
@@ -428,26 +465,121 @@ func _build_phone() -> void:
 	surface.material_override = mat
 	phone.add_child(surface)
 	phone.visible = xr_active
+	pointer_ray = MeshInstance3D.new()
+	var ray_mesh := BoxMesh.new()
+	ray_mesh.size = Vector3(0.004, 0.004, 1.0)
+	var ray_material := StandardMaterial3D.new()
+	ray_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	ray_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	ray_material.albedo_color = Color(0.45, 0.75, 1.0, 0.6)
+	ray_mesh.material = ray_material
+	pointer_ray.mesh = ray_mesh
+	pointer_ray.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	pointer_ray.visible = false
+	add_child(pointer_ray)
+
+func _phone_tab(tabs: TabContainer, title: String) -> VBoxContainer:
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(540, 740)
+	tabs.add_child(scroll)
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 12)
+	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(column)
+	tabs.set_tab_title(tabs.get_tab_count() - 1, title)
+	return column
+
+func _build_keyboard() -> void:
+	# Phone-local virtual keyboard; physical LineEdit typing stays untouched.
+	keyboard_panel = PanelContainer.new()
+	keyboard_panel.position = Vector2(20, 960 - 292)
+	keyboard_panel.custom_minimum_size = Vector2(520, 282)
+	keyboard_panel.visible = false
+	phone_viewport.add_child(keyboard_panel)
+	var rows := VBoxContainer.new()
+	rows.add_theme_constant_override("separation", 6)
+	keyboard_panel.add_child(rows)
+	for line in [["1","2","3","4","5","6","7","8","9","0"],["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["z","x","c","v","b","n","m",",",".","-"]]:
+		var grid := GridContainer.new()
+		grid.columns = line.size()
+		grid.add_theme_constant_override("h_separation", 4)
+		grid.add_theme_constant_override("v_separation", 4)
+		rows.add_child(grid)
+		for key in line:
+			_key_button(grid, key, key)
+	var actions := GridContainer.new()
+	actions.columns = 4
+	actions.add_theme_constant_override("h_separation", 4)
+	rows.add_child(actions)
+	_key_button(actions, "Space", "space")
+	_key_button(actions, "Backspace", "backspace")
+	_key_button(actions, "Clear", "clear")
+	_key_button(actions, "Enter", "enter")
+
+func _key_button(parent: Node, text: String, action: String) -> void:
+	var button := Button.new()
+	button.text = text
+	button.custom_minimum_size = Vector2(44, 40)
+	button.focus_mode = Control.FOCUS_NONE
+	button.pressed.connect(_key_pressed.bind(action, text))
+	parent.add_child(button)
+
+func _key_pressed(action: String, text: String) -> void:
+	if not is_instance_valid(keyboard_target):
+		return
+	var line := keyboard_target
+	match action:
+		"space":
+			if line.max_length <= 0 or line.text.length() < line.max_length:
+				line.text += " "
+		"backspace":
+			if not line.text.is_empty():
+				line.text = line.text.substr(0, line.text.length() - 1)
+		"clear":
+			line.clear()
+		"enter":
+			if not line.text.is_empty():
+				line.text_submitted.emit(line.text)
+		_:
+			if line.max_length <= 0 or line.text.length() < line.max_length:
+				line.text += text
+
+func _phone_focus_changed(control: Control) -> void:
+	keyboard_target = control as LineEdit
+
+func _update_keyboard() -> void:
+	if keyboard_panel:
+		keyboard_panel.visible = is_instance_valid(keyboard_target) and (phone.visible or not xr_active)
 
 func _connect() -> void:
 	var grant = JSON.parse_string(grant_input.text)
 	if not grant is Dictionary:
 		_status("Invalid grant JSON")
 		return
+	grant_input.text = ""
+	_apply_grant(grant)
+
+func _apply_grant(grant: Dictionary) -> void:
 	var api_url := str(grant.get("api_url", ""))
 	if not api_url.begins_with("https://") and not api_url.begins_with("http://127.0.0.1:"):
 		_status("Asset API requires HTTPS (except loopback development)")
 		return
+	var send := int(preferences.get("send_divisor", 1))
+	var receive := int(preferences.get("receive_divisor", 1))
+	if not [1, 2, 4].has(send):
+		send = 1
+	if not [1, 2, 4].has(receive):
+		receive = 1
 	preferences_request.cancel_request()
 	preference_save_timer.stop()
 	preference_save_pending = false
 	preferences = {}
-	settings_panel.configure(preferences)
+	settings_panel.configure(preferences, xr_active)
 	loader.credentials = str(grant.get("api_token", ""))
 	loader.base_url = api_url
+	worlds_tab.configure(api_url, loader.credentials, send, receive)
 	_clear_instance()
 	var result: Error = network.connect_grant(grant)
-	grant_input.text = ""
 	if result != OK:
 		_status(error_string(result))
 
@@ -472,6 +604,9 @@ func _clear_instance() -> void:
 	interactions.clear()
 	contact_events.clear()
 	selected_entity = ""
+	visual_states.clear()
+	if is_instance_valid(people_tab):
+		people_tab.clear()
 	loader.prefabs.clear()
 	creator.close()
 	voice.clear()
@@ -499,25 +634,32 @@ func _message(kind: int, data: Dictionary) -> void:
 	if kind == 255:
 		_status(str(data.get("error", "Server error")))
 	elif kind == 2:
-		var snapshot: Dictionary = data.snapshot
-		if current_instance != str(snapshot.instance):
+		var snapshot: Dictionary = data.get("snapshot", {})
+		if current_instance != str(snapshot.get("instance", "")):
 			_clear_instance()
-			current_instance = str(snapshot.instance)
-		if current_version != str(snapshot.version):
-			current_version = str(snapshot.version)
+			current_instance = str(snapshot.get("instance", ""))
+		var next_visuals: Dictionary = snapshot.get("visual", {})
+		var visuals_changed := next_visuals != visual_states
+		if visuals_changed:
+			visual_states = next_visuals
+		if snapshot.has("manifest") and current_version != str(snapshot.get("version", "")):
+			current_version = str(snapshot.get("version", ""))
 			loader.quality = quality
 			loader.load_world(snapshot)
-			var spawn: Array = snapshot.manifest.spawn
+			var spawn: Array = snapshot.manifest.get("spawn", [0, 1, 3])
 			origin.position = Vector3(float(spawn[0]), float(spawn[1]), float(spawn[2]))
-		_update_players(snapshot.players.values(), int(snapshot.tick), true)
-		latest_tick = int(snapshot.tick)
-		entity_data = snapshot.entities
-		creator.world_queries = snapshot.manifest.get("scripts", []).any(func(s): return s.get("side") == "client")
-		creator.update_objects(entity_data, int(snapshot.tick))
-		creator.update_state(snapshot.get("variables", {}), int(snapshot.tick))
+		var tick := int(snapshot.get("tick", latest_tick))
+		_update_players(snapshot.get("players", {}).values(), tick, true)
+		people_tab.players(snapshot.get("players", {}).values(), network.user)
+		latest_tick = tick
+		entity_data = snapshot.get("entities", {})
+		if snapshot.has("manifest"):
+			creator.world_queries = snapshot.manifest.get("scripts", []).any(func(s): return s.get("side") == "client")
+		creator.update_objects(entity_data, tick)
+		creator.update_state(snapshot.get("variables", {}), tick)
 		var next_contacts: Dictionary = snapshot.get("interactions", {})
 		for event in contact_events.replace(next_contacts):
-			event.snapshot_tick = int(snapshot.tick)
+			event.snapshot_tick = tick
 			if avatars.has(str(event.target)):
 				avatars[str(event.target)].contact(event)
 			creator.dispatch("release", event)
@@ -529,14 +671,17 @@ func _message(kind: int, data: Dictionary) -> void:
 				entity_nodes[id].queue_free()
 				entity_nodes.erase(id)
 		for id in entity_data:
-			_upsert_entity(entity_data[id], latest_tick)
+			_upsert_entity(entity_data[id], tick)
+		if visuals_changed:
+			for id in entity_nodes.keys():
+				Visuals.apply(entity_nodes[id], visual_states.get(id, {}))
 	elif kind == 3:
-		creator.update_transforms(data.get("entities", []), int(data.tick))
+		creator.update_transforms(data.get("entities", []), int(data.get("tick", latest_tick)))
 		_update_media(data.get("media", {}))
-		_update_players(data.players, int(data.tick), false)
+		_update_players(data.get("players", []), int(data.get("tick", latest_tick)), false)
 		for entity in data.get("entities", []):
-			if entity_nodes.has(str(entity.id)):
-				entity_nodes[str(entity.id)].sample(entity, int(data.tick))
+			if entity_nodes.has(str(entity.get("id", ""))):
+				entity_nodes[str(entity.get("id", ""))].sample(entity, int(data.get("tick", latest_tick)))
 	elif kind == 4:
 		if avatars.has(str(data.user)):
 			avatars[str(data.user)].chat(str(data.text))
@@ -559,8 +704,8 @@ func _message(kind: int, data: Dictionary) -> void:
 		radios.receive(data)
 	elif kind == 11:
 		var graph_changed := false
-		var event_tick := int(data.tick)
-		for event in data.events:
+		var event_tick := int(data.get("tick", latest_tick))
+		for event in data.get("events", []):
 			if event.event == "sound" and world_root and world_root.has_meta("ssc_audio"):
 				var audio: Node = world_root.get_meta("ssc_audio")
 				match str(event.action):
@@ -568,8 +713,8 @@ func _message(kind: int, data: Dictionary) -> void:
 					"stop_sound": audio.stop_sound(str(event.target))
 					"seek_sound": audio.seek_sound(str(event.target), float(event.value))
 			elif event.event == "spawn" and event_tick > latest_tick:
-				entity_data[str(event.entity.id)] = event.entity
-				_upsert_entity(event.entity, int(data.tick))
+				entity_data[str(event.entity.get("id", ""))] = event.entity
+				_upsert_entity(event.entity, event_tick)
 				graph_changed = true
 			elif event.event == "destroy" and event_tick > latest_tick:
 				var id := str(event.target)
@@ -582,16 +727,22 @@ func _message(kind: int, data: Dictionary) -> void:
 		# describes creation-time poses, not necessarily the final tick pose.
 		if graph_changed:
 			creator.update_objects(entity_data, event_tick)
-		creator.queue_world_events(data.events)
+		creator.queue_world_events(data.get("events", []))
 
 func _upsert_entity(data: Dictionary, tick: int) -> void:
-	var id := str(data.id)
+	var id := str(data.get("id", ""))
+	if id.is_empty():
+		return
 	if not entity_nodes.has(id):
 		var entity := Entity.new()
 		entity.presentation_error.connect(_status)
 		add_child(entity)
 		entity_nodes[id] = entity
 	entity_nodes[id].configure(data, loader.prefabs, quality, tick)
+	if visual_states.has(id):
+		# Rebuilt visual subtrees lose their applied state; re-assert the
+		# authoritative override (idempotent for unchanged entities).
+		Visuals.apply(entity_nodes[id], visual_states[id])
 
 func _setup_video(manifest: Dictionary) -> void:
 	for surface in video_surfaces.values():
@@ -643,7 +794,9 @@ func _update_players(players: Array, tick: int, complete: bool) -> void:
 	voice.positions(players,complete)
 	var seen: Dictionary = {}
 	for player in players:
-		var id := str(player.id)
+		var id := str(player.get("id", ""))
+		if id.is_empty():
+			continue
 		seen[id] = true
 		if not avatars.has(id):
 			var avatar := Avatar.new()
@@ -652,8 +805,15 @@ func _update_players(players: Array, tick: int, complete: bool) -> void:
 			avatars[id] = avatar
 			Materials.apply(avatar, quality)
 		avatars[id].set_audio_allowed(bool(player.get("audio_allowed", id == network.user)))
+		var avatar_id := str(player.get("avatar", ""))
+		if player.get("avatar") == null:
+			avatar_id = ""
 		if id == network.user:
 			avatars[id].is_local = true
+			avatars[id].sleep_pose = sleep_pose
+			if avatar_id != local_avatar_id:
+				local_avatar_id = avatar_id
+				_refresh_avatar_actions()
 		else:
 			avatars[id].sample(player, tick)
 		avatars[id].set_actions(player.get("avatar_actions", {}))
@@ -664,7 +824,7 @@ func _update_players(players: Array, tick: int, complete: bool) -> void:
 			avatars[id].avatar_version = version
 			avatars[id].fallback()
 			if not version.is_empty() and vrm_runtime.available():
-				avatar_queue.append({"player":id, "asset":str(player.avatar), "version":version})
+				avatar_queue.append({"player":id, "asset":avatar_id, "version":version})
 	if complete:
 		for id in avatars.keys():
 			if not seen.has(id):
@@ -680,7 +840,7 @@ func creator_ambient(color: Array, brightness: float) -> void:
 
 func _process(delta: float) -> void:
 	ambient_visuals.advance()
-	Materials.refresh_shadows()
+	_update_keyboard()
 	acoustics.listener(camera.global_position,get_world_3d())
 	radios.environment(acoustics.route(camera.global_position))
 	for state in voice.streams.values():
@@ -725,22 +885,30 @@ func _process(delta: float) -> void:
 		avatars[user].grabs(list)
 	if not input_focused:
 		return
-	touch_elapsed += delta
-	if touch_elapsed > 0.5 and bool(preferences.get("can_touch_others", false)):
-		touch_elapsed = 0
-		_contact_nearest("touch", 0.3)
 	if xr_active:
 		phone.global_transform = controllers[phone_hand].global_transform
 		phone.rotate_object_local(Vector3.RIGHT, -0.6)
 		phone.translate_object_local(Vector3(0, 0.2, -0.08))
-		var stick := controllers[1].get_vector2("primary")
+		_update_pointer_ray()
 		if not menu_pressed:
+			var stick := controllers[move_hand_index].get_vector2("primary")
 			var direction := camera.global_basis * Vector3(stick.x, 0, -stick.y)
 			direction.y = 0
-			origin.position += direction * delta * 1.5
+			origin.position += direction * delta * move_speed_value
+			var turn := controllers[1 - move_hand_index].get_vector2("primary").x
+			if snap_turn_on:
+				# Discrete comfort turning: one step per flick, re-armed when
+				# the stick returns below the hysteresis threshold.
+				if absf(turn) > 0.75 and not turn_armed:
+					origin.rotate_y(-deg_to_rad(turn_angle_deg))
+					turn_armed = true
+				elif absf(turn) < 0.5:
+					turn_armed = false
+			elif absf(turn) > 0.15:
+				origin.rotate_y(-turn * delta * deg_to_rad(90.0))
 	else:
 		var direction := Vector3.ZERO
-		if not grant_input.has_focus() and not chat_input.has_focus():
+		if not _text_typing():
 			direction = Vector3(float(Input.is_physical_key_pressed(KEY_D)) - float(Input.is_physical_key_pressed(KEY_A)), 0, float(Input.is_physical_key_pressed(KEY_S)) - float(Input.is_physical_key_pressed(KEY_W)))
 		origin.position += origin.basis * direction * delta * 2
 	if network.joined and not selected_entity.is_empty():
@@ -763,7 +931,7 @@ func _process(delta: float) -> void:
 			phone.visible = true
 			radial.point(controllers[1 - phone_hand].get_vector2("primary"))
 
-func _controller_pressed(action: StringName) -> void:
+func _controller_pressed(action: StringName, hand: int = 1) -> void:
 	if not input_focused:
 		return
 	if action == &"menu_button" or action == &"ax_button":
@@ -773,10 +941,14 @@ func _controller_pressed(action: StringName) -> void:
 		radial.configure_actions(preferences.get("radial_actions", RadialMenu.DEFAULT_ACTIONS))
 		phone_before_radial = phone.visible
 	elif action == &"trigger_click":
-		if not _point_phone(true):
+		# Contact is explicit: touch while an avatar is within reach, otherwise
+		# the trigger keeps its vehicle fire meaning.
+		if not _point_phone(true) and not _contact_nearest("touch", 0.45, hand):
 			_fire()
+	elif action == &"grip_click":
+		_contact_nearest("touch", 0.45, hand)
 
-func _controller_released(action: StringName) -> void:
+func _controller_released(action: StringName, _hand: int = 1) -> void:
 	if not input_focused:
 		return
 	if action == &"menu_button" or action == &"ax_button":
@@ -789,7 +961,7 @@ func _controller_released(action: StringName) -> void:
 				"sleep": _sleep()
 				"phone_hand": _switch_phone_hand()
 				"interact": _interact()
-				"avatar_action": network.command(13, {"name":avatar_action_input.text, "weight":1.0})
+				"avatar_action": _avatar_action(1.0)
 				"video_pause": _media_command("pause")
 				"phone": phone.visible = true
 				"leave":
@@ -808,10 +980,9 @@ func _switch_phone_hand() -> void:
 		preferences.phone_hand = "left" if phone_hand == 0 else "right"
 		_save_preferences()
 
-func _point_phone(pressed: bool) -> bool:
+func _phone_hit(pointer: XRController3D) -> bool:
 	if not phone.visible:
 		return false
-	var pointer := controllers[1 - phone_hand]
 	var from := phone.to_local(pointer.global_position)
 	var direction := phone.global_basis.inverse() * -pointer.global_basis.z
 	if absf(direction.z) < 0.0001:
@@ -822,8 +993,31 @@ func _point_phone(pressed: bool) -> bool:
 	var point := from + direction * t
 	if absf(point.x) > 0.14 or absf(point.y) > 0.24:
 		return false
+	phone_hit = point
+	return true
+
+func _update_pointer_ray() -> void:
+	var pointer := controllers[1 - phone_hand]
+	if not pointer.get_is_active() or not _phone_hit(pointer):
+		pointer_ray.visible = false
+		return
+	var from: Vector3 = pointer.global_position
+	var to: Vector3 = phone.to_global(phone_hit)
+	var distance := from.distance_to(to)
+	if distance < 0.02:
+		pointer_ray.visible = false
+		return
+	pointer_ray.visible = true
+	pointer_ray.global_position = (from + to) / 2.0
+	var forward := (to - from) / distance
+	pointer_ray.global_basis = Basis.looking_at(forward, Vector3.UP if absf(forward.dot(Vector3.UP)) < 0.99 else Vector3.BACK)
+	pointer_ray.scale = Vector3(1, 1, distance)
+
+func _point_phone(pressed: bool) -> bool:
+	if not _phone_hit(controllers[1 - phone_hand]):
+		return false
 	var event := InputEventMouseButton.new()
-	event.position = Vector2((point.x / 0.28 + 0.5) * 560, (0.5 - point.y / 0.48) * 960)
+	event.position = Vector2((phone_hit.x / 0.28 + 0.5) * 560, (0.5 - phone_hit.y / 0.48) * 960)
 	event.button_index = MOUSE_BUTTON_LEFT
 	event.pressed = pressed
 	phone_viewport.push_input(event, true)
@@ -846,7 +1040,7 @@ func _claim(component: String) -> void:
 	var nearest := ""
 	var distance := 4.0
 	for id in entity_data:
-		if entity_data[id].component == component:
+		if entity_data[id].get("component", "") == component:
 			var d: float = camera.global_position.distance_to(entity_nodes[id].global_position)
 			if d < distance:
 				distance = d
@@ -877,8 +1071,15 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		origin.rotate_y(-event.relative.x * 0.003)
 		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.003, -1.4, 1.4)
-	elif event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_SPACE and not chat_input.has_focus() and not grant_input.has_focus():
-		_fire()
+	elif event is InputEventKey and event.pressed and not event.echo and not _text_typing():
+		if event.physical_keycode == KEY_SPACE:
+			_fire()
+		elif event.physical_keycode == KEY_E:
+			# Desktop contact: an explicit touch within reach.
+			_contact_nearest("touch", 0.45, 1 - phone_hand)
+
+func _text_typing() -> bool:
+	return grant_input.has_focus() or chat_input.has_focus() or is_instance_valid(keyboard_target)
 
 func _sleep() -> void:
 	sleeping = not sleeping
@@ -929,12 +1130,40 @@ func _avatar_catalog(result: int, code: int, _headers: PackedStringArray, body: 
 	var assets = JSON.parse_string(body.get_string_from_utf8())
 	if not assets is Array:
 		return
+	avatar_catalog = assets
 	avatar_choices.clear()
 	avatar_choices.add_item("Fallback avatar")
 	avatar_choices.set_item_metadata(0, null)
 	for asset in assets:
 		avatar_choices.add_item(str(asset.name))
 		avatar_choices.set_item_metadata(avatar_choices.item_count - 1, str(asset.id))
+	_refresh_avatar_actions()
+
+func _refresh_avatar_actions() -> void:
+	# Catalog rows carry each avatar's declared actions; the free-text field
+	# stays only as the fallback when no catalog data is available.
+	var actions: Array = []
+	for row in avatar_catalog:
+		if str(row.get("id", "")) == local_avatar_id and row.get("actions") is Array:
+			actions = row.actions
+			break
+	avatar_action_choices.clear()
+	if actions.is_empty():
+		avatar_action_input.visible = true
+		avatar_action_choices.visible = false
+		return
+	avatar_action_input.visible = false
+	avatar_action_choices.visible = true
+	for name in actions:
+		avatar_action_choices.add_item(str(name))
+		avatar_action_choices.set_item_metadata(avatar_action_choices.item_count - 1, str(name))
+	avatar_action_choices.select(0)
+
+func _avatar_action(weight: float) -> void:
+	if avatar_action_choices.visible and avatar_action_choices.selected >= 0:
+		network.command(13, {"name":avatar_action_choices.get_item_metadata(avatar_action_choices.selected), "weight":weight})
+	else:
+		network.command(13, {"name":avatar_action_input.text, "weight":weight})
 
 func _preferences_received(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
@@ -943,16 +1172,27 @@ func _preferences_received(result: int, code: int, _headers: PackedStringArray, 
 	var data = JSON.parse_string(body.get_string_from_utf8())
 	if data is Dictionary and data.has("preferences"):
 		preferences = data.preferences
+		var comfort_defaults := {"snap_turn": true, "turn_angle": 30, "move_speed": 1.5, "move_hand": "right", "sleep_pose": "flat"}
+		for key in comfort_defaults.keys():
+			# The full preference object is always PUT back; older servers may
+			# have never stored the comfort fields.
+			if not preferences.has(key):
+				preferences[key] = comfort_defaults[key]
 		_apply_preferences()
 		network.command(7, {"sleeping":sleeping})
 	else:
 		_status("Preferences saved")
 
 func _apply_preferences() -> void:
-	phone_hand = 0 if preferences.phone_hand == "left" else 1
-	quality = int(preferences.quality)
-	sleeping = bool(preferences.sleeping)
+	phone_hand = 0 if str(preferences.get("phone_hand", "right")) == "left" else 1
+	quality = int(preferences.get("quality", 1))
+	sleeping = bool(preferences.get("sleeping", false))
 	radio_preset = str(preferences.get("radio_preset", "standard"))
+	snap_turn_on = bool(preferences.get("snap_turn", true))
+	turn_angle_deg = float(preferences.get("turn_angle", 30))
+	move_speed_value = clampf(float(preferences.get("move_speed", 1.5)), 0.5, 3.0)
+	move_hand_index = 0 if str(preferences.get("move_hand", "right")) == "left" else 1
+	sleep_pose = str(preferences.get("sleep_pose", "flat"))
 	_apply_radio_preset()
 	loader.quality = quality
 	loader.texture_reduction = int(preferences.get("texture_reduction", 0))
@@ -962,7 +1202,7 @@ func _apply_preferences() -> void:
 		Materials.apply(avatar, quality)
 	for entity in entity_nodes.values():
 		Materials.apply(entity, quality)
-	settings_panel.configure(preferences)
+	settings_panel.configure(preferences, xr_active)
 	var notices := SettingsPanel.apply_local(preferences, get_viewport(), voice, radios, camera)
 	settings_panel.report(notices)
 	if not notices.is_empty():
@@ -976,7 +1216,7 @@ func _flush_preferences() -> void:
 	if not preference_save_pending:
 		return
 	var payload := preferences.duplicate(true)
-	for key in ["quality", "send_divisor", "receive_divisor", "texture_reduction"]:
+	for key in ["quality", "send_divisor", "receive_divisor", "texture_reduction", "turn_angle"]:
 		payload[key] = int(payload[key])
 	var error := preferences_request.request(loader.base_url + "/api/v1/preferences", PackedStringArray(["Authorization: Bearer " + loader.credentials,"Content-Type: application/json"]), HTTPClient.METHOD_PUT, JSON.stringify(payload))
 	if error == OK:
@@ -984,11 +1224,11 @@ func _flush_preferences() -> void:
 	else:
 		preference_save_timer.start() # One coalesced pending state, never a request queue.
 
-func _contact_nearest(action: String, reach: float = 0.45) -> void:
+func _contact_nearest(action: String, reach: float = 0.45, hand: int = -1) -> bool:
 	if not network.joined or not avatars.has(network.user):
-		return
-	var hand := 1 - phone_hand
-	var position: Vector3 = avatars[network.user].hands[hand].global_position
+		return false
+	var side := 1 - phone_hand if hand < 0 else hand
+	var position: Vector3 = avatars[network.user].hands[side].global_position
 	for user in avatars:
 		if user == network.user:
 			continue
@@ -999,11 +1239,12 @@ func _contact_nearest(action: String, reach: float = 0.45) -> void:
 			var anchor: Transform3D = avatars[user].head.global_transform
 			if collider.anchor in ["left_hand", "right_hand"]:
 				anchor = avatars[user].hands[0 if collider.anchor == "left_hand" else 1].global_transform
-			var offset: Array = collider.offset
+			var offset: Array = collider.get("offset", [0, 0, 0])
 			var center := anchor * Vector3(float(offset[0]),float(offset[1]),float(offset[2]))
 			if position.distance_to(center) < minf(reach, float(collider.radius) + 0.12):
-				network.command(6, {"action":action,"target":user,"hand":hand,"segment":collider.id})
-				return
+				network.command(6, {"action":action,"target":user,"hand":side,"segment":collider.id})
+				return true
+	return false
 
 func _exit_tree() -> void:
 	network.close()

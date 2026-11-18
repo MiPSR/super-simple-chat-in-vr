@@ -11,6 +11,7 @@ var space: World3D
 var sources: Dictionary = {}
 var source_cursor := 0
 var noise_player: AudioStreamPlayer
+var noise_buffer := PackedVector2Array()
 var noise_rng := RandomNumberGenerator.new()
 
 func configure(specs: Array, ceiling: float, realistic_mode: bool = false) -> void:
@@ -198,14 +199,18 @@ func _update_noise() -> void:
 	var playback := noise_player.get_stream_playback() as AudioStreamGeneratorPlayback
 	if not playback:
 		return
-	# At most one 100-ms buffer, including low-frame-rate clients.
+	# At most one 100-ms buffer, including low-frame-rate clients. The PCM
+	# buffer is preallocated and only refilled here, never reallocated in the
+	# steady state.
 	var count := mini(playback.get_frames_available(),4800)
-	var pcm := PackedVector2Array()
-	pcm.resize(count)
+	if count <= 0:
+		return
+	if noise_buffer.size() != count:
+		noise_buffer.resize(count)
 	for index in count:
 		var sample := noise_rng.randf_range(-1,1)
-		pcm[index] = Vector2(sample,sample)
-	playback.push_buffer(pcm)
+		noise_buffer[index] = Vector2(sample,sample)
+	playback.push_buffer(noise_buffer)
 
 func route(position: Vector3, dry: bool = false) -> StringName:
 	if not dry:
@@ -227,6 +232,7 @@ func clear() -> void:
 		noise_player.stop()
 		noise_player.queue_free()
 		noise_player = null
+	noise_buffer.clear()
 	dirty.clear()
 	update_cursor = 0
 	for name in bus_names:

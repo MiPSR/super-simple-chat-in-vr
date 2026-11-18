@@ -78,7 +78,7 @@ func _limb(root_name: String, tip_name: String) -> void:
 	solvers.append(solver)
 	limb_solvers[tip_name] = solver
 
-func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary = {}) -> void:
+func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary = {}, sleep_pose: String = "flat") -> void:
 	if not skeleton or poses.size() < 3:
 		return
 	var head := poses[0]
@@ -86,6 +86,9 @@ func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary 
 	global_basis = Basis(Vector3.UP, yaw)
 	if sleeping:
 		global_basis *= Basis(Vector3.RIGHT, PI / 2)
+		if sleep_pose == "side":
+			# Flat rests on the back; the side variant rolls about the spine.
+			global_basis *= Basis(Vector3.UP, PI / 2)
 	global_position = head.origin - global_basis * rest_head
 	sources.clear()
 	for name in ["Hips", "Chest"]:

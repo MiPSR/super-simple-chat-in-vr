@@ -1,9 +1,10 @@
-# Resource admission (new batch, unverified)
+# Resource admission
 
-These controls are implemented but have **not been compiled or tested**. They
+These controls are implemented and their ceilings have passing unit tests
+(native/src/render_budget.rs, audio_budget.rs, cache_lock.rs). They
 bound specific owned resources, not total process RSS, importer peaks, GPU-driver
-allocations or every native decoder allocation. Hardware/load/security acceptance
-remains required.
+allocations or every native decoder allocation. Importer/GPU and real-hardware
+or load acceptance remains required.
 
 ## Client rendering
 

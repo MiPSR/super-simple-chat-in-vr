@@ -34,7 +34,7 @@ gameplay. Downloads add temporary disk usage before publication. Legacy partials
 without provable owners remain intentionally untouched. Server-side immutable
 asset-version garbage collection is separate; see [asset-storage.md](asset-storage.md).
 
-## Cross-process pins (new implementation, unverified)
+## Cross-process pins
 
 The native client now coordinates completed ZIPs with Linux OFD byte-range locks
 in one zero-length `.ssc-cache.lock` per directory. A 63-bit hash-derived lock
@@ -53,9 +53,10 @@ partial instead of replacing an immutable completed ZIP. Hash verification still
 runs before importing cached content. Invalid completed content is removed only
 after the import pin retires, and only if no other process is using it.
 
-These changes and new independent-descriptor/process-crash/symlink regression
-cases have not been compiled or executed. External tools deleting/replacing the
-lock file while clients are running are outside this cooperative-cache protocol.
+These changes are implemented; the independent-descriptor/process-crash/symlink
+regression cases are unit tests in native/src/cache_lock.rs. External tools
+deleting/replacing the lock file while clients are running are outside this
+cooperative-cache protocol.
 
 Headless checks cover byte/file eviction, recency, refcounted pins, malformed
 hash/path rejection, dead-process partial cleanup, live-owner preservation,

@@ -22,6 +22,19 @@ authenticated value; older reordered envelopes are discarded too. Large reliable
 JSON snapshots use bounded application fragments. This is not a completed
 cryptographic/security audit or full load acceptance.
 
+## Challenge handshake
+
+Admission is challenge-based. On ENet `Event::Connect` the server speaks first
+with a cleartext 17-byte reliable channel-0 packet: a 0 tag byte followed by a
+fresh random 16-byte challenge. The client replies with the 64-byte one-use
+ticket, the 16-byte challenge echoed, and a sealed kind-1 envelope whose
+payload is the ticket bytes, so the cleartext ticket is MAC-covered end to end.
+The server rejects the reply unless the echoed challenge matches this
+connection's pending value; challenges are per-connection, so a captured
+handshake cannot be replayed onto a fresh connection to burn someone else's
+ticket, and pending handshakes expire after five seconds. The realtime protocol
+version advertised with game grants is now 2.
+
 ## Per-peer rates (new implementation, unverified)
 
 `SSC_NETWORK_MIN_HZ`/`SSC_NETWORK_MAX_HZ` (defaults 1/120) bound both directions
@@ -77,6 +90,14 @@ disposable kind-27 envelopes are explicitly excluded from recursive fragmentatio
 this also fixes a large-reliable-envelope recursion case found during review.
 ENet itself is limited to 64-KiB packets and 256-KiB waiting data per server peer,
 before application authentication. New fragmentation cases are unexecuted.
+
+## Stale avatar input
+
+A player sample keeps retransmitting for one second of ticks after its last
+change; an avatar whose input stops is then no longer transmitted, and
+receivers hold the last known pose instead of predicting it. A session that
+authenticates no packets at all for 15 seconds is killed and its membership
+removed, so a stalled client cannot hold a seat indefinitely.
 
 ## Focus loss and resume (new implementation, unverified)
 
@@ -164,3 +185,29 @@ results cannot publish an abandoned scene. A running importer retires without a
 UI-thread join, releases its pin, and then processes the newest queued load.
 Only final node teardown joins a still-running worker. New staged-transition and
 cancelled-generation fixtures are unexecuted.
+
+## Revision snapshots
+
+Revision resnapshots (kind 2 without the join-negotiation fields) omit
+`manifest` when the receiving peer already holds that exact world version; the
+immutable world definition is not re-sent just because instance state changed.
+A client must keep its current world definition when a snapshot carries no
+manifest. Admission snapshots and world switches still ship the full manifest.
+
+## Realtime SQLite reads
+
+Per-tick SQLite reads on the authoritative realtime thread — session validity,
+call-mode preferences, blocks and touch consent — go through a bounded TTL
+cache with a 5-second window, pruned every tick and reset wholesale when a map
+exceeds 4,096 entries. Block and preference changes therefore surface within
+one TTL window; session revocation is rechecked each tick through the same
+cache and surfaces within 15 seconds worst case. Access semantics are
+unchanged.
+
+## Shared physics budget
+
+The authoritative tick carries one shared 8-millisecond physics budget across
+all instances. An instance that exhausts the shared allowance freezes its
+bodies for that tick — its scene step and contact resolution are skipped —
+rather than stalling every other player's tick. The budget resets each tick;
+creator/script work keeps its existing separate queues and watchdogs.

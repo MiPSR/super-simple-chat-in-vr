@@ -331,7 +331,9 @@ pub fn validate<R: Read + Seek>(source: R, kind: &str, budget: u64) -> ApiResult
         || manifest.name.is_empty()
         || manifest.name.len() > 120
         || manifest.description.len() > 4096
-        || !(1..=64).contains(&manifest.capacity)
+        // The absolute manifest ceiling is 128; the effective cap is min(capacity,
+        // SSC_INSTANCE_PLAYERS) at admission, so this is not a hard player cap.
+        || !(1..=128).contains(&manifest.capacity)
         || !manifest.spawn.iter().all(|x| x.is_finite())
     {
         return Err(ApiError::bad(

@@ -79,10 +79,11 @@ The flake pins toolchain and engine versions; Cargo.lock pins Rust dependencies.
 Nix uses binary substitutes when available. Development builds disable debug
 symbols and incremental compilation to reduce disk writes. The engine, codecs,
 and other system libraries use Nix substitutes when available. One isolated
-native extension supplies facilities missing from Godot: bounded Luau, Opus,
-and the in-progress libmpv bridge. Ordinary gameplay remains GDScript. The
-`nix develop .#native` shell permits editing/checking that extension without
-rebuilding its release package just to enter the shell.
+native extension supplies facilities missing from Godot: bounded Luau and Opus;
+video decode is not an in-process bridge but is supplied by the separate
+Landlock-confined `ssc-media-worker` described below. Ordinary gameplay remains
+GDScript. The `nix develop .#native` shell permits editing/checking that
+extension without rebuilding its release package just to enter the shell.
 
 Production video decoding runs in a separate `ssc-media-worker`, built alongside
 the extension and selected automatically by the packaged launcher. Its filesystem
@@ -120,9 +121,19 @@ policy explicitly; HTTP proxies do not forward UDP. Runtime data defaults to
 `SSC_DATA`, `SSC_LISTEN`, `SSC_ENET`, `SSC_PUBLIC_URL`, `SSC_TPS`, and
 `SSC_VOICE_BITRATE` (8,000–64,000 bit/s, default 24,000) as needed.
 `SSC_AUDIO_EFFECT_MAX` bounds world-authored effect amounts (0–1, default 0.9).
+Process admission ceilings are `SSC_INSTANCE_LIMIT` (1–512, default 64 live
+instances), `SSC_INSTANCE_PLAYERS` (1–128, default 64 players per instance),
+`SSC_DEFAULT_WORLD_SLOTS` (1–1000, default 4), `SSC_DEFAULT_AVATAR_SLOTS`
+(1–1000, default 8), `SSC_DEFAULT_WORLD_BYTES` (at most 1,000,000,000,
+default 1,000,000,000) and `SSC_DEFAULT_AVATAR_BYTES` (at most 1,000,000,000,
+default 100,000,000); the slot/byte defaults are granted to newly allowed
+accounts.
 
 **Development build, not the complete release.** See [release status](docs/status.md)
-for the remaining requirements and verification gaps. In particular radios,
-synchronized video, full audio/creator/material/settings capabilities, live
-Discord validation, real XR hardware checks, and long-session testing are not
-complete. Passing the current suite does not mean all acceptance criteria pass.
+for the remaining requirements and verification gaps. The remaining gaps are
+live Discord OAuth validation, real XR-hardware/comfort checks,
+long-session/hardware acceptance and full NixOS deployment acceptance.
+Radios, synchronized video and the audio/creator/material/settings capabilities
+are implemented and locally tested, but local tests do not establish hardware
+or deployment acceptance. Passing the current suite does not mean all acceptance
+criteria pass.

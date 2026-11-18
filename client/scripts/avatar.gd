@@ -13,6 +13,7 @@ var legs: Array[MeshInstance3D] = []
 var label: Label3D
 var text_timeout := 0.0
 var sleeping := false
+var sleep_pose := "flat"
 var model: Node3D
 var avatar_version := ""
 var is_local := false
@@ -104,7 +105,7 @@ func _render_pose(delta: float, transforms: Array[Transform3D], tracking: Dictio
 		legs[i].position = h + Vector3(-0.13 if i == 0 else 0.13, -1.4 if not sleeping else -0.2, 0.8 if sleeping else 0.0)
 	label.position = h + Vector3(0, 0.3, 0)
 	if model:
-		model.update_pose(transforms, sleeping, tracking)
+		model.update_pose(transforms, sleeping, tracking, sleep_pose)
 	text_timeout -= delta
 	if text_timeout <= 0:
 		label.text = ""

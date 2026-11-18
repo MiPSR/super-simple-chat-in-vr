@@ -1,5 +1,8 @@
 //! Version 1 encrypt-then-MAC envelope. HTTPS delivers an independent random
 //! per-connection master key; ENet is not claimed to support Godot DTLS.
+//! The first application packet is bound to a per-connection server
+//! challenge, so a captured handshake cannot be replayed onto a fresh
+//! connection and burn its one-use ticket.
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -11,9 +14,13 @@ pub struct Cipher {
     received: [u64; 3],
 }
 fn key(secret: &[u8], direction: u8, purpose: u8) -> [u8; 32] {
+    // Length-prefixed domain separation: the label is framed so no secret
+    // bytes can be reinterpreted as label bytes by a later scheme revision.
     let mut h = Sha256::new();
-    h.update(secret);
     h.update([direction, purpose]);
+    h.update((secret.len() as u32).to_le_bytes());
+    h.update(secret);
+    h.update(b"ssc-cipher-v2");
     h.finalize().into()
 }
 impl Cipher {

@@ -14,6 +14,16 @@ pub fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+/// Cross-thread invalidation for the realtime read cache: HTTP handlers bump
+/// this after writing blocks/preferences/sessions so the authoritative thread
+/// re-reads on its next lookup instead of waiting out the TTL.
+static POLICY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub fn bump_policy_epoch() {
+    POLICY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+pub fn policy_epoch() -> u64 {
+    POLICY_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
 pub fn token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
@@ -49,6 +59,11 @@ pub struct Preferences {
     pub radio_preset: String,
     pub radial_hold_seconds: f32,
     pub radial_actions: Vec<String>,
+    pub snap_turn: bool,
+    pub turn_angle: u8,
+    pub move_speed: f32,
+    pub move_hand: String,
+    pub sleep_pose: String,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -87,6 +102,11 @@ impl Default for Preferences {
             .into_iter()
             .map(String::from)
             .collect(),
+            snap_turn: true,
+            turn_angle: 30,
+            move_speed: 1.5,
+            move_hand: "right".into(),
+            sleep_pose: "flat".into(),
         }
     }
 }
@@ -136,6 +156,11 @@ impl Preferences {
                         | "none"
                 )
             })
+            && [15, 30, 45].contains(&self.turn_angle)
+            && self.move_speed.is_finite()
+            && (0.5..=3.0).contains(&self.move_speed)
+            && matches!(self.move_hand.as_str(), "left" | "right")
+            && matches!(self.sleep_pose.as_str(), "flat" | "side")
     }
 }
 pub fn preferences(db: &Connection, id: &str) -> Preferences {
@@ -155,6 +180,17 @@ pub fn allowed(db: &Connection, id: &str) -> bool {
 pub fn blocked(db: &Connection, a: &str, b: &str, flag: u32) -> bool {
     db.query_row("SELECT EXISTS(SELECT 1 FROM blocks WHERE ((owner=?1 AND target=?2) OR (owner=?2 AND target=?1)) AND (flags & ?3)!=0)", params![a, b, flag | 16], |r| r.get(0)).unwrap_or(true)
 }
+pub fn my_blocks(db: &Connection, owner: &str) -> Vec<(String, u32)> {
+    let Ok(mut stmt) = db.prepare("SELECT target,flags FROM blocks WHERE owner=? ORDER BY target")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([owner], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))
+    else {
+        return Vec::new();
+    };
+    rows.filter_map(std::result::Result::ok).collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -170,6 +206,9 @@ mod tests {
         assert_eq!(old.draw_distance, 250.0);
         assert_eq!(old.radial_actions.len(), 8);
         assert_eq!(old.radial_hold_seconds, 0.45);
+        assert!(old.snap_turn && old.turn_angle == 30 && old.sleep_pose == "flat");
+        assert_eq!(old.move_speed, 1.5);
+        assert_eq!(old.move_hand, "right");
         let defaults = serde_json::to_value(Preferences::default()).unwrap();
         for (key, value) in [
             ("resolution_scale", json!(0.49)),
@@ -190,6 +229,10 @@ mod tests {
             ("radio_preset", json!("ultra")),
             ("input_device", json!("bad\nname")),
             ("output_device", json!("x".repeat(257))),
+            ("turn_angle", json!(20)),
+            ("move_speed", json!(3.5)),
+            ("move_hand", json!("both")),
+            ("sleep_pose", json!("standing")),
         ] {
             let mut value_map = defaults.clone();
             value_map[key] = value;

@@ -50,19 +50,55 @@ async function grant(join) {
   $("grant").value = JSON.stringify(data); $("grant").select();
   status("One-use grant created. Paste it into the client within 60 seconds.");
 }
+const quotaFields = [["world_slots", "World slots", 1000], ["avatar_slots", "Avatar slots", 1000], ["world_bytes", "World bytes", 1000000000], ["avatar_bytes", "Avatar bytes", 1000000000]];
+function quotaForm(u) {
+  const form = document.createElement("form");
+  for (const [name, label, max] of quotaFields) {
+    const l = document.createElement("label");
+    l.textContent = `${label} `;
+    const input = document.createElement("input");
+    input.name = name; input.type = "number"; input.min = 0; input.max = max; input.value = u[name];
+    l.append(input); form.append(l);
+  }
+  const save = document.createElement("button");
+  save.textContent = "Save quotas";
+  form.append(save);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const submitter = event.submitter;
+    if (submitter) submitter.disabled = true;
+    try {
+      const body = {};
+      for (const [name] of quotaFields) body[name] = Number(form.elements.namedItem(name).value);
+      await api(`/admin/users/${u.id}`, { method: "PUT", body });
+      status("Quotas saved.");
+      await refresh();
+    } catch (error) { status(error.message); }
+    finally { if (submitter) submitter.disabled = false; }
+  });
+  return form;
+}
 async function refresh() {
   const assets = await api(`/assets?q=${encodeURIComponent($("query").value)}`);
   $("assets").replaceChildren(...assets.map(asset => {
-    const card = article(asset.name, `${asset.kind} · ${asset.id}\n${asset.description}`);
+    const card = article(`${asset.name}${asset.enabled ? "" : " (disabled)"}`, `${asset.kind} · ${asset.id}\n${asset.description}`);
     if (asset.kind === "world") {
       card.append(button("New public instance", () => grant({ world: asset.id })), button("New invite-only instance", () => grant({ world: asset.id, private: true })));
     }
+    if (me.user.admin) card.append(button(asset.enabled ? "Disable listing" : "Enable listing", async () => {
+      try { await api(`/admin/assets/${asset.id}/enabled`, { method: "POST", body: { enabled: !asset.enabled } }); }
+      catch (error) { status(error.message); } // A 404 means the asset is gone; the refresh below drops it.
+      await refresh();
+    }));
     if (asset.owner === me.user.id || me.user.admin) card.append(button("Delete", async () => { if (confirm(`Delete ${asset.name}? Running instances keep their version.`)) { await api(`/assets/${asset.id}`, { method: "DELETE" }); await refresh(); } }));
     return card;
   }));
   const instances = await api("/instances");
   $("instances").replaceChildren(...instances.map(i => {
-    const a = article(i.id, `${i.players}/${i.capacity} players · ${i.private ? "Invite-only" : "Public"}`);
+    const roster = i.roster || [];
+    const names = roster.slice(0, 12).map(p => p.name || p.id);
+    const extra = roster.length - names.length;
+    const a = article(i.id, `${i.players}/${i.capacity} players · ${i.private ? "Invite-only" : "Public"}${names.length ? ` · ${names.join(", ")}${extra > 0 ? ` +${extra} more` : ""}` : ""}`);
     a.append(button("Join", () => grant({ instance: i.id })), button("Invite user", async () => {
       const user = prompt("Discord ID to invite"); if (!user) return;
       const invite = await api(`/instances/${i.id}/invite`, { method: "POST", body: { user } });
@@ -74,12 +110,12 @@ async function refresh() {
     $("users").replaceChildren(...users.map(u => {
       const a = article(`${u.name || u.id} ${u.enabled ? "" : "(disabled)"}`, `${u.id}: ${u.world_slots} worlds / ${u.avatar_slots} avatars`);
       if (u.id !== "admin") a.append(button("Disable & revoke sessions", async () => { await api(`/admin/users/${u.id}`, { method: "DELETE" }); await refresh(); }));
-      a.append(button("Edit quotas", async () => {
-        const raw = prompt("Per-user quotas as JSON", JSON.stringify({world_slots:u.world_slots,avatar_slots:u.avatar_slots,world_bytes:u.world_bytes,avatar_bytes:u.avatar_bytes}));
-        if (raw) { await api(`/admin/users/${u.id}`, {method:"PUT",body:JSON.parse(raw)}); await refresh(); }
-      })); return a;
+      a.append(quotaForm(u)); return a;
     }));
-    $("health").textContent = JSON.stringify(await api("/admin/health"), null, 2);
+    const health = await api("/admin/health");
+    if (health.limits) $("limits").textContent = `Live-instance limits: ${health.limits.instances} instances · ${health.limits.instance_players} players per instance.`;
+    if (health.defaults) $("defaults").textContent = `New-account quotas: ${health.defaults.world_slots} world slots / ${health.defaults.world_bytes} bytes · ${health.defaults.avatar_slots} avatar slots / ${health.defaults.avatar_bytes} bytes.`;
+    $("health").textContent = JSON.stringify(health, null, 2);
   }
 }
 async function load() {

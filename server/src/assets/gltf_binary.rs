@@ -131,9 +131,18 @@ impl<R: Read> Checked<R> {
             if let Some(primitives) = mesh["primitives"].as_array() {
                 for primitive in primitives {
                     if let Some(reference) = primitive["indices"].as_u64() {
-                        let position =
-                            primitive["attributes"]["POSITION"].as_u64().unwrap() as usize;
-                        let count = accessors[position]["count"].as_u64().unwrap();
+                        // Defensive: gltf_scene::validate rejects documents without
+                        // these fields first, but streaming must never panic if
+                        // that ordering changes or a new caller skips it.
+                        let Some(position) = primitive["attributes"]["POSITION"].as_u64() else {
+                            continue;
+                        };
+                        let Some(count) = accessors
+                            .get(position as usize)
+                            .and_then(|accessor| accessor["count"].as_u64())
+                        else {
+                            continue;
+                        };
                         bounds
                             .entry(reference as usize)
                             .and_modify(|bound| *bound = (*bound).min(count))
@@ -145,11 +154,21 @@ impl<R: Read> Checked<R> {
         if let Some(nodes) = doc["nodes"].as_array() {
             for node in nodes {
                 if let (Some(mesh), Some(skin)) = (node["mesh"].as_u64(), node["skin"].as_u64()) {
-                    let joints = doc["skins"][skin as usize]["joints"]
+                    let Some(joints) = doc["skins"]
                         .as_array()
-                        .unwrap()
-                        .len() as u64;
-                    for primitive in meshes[mesh as usize]["primitives"].as_array().unwrap() {
+                        .and_then(|skins| skins.get(skin as usize))
+                        .and_then(|skin| skin["joints"].as_array())
+                    else {
+                        continue;
+                    };
+                    let joints = joints.len() as u64;
+                    let Some(primitives) = meshes
+                        .get(mesh as usize)
+                        .and_then(|mesh| mesh["primitives"].as_array())
+                    else {
+                        continue;
+                    };
+                    for primitive in primitives {
                         for name in ["JOINTS_0", "JOINTS_1"] {
                             if let Some(reference) = primitive["attributes"][name].as_u64() {
                                 bounds
@@ -166,7 +185,13 @@ impl<R: Read> Checked<R> {
         let mut time_slots = BTreeMap::new();
         let mut time_count = 0usize;
         for index in &times {
-            let count = accessors[*index]["count"].as_u64().unwrap() as usize;
+            let Some(count) = accessors
+                .get(*index)
+                .and_then(|accessor| accessor["count"].as_u64())
+            else {
+                return Err(ApiError::bad("GLB animation input accessor is missing"));
+            };
+            let count = count as usize;
             time_count = time_count
                 .checked_add(count)
                 .filter(|n| *n <= 262144)
@@ -181,13 +206,18 @@ impl<R: Read> Checked<R> {
         }
         let mut pending = Vec::new();
         for (index, accessor) in accessors.iter().enumerate() {
-            let component = accessor["componentType"].as_u64().unwrap();
+            let Some(component) = accessor["componentType"].as_u64() else {
+                return Err(ApiError::bad("GLB accessor is missing its component type"));
+            };
             let width: u64 = match component {
                 5120 | 5121 => 1,
                 5122 | 5123 => 2,
                 _ => 4,
             };
-            let (rows, columns) = match accessor["type"].as_str().unwrap() {
+            let Some(kind) = accessor["type"].as_str() else {
+                return Err(ApiError::bad("GLB accessor is missing its type"));
+            };
+            let (rows, columns) = match kind {
                 "SCALAR" => (1, 1),
                 "VEC2" => (2, 1),
                 "VEC3" => (3, 1),
@@ -195,7 +225,7 @@ impl<R: Read> Checked<R> {
                 "MAT2" => (2, 2),
                 "MAT3" => (3, 3),
                 "MAT4" => (4, 4),
-                _ => unreachable!(),
+                _ => return Err(ApiError::bad("GLB accessor has an unsupported type")),
             };
             let column = if columns > 1 {
                 (rows * width).div_ceil(4) * 4
@@ -210,7 +240,9 @@ impl<R: Read> Checked<R> {
             } else {
                 bounds.get(&index).copied().map(Rule::Index)
             };
-            let count = accessor["count"].as_u64().unwrap();
+            let Some(count) = accessor["count"].as_u64() else {
+                return Err(ApiError::bad("GLB accessor is missing its count"));
+            };
             if let Some(rule) = rule
                 && let Some(view) = accessor["bufferView"].as_u64()
             {
@@ -233,23 +265,33 @@ impl<R: Read> Checked<R> {
                 )?;
             }
             if let Some(sparse) = accessor.get("sparse") {
-                let count = sparse["count"].as_u64().unwrap();
+                let Some(count) = sparse["count"].as_u64() else {
+                    return Err(ApiError::bad("GLB sparse accessor is missing its count"));
+                };
                 let indices = &sparse["indices"];
-                let index_width = match indices["componentType"].as_u64().unwrap() {
+                let Some(index_component) = indices["componentType"].as_u64() else {
+                    return Err(ApiError::bad("GLB sparse indices lack a component type"));
+                };
+                let index_width = match index_component {
                     5121 => 1,
                     5123 => 2,
                     _ => 4,
                 };
-                let limit = accessor["count"].as_u64().unwrap();
+                let Some(limit) = accessor["count"].as_u64() else {
+                    return Err(ApiError::bad("GLB accessor is missing its count"));
+                };
                 let index_rule = if let Some(slot) = time_slots.get(&index) {
                     Rule::TimeIndex(*slot, limit)
                 } else {
                     Rule::SparseIndex(limit)
                 };
+                let Some(index_view) = indices["bufferView"].as_u64() else {
+                    return Err(ApiError::bad("GLB sparse indices lack a buffer view"));
+                };
                 add(
                     &mut pending,
                     doc,
-                    indices["bufferView"].as_u64().unwrap(),
+                    index_view,
                     indices
                         .get("byteOffset")
                         .and_then(Value::as_u64)
@@ -270,10 +312,13 @@ impl<R: Read> Checked<R> {
                     } else {
                         rule
                     };
+                    let Some(values_view) = values["bufferView"].as_u64() else {
+                        return Err(ApiError::bad("GLB sparse values lack a buffer view"));
+                    };
                     add(
                         &mut pending,
                         doc,
-                        values["bufferView"].as_u64().unwrap(),
+                        values_view,
                         values
                             .get("byteOffset")
                             .and_then(Value::as_u64)

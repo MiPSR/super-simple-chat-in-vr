@@ -65,9 +65,8 @@ pub fn ensure_admin_user(app: &App) -> ApiResult<()> {
     Ok(())
 }
 pub fn session_valid(app: &App, id: &str, session: &str) -> bool {
-    if id == "admin" && session == "admin" {
-        return true;
-    }
+    // Session digests are minted only by HTTP grant/login paths; there is no
+    // literal-credential bypass here on purpose.
     let db = app.db.lock().unwrap();
     db.query_row("SELECT EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.hash=? AND s.user_id=? AND s.expires>? AND u.enabled=1)", rusqlite::params![session,id,db::now()], |r| r.get(0)).unwrap_or(false)
 }

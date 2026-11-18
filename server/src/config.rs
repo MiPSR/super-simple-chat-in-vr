@@ -21,6 +21,12 @@ pub struct Config {
     pub radio_filter_hz: f32,
     pub radio_ft8_interval: u64,
     pub radio_sstv_interval: u64,
+    pub instance_limit: usize,
+    pub instance_players: usize,
+    pub default_world_slots: u32,
+    pub default_avatar_slots: u32,
+    pub default_world_bytes: u64,
+    pub default_avatar_bytes: u64,
 }
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
@@ -60,6 +66,12 @@ impl Config {
             radio_filter_hz: get("SSC_RADIO_FILTER_HZ", "1500").parse()?,
             radio_ft8_interval: get("SSC_RADIO_FT8_INTERVAL", "2").parse()?,
             radio_sstv_interval: get("SSC_RADIO_SSTV_INTERVAL", "30").parse()?,
+            instance_limit: get("SSC_INSTANCE_LIMIT", "64").parse()?,
+            instance_players: get("SSC_INSTANCE_PLAYERS", "64").parse()?,
+            default_world_slots: get("SSC_DEFAULT_WORLD_SLOTS", "4").parse()?,
+            default_avatar_slots: get("SSC_DEFAULT_AVATAR_SLOTS", "8").parse()?,
+            default_world_bytes: get("SSC_DEFAULT_WORLD_BYTES", "1000000000").parse()?,
+            default_avatar_bytes: get("SSC_DEFAULT_AVATAR_BYTES", "100000000").parse()?,
         };
         anyhow::ensure!(config.admin_token.len() >= 32, "admin secret too short");
         anyhow::ensure!(
@@ -95,6 +107,21 @@ impl Config {
             "Audio effect ceiling must be 0..1"
         );
         anyhow::ensure!((1..=120).contains(&config.tps), "TPS must be 1..120");
+        anyhow::ensure!(
+            (1..=512).contains(&config.instance_limit),
+            "Instance limit must be 1..512"
+        );
+        anyhow::ensure!(
+            (1..=128).contains(&config.instance_players),
+            "Instance player cap must be 1..128"
+        );
+        anyhow::ensure!(
+            (1..=1000).contains(&config.default_world_slots)
+                && (1..=1000).contains(&config.default_avatar_slots)
+                && config.default_world_bytes <= 1_000_000_000
+                && config.default_avatar_bytes <= 1_000_000_000,
+            "Default slot/byte quotas exceed the process ceilings"
+        );
         config.network_rates.validate(config.tps)?;
         anyhow::ensure!(
             (8000..=64000).contains(&config.voice_bitrate),

@@ -33,6 +33,7 @@ func _run() -> void:
 	preload("res://tests/cache.gd").run()
 	preload("res://tests/contacts.gd").run()
 	preload("res://tests/textures.gd").run()
+	await preload("res://tests/people_blocks.gd").run()
 	assert(Settings.upscalers("mobile", false) == ["bilinear"])
 	assert(Settings.upscalers("forward_plus", true) == ["bilinear"])
 	assert(Settings.upscalers("forward_plus", false) == ["bilinear", "fsr1"])
@@ -56,12 +57,21 @@ func _run() -> void:
 	preferences.draw_distance = 80.0
 	panel.configure(preferences)
 	assert(is_equal_approx(panel.controls.draw_distance.value,80.0))
-	assert(not panel.controls.has("can_touch_me"))
+	assert(panel.controls.can_touch_me is CheckButton and panel.controls.can_touch_others is CheckButton)
+	assert(panel.controls.can_touch_me.button_pressed and not panel.controls.can_touch_others.button_pressed)
+	assert(panel.controls.snap_turn.button_pressed)
+	assert(panel.controls.turn_angle.get_item_metadata(panel.controls.turn_angle.selected) == 30)
+	assert(is_equal_approx(float(panel.controls.move_speed.value), 1.5))
+	assert(panel.controls.move_hand.get_item_metadata(panel.controls.move_hand.selected) == "right")
+	assert(panel.controls.sleep_pose.get_item_metadata(panel.controls.sleep_pose.selected) == "flat")
+	assert(panel.controls.upscaler.item_count == 1, "Mobile renderer must hide the fsr1 upscaler option")
 	assert(panel.controls.quality.get_item_metadata(panel.controls.quality.selected) == 2)
 	assert(panel.controls.radial_action_0.get_item_metadata(panel.controls.radial_action_0.selected) == "microphone")
 	assert(is_equal_approx(panel.controls.radial_hold_seconds.value, 0.45))
 	var edited := {"value":{}}
 	panel.changed.connect(func(updates: Dictionary): edited.value = updates)
+	panel.controls.can_touch_others.set_pressed_no_signal(true)
+	panel.controls.turn_angle.select(0)
 	panel.controls.radial_action_0.select(panel.controls.radial_action_0.item_count - 1)
 	panel.controls.radial_hold_seconds.value = 0.7
 	for child in panel.get_children():
@@ -69,6 +79,9 @@ func _run() -> void:
 			child.pressed.emit()
 	assert(edited.value.radial_actions.size() == 8 and edited.value.radial_actions[0] == "none")
 	assert(not edited.value.has("radial_action_0") and is_equal_approx(float(edited.value.radial_hold_seconds), 0.7))
+	assert(edited.value.can_touch_me and edited.value.can_touch_others and edited.value.turn_angle == 15)
+	assert(edited.value.snap_turn and edited.value.move_hand == "right" and edited.value.sleep_pose == "flat")
+	assert(is_equal_approx(float(edited.value.move_speed), 1.5))
 	var notices := Settings.apply_local(preferences, viewport, voice, radio,camera)
 	assert(is_equal_approx(camera.far,80.0))
 	preferences.draw_distance = 5000.0

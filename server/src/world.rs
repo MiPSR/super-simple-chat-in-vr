@@ -203,6 +203,7 @@ pub struct Instance {
     pub capacity: usize,
     pub players: BTreeMap<String, Player>,
     pub entities: BTreeMap<String, Entity>,
+    pub visual: BTreeMap<String, Visual>,
     tag_bytes: usize,
     pub variables: Arc<Mutex<BTreeMap<String, Value>>>,
     pub revision: u64,
@@ -236,6 +237,40 @@ pub struct Interaction {
     pub segment: String,
     pub hand: u8,
 }
+/// Server-authoritative visual overrides replicated through the snapshot so
+/// late joiners observe the same lights/tint/animation state as everyone else.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Visual {
+    pub tint: Option<[f32; 3]>,
+    pub light: Option<[f32; 4]>,
+    pub animation: Option<String>,
+    pub animation_playing: Option<bool>,
+}
+impl Visual {
+    pub fn valid(&self) -> bool {
+        self.tint.is_none_or(|c| {
+            c.iter()
+                .all(|v| v.is_finite() && (0.0..=2.0).contains(v))
+        }) && self.light.is_none_or(|l| {
+            l[..3]
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                && l[3].is_finite()
+                && (0.0..=100.0).contains(&l[3])
+        }) && self
+            .animation
+            .as_deref()
+            .is_none_or(|a| !a.is_empty() && a.len() <= 64)
+    }
+    pub fn cleared(&self) -> bool {
+        self.tint.is_none()
+            && self.light.is_none()
+            && self.animation.is_none()
+            && self.animation_playing.is_none()
+    }
+}
+pub const MAX_VISUAL_OVERRIDES: usize = 256;
 pub struct Sandbox {
     serial: u64,
     lua: Lua,
@@ -454,14 +489,16 @@ impl Instance {
         self.last_script_diagnostic = Some(Instant::now());
         self.suppressed_script_diagnostics = 0;
     }
+    #[allow(clippy::too_many_arguments)]
     fn create(
         id: String,
         join: &Join,
         version: String,
         owner: String,
         manifest: Manifest,
-        sources: Vec<String>,
+        sources: Vec<(String, String)>,
         tps: u32,
+        player_cap: usize,
     ) -> anyhow::Result<Self> {
         let mut instance = Self {
             id,
@@ -469,9 +506,10 @@ impl Instance {
             version,
             owner,
             private: join.private,
-            capacity: manifest.capacity,
+            capacity: manifest.capacity.min(player_cap),
             players: BTreeMap::new(),
             entities: BTreeMap::new(),
+            visual: BTreeMap::new(),
             tag_bytes: 0,
             variables: Arc::new(Mutex::new(
                 manifest
@@ -588,15 +626,20 @@ impl Instance {
             );
         }
         instance.refresh_context();
-        for (source, decl) in sources.iter().zip(
-            instance
+        // Scripts are matched to their manifest declarations by path, not by
+        // positional zip order, so filtering on either side cannot silently
+        // swap capabilities or attachments.
+        for (path, source) in sources {
+            let Some(decl) = instance
                 .manifest
                 .scripts
                 .iter()
-                .filter(|s| s.side == "server"),
-        ) {
+                .find(|s| s.path == path && s.side == "server")
+            else {
+                continue;
+            };
             match Sandbox::with_context(
-                source,
+                &source,
                 instance.variables.clone(),
                 &decl.capabilities,
                 instance.context.clone(),
@@ -614,10 +657,16 @@ impl Instance {
         Ok(instance)
     }
     fn refresh_context(&self) {
-        self.context.lock().unwrap().objects = self
+        let mut context = self.context.lock().unwrap();
+        context.objects = self
             .entities
             .iter()
             .map(|(id, e)| (id.clone(), serde_json::to_value(e).unwrap()))
+            .collect();
+        context.visual = self
+            .visual
+            .iter()
+            .map(|(id, v)| (id.clone(), serde_json::to_value(v).unwrap()))
             .collect();
     }
     pub(crate) fn dispatch(&mut self, event: &str, value: Value) {
@@ -779,6 +828,24 @@ impl Instance {
                             self.revision += 1;
                         }
                     }
+                    Command::Visual(id, visual) => {
+                        // Validated again here: commands can reach apply_commands
+                        // from sources other than the enqueue path.
+                        anyhow::ensure!(visual.valid(), "Invalid visual override");
+                        if self.entities.contains_key(&id) {
+                            if visual.cleared() {
+                                self.visual.remove(&id);
+                            } else {
+                                anyhow::ensure!(
+                                    self.visual.len() < MAX_VISUAL_OVERRIDES
+                                        || self.visual.contains_key(&id),
+                                    "Visual override budget exhausted"
+                                );
+                                self.visual.insert(id, visual);
+                            }
+                            self.revision += 1;
+                        }
+                    }
                     Command::Move(id, position) => {
                         if let Some(e) = self.entities.get_mut(&id) {
                             anyhow::ensure!(
@@ -883,7 +950,28 @@ impl Instance {
             .ok_or_else(|| anyhow::anyhow!("Prefab is not packaged"))?;
         let spec = prefab_def.physics.clone();
         let mut tags = prefab_def.tags.clone();
+        if let Some(extra) = &options.tags {
+            // Spawn customization is limited to the packaged tag vocabulary so
+            // scripts cannot use spawn options to bypass the live tag budget.
+            let packaged = |tag: &str| {
+                self.manifest
+                    .prefabs
+                    .values()
+                    .any(|p| p.tags.iter().any(|t| t == tag))
+                    || self
+                        .manifest
+                        .objects
+                        .iter()
+                        .any(|o| o.tags.iter().any(|t| t == tag))
+            };
+            anyhow::ensure!(
+                extra.iter().all(|tag| !tag.is_empty() && tag.len() <= 32 && packaged(tag)),
+                "Spawn tags must be packaged tags"
+            );
+            tags.extend(extra.iter().cloned());
+        }
         tags.sort();
+        tags.dedup();
         let tag_bytes = crate::assets::tag_bytes(&tags);
         anyhow::ensure!(
             self.tag_bytes + tag_bytes <= crate::assets::MAX_ENTITY_TAG_BYTES,
@@ -1360,13 +1448,19 @@ impl Instance {
                         position,
                         velocity,
                         owner: Some(user.into()),
+                        tags: None,
                     },
                 )?;
             }
         }
         Ok(())
     }
+#[cfg(test)]
     fn tick(&mut self) {
+        // Direct callers (tests, tooling) step physics without a shared cap.
+        self.tick_budgeted(Instant::now() + Duration::from_secs(3600));
+    }
+    fn tick_budgeted(&mut self, physics_until: Instant) {
         self.clock += 1;
         let expired: Vec<_> = self
             .entities
@@ -1398,7 +1492,14 @@ impl Instance {
                 }
             }
         }
-        let contacts = self.scene.step(1.0 / self.tps as f32);
+        // The authoritative tick stays responsive even if one pathological
+        // instance exhausts the shared physics budget: remaining instances
+        // freeze their bodies for a tick instead of stalling every player.
+        let contacts = if Instant::now() >= physics_until {
+            Vec::new()
+        } else {
+            self.scene.step(1.0 / self.tps as f32)
+        };
         for (id, entity) in &mut self.entities {
             if let Some((position, rotation)) = self.scene.transform(id) {
                 if entity.position != position || entity.rotation != rotation {
@@ -1470,7 +1571,7 @@ impl Instance {
             .iter()
             .map(|(id, session)| (id, session.snapshot()))
             .collect();
-        json!({"instance":self.id,"world":self.world,"version":self.version,"revision":self.revision,"tick":tick,"players":self.players,"entities":self.entities,"variables":*self.variables.lock().unwrap(),"manifest":self.manifest,"scores":self.scores,"clock":self.clock,"interactions":self.interactions,"media":media})
+        json!({"instance":self.id,"world":self.world,"version":self.version,"revision":self.revision,"tick":tick,"players":self.players,"entities":self.entities,"visual":self.visual,"variables":*self.variables.lock().unwrap(),"manifest":self.manifest,"scores":self.scores,"clock":self.clock,"interactions":self.interactions,"media":media})
     }
     pub fn media_command(&mut self, actor: &str, request: media::Request) -> anyhow::Result<()> {
         let surface = self
@@ -1562,6 +1663,8 @@ pub struct Registry {
     pub instances: BTreeMap<String, Instance>,
     pub tick: u64,
     pub tps: u32,
+    instance_limit: usize,
+    player_cap: usize,
     scheduled_scripts: bool,
     script_cursor: usize,
     avatar_changes: BTreeMap<String, Instant>,
@@ -1572,6 +1675,8 @@ impl Default for Registry {
             instances: BTreeMap::new(),
             tick: 0,
             tps: 60,
+            instance_limit: 64,
+            player_cap: 64,
             scheduled_scripts: false,
             script_cursor: 0,
             avatar_changes: BTreeMap::new(),
@@ -1579,9 +1684,11 @@ impl Default for Registry {
     }
 }
 impl Registry {
-    pub fn with_tps(tps: u32) -> Self {
+    pub fn with_limits(tps: u32, instance_limit: usize, player_cap: usize) -> Self {
         Self {
             tps,
+            instance_limit,
+            player_cap,
             ..Self::default()
         }
     }
@@ -1639,7 +1746,7 @@ impl Registry {
         name: &str,
         version: &str,
         manifest: Manifest,
-        sources: Vec<String>,
+        sources: Vec<(String, String)>,
     ) -> anyhow::Result<String> {
         anyhow::ensure!(
             [1, 2, 4].contains(&join.send_divisor) && [1, 2, 4].contains(&join.receive_divisor),
@@ -1675,7 +1782,7 @@ impl Registry {
                 })
                 .count();
             anyhow::ensure!(
-                self.instances.len().saturating_sub(vacated) < 64,
+                self.instances.len().saturating_sub(vacated) < self.instance_limit,
                 "Instance limit reached"
             );
             let id = loop {
@@ -1692,6 +1799,7 @@ impl Registry {
                 manifest,
                 sources,
                 self.tps,
+                self.player_cap,
             )?;
             instance.scheduled_scripts = self.scheduled_scripts;
             Some((id, instance))
@@ -1787,8 +1895,11 @@ impl Registry {
     }
     pub fn step(&mut self) {
         self.tick += 1;
+        // Shared per-tick physics budget: a pathological instance cannot stall
+        // the authoritative loop beyond this wall-clock allowance.
+        let physics_until = Instant::now() + Duration::from_millis(8);
         for instance in self.instances.values_mut() {
-            instance.tick();
+            instance.tick_budgeted(physics_until);
         }
         if self.scheduled_scripts {
             self.advance_scripts(
@@ -1854,7 +1965,8 @@ impl Registry {
         }
     }
     pub fn list(&self, user: &str) -> Value {
-        json!(self.instances.values().filter(|i|!i.private || i.owner==user || i.players.contains_key(user)).map(|i|json!({"id":i.id,"world":i.world,"version":i.version,"players":i.players.len(),"capacity":i.capacity,"private":i.private})).collect::<Vec<_>>())
+        json!(self.instances.values().filter(|i|!i.private || i.owner==user || i.players.contains_key(user)).map(|i|json!({"id":i.id,"world":i.world,"version":i.version,"players":i.players.len(),"capacity":i.capacity,"private":i.private,
+            "roster":i.players.values().map(|p|json!({"id":p.id,"name":p.name})).collect::<Vec<_>>()})).collect::<Vec<_>>())
     }
 }
 
@@ -2180,11 +2292,11 @@ mod tests {
                 "A",
                 "hash",
                 definition.clone(),
-                vec![source.into()],
+                vec![("script.luau".into(), source.into())],
             )
             .unwrap();
         let second = registry
-            .admit(&join, "b", "B", "hash", definition, vec![source.into()])
+            .admit(&join, "b", "B", "hash", definition, vec![("script.luau".into(), source.into())])
             .unwrap();
         assert_eq!(
             registry.instances[&first].variables.lock().unwrap()["joined"],
@@ -2296,7 +2408,7 @@ mod tests {
             {"path":"two.luau","side":"server","attachment":"world","capabilities":[]}
         ]))
         .unwrap();
-        let sources = vec!["world.after(600,function() end)".into(); 2];
+        let sources = vec![("one.luau".into(), "world.after(600,function() end)".into()), ("two.luau".into(), "world.after(600,function() end)".into())];
         assert!(
             registry
                 .admit(&join, "a", "A", "new", definition.clone(), sources.clone())
@@ -2328,11 +2440,13 @@ mod tests {
             "v".into(),
             "a".into(),
             definition,
-            vec![
+            vec![(
+                "one.luau".into(),
                 "world.after(600,function() end); world.on('tick',function() error('broken') end)"
                     .into(),
-            ],
+            )],
             60,
+            64,
         )
         .unwrap();
         assert_eq!(instance.scripts.len(), 1);
@@ -2552,7 +2666,7 @@ mod tests {
                 "A",
                 "v",
                 definition.clone(),
-                vec![source.into()],
+                vec![("events.luau".into(), source.into())],
             )
             .unwrap();
         let existing = Join {
@@ -2852,6 +2966,7 @@ mod tests {
             definition,
             vec![],
             60,
+            64,
         )
         .unwrap();
         assert_eq!(
@@ -2894,6 +3009,7 @@ mod tests {
             definition,
             vec![],
             60,
+            64,
         )
         .unwrap();
         let count = crate::assets::MAX_ENTITY_TAG_BYTES / cost;
@@ -2949,7 +3065,7 @@ mod tests {
                 "A",
                 "hash",
                 definition.clone(),
-                vec![source.into()],
+                vec![("events.luau".into(), source.into())],
             )
             .unwrap();
         registry
@@ -3130,8 +3246,9 @@ mod tests {
             "hash".into(),
             "owner".into(),
             definition,
-            vec![script.into()],
+            vec![("events.luau".into(), script.into())],
             60,
+            64,
         )
         .unwrap();
         instance.damage("prop", 1.0, None);
@@ -3209,7 +3326,7 @@ mod tests {
                 "A",
                 "hash",
                 definition.clone(),
-                vec![source.into()],
+                vec![("release.luau".into(), source.into())],
             )
             .unwrap();
         registry
@@ -3394,8 +3511,9 @@ mod tests {
             "version".into(),
             "owner".into(),
             definition,
-            vec!["world.after(0.1, function() world.state.set('on', true) end)".into()],
+            vec![("script.luau".into(), "world.after(0.1, function() world.state.set('on', true) end)".into())],
             60,
+            64,
         )
         .unwrap();
         instance.dispatch("tick", json!({"dt":0.1}));
@@ -3436,7 +3554,7 @@ mod tests {
             serde_json::from_value(json!([{"id":"bell","path":"audio/bell.opus"}])).unwrap();
         definition.scripts = serde_json::from_value(json!([{"path":"script.luau","side":"server","attachment":"world","capabilities":["audio"]}])).unwrap();
         let mut instance = Instance::create("test".into(), &Join {world:"world".into(), ..Join::default()}, "version".into(), "owner".into(), definition,
-            vec!["world.play_sound('bell'); world.seek_sound('bell', 0.1); world.stop_sound('bell'); world.play_sound('missing')".into()], 60).unwrap();
+            vec![("script.luau".into(), "world.play_sound('bell'); world.seek_sound('bell', 0.1); world.stop_sound('bell'); world.play_sound('missing')".into())], 60, 64).unwrap();
         let actions: Vec<_> = instance
             .events
             .iter()
@@ -3472,8 +3590,9 @@ mod tests {
             "version".into(),
             "owner".into(),
             definition,
-            vec![source.into()],
+            vec![("media.luau".into(), source.into())],
             60,
+            64,
         )
         .unwrap();
         assert_eq!(instance.media.len(), 1);
@@ -3608,5 +3727,103 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+    #[test]
+    fn visual_overrides_are_validated_replicated_and_clearable() {
+        let mut instance = Instance::create(
+            "visual".into(),
+            &Join::default(),
+            "hash".into(),
+            "owner".into(),
+            manifest(),
+            vec![],
+            60,
+            64,
+        )
+        .unwrap();
+        instance.entities.insert(
+            "lamp".into(),
+            Entity {
+                attached_to: None,
+                attachment_offset: [0.0; 3],
+                last_motion: 0,
+                _slot: EntitySlot::reserve().unwrap(),
+                id: "lamp".into(),
+                component: "static".into(),
+                tags: Vec::new(),
+                position: [0.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                size: [0.25; 3],
+                prefab: None,
+                health: 0.0,
+                visible: true,
+                active: false,
+                controller: None,
+                owner: None,
+                spec: None,
+                lease_until: 0,
+                held_hand: None,
+                controls: [0.0; 2],
+                last_control: 0,
+                last_fire: None,
+                expires: None,
+            },
+        );
+        let context = instance.context.clone();
+        {
+            let mut c = context.lock().unwrap();
+            c.commands.push(Command::Visual(
+                "lamp".into(),
+                Visual {
+                    tint: Some([1.0, 0.5, 0.5]),
+                    light: Some([1.0, 1.0, 1.0, 3.0]),
+                    animation: Some("wave".into()),
+                    animation_playing: Some(true),
+                },
+            ));
+            // Unknown entities and invalid values are rejected, not stored.
+            c.commands.push(Command::Visual(
+                "missing".into(),
+                Visual {
+                    tint: Some([1.0, 0.5, 0.5]),
+                    ..Default::default()
+                },
+            ));
+            c.commands.push(Command::Visual(
+                "lamp".into(),
+                Visual {
+                    tint: Some([9.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+            ));
+        }
+        instance.apply_commands();
+        assert!(instance.visual.contains_key("lamp"));
+        assert!(!instance.visual.contains_key("missing"));
+        assert!(instance.visual.len() == 1);
+        let snapshot = instance.snapshot(0);
+        assert_eq!(snapshot["visual"]["lamp"]["tint"], json!([1.0, 0.5, 0.5]));
+        assert_eq!(snapshot["visual"]["lamp"]["light"], json!([1.0, 1.0, 1.0, 3.0]));
+        assert_eq!(snapshot["visual"]["lamp"]["animation"], json!("wave"));
+        assert_eq!(snapshot["visual"]["lamp"]["animation_playing"], true);
+        // The mirrored context keeps world.get_visual consistent; it refreshes
+        // on the next dispatch/interact, as in the live dispatch path.
+        instance.refresh_context();
+        assert_eq!(
+            context.lock().unwrap().visual["lamp"]["animation"],
+            json!("wave")
+        );
+        {
+            let mut c = context.lock().unwrap();
+            c.commands.push(Command::Visual("lamp".into(), Visual::default()));
+        }
+        instance.apply_commands();
+        assert!(instance.visual.is_empty());
+        assert!(
+            !instance.snapshot(0)["visual"]
+                .as_object()
+                .unwrap()
+                .contains_key("lamp")
+        );
     }
 }

@@ -42,7 +42,11 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Recovered {stale_uploads} abandoned uploads ({stale_bytes} bytes)");
     }
     let db = db::open(&config.data.join("platform.sqlite"))?;
-    let worlds = world::Registry::with_tps(config.tps);
+    let worlds = world::Registry::with_limits(
+        config.tps,
+        config.instance_limit,
+        config.instance_players,
+    );
     let app = Arc::new(App {
         asset_gate: Arc::new(tokio::sync::Mutex::new(())),
         uploads: Arc::new(uploads::Budget::default()),

@@ -22,6 +22,9 @@ impl ApiError {
     pub fn unauthorized() -> Self {
         Self(StatusCode::UNAUTHORIZED, "Authentication required".into())
     }
+    pub fn not_found(s: impl Into<String>) -> Self {
+        Self(StatusCode::NOT_FOUND, s.into())
+    }
     pub fn internal(e: impl std::fmt::Display) -> Self {
         eprintln!("Request error: {e}");
         Self(
@@ -74,6 +77,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/me", get(me))
         .route("/api/v1/preferences", put(preferences))
+        .route("/api/v1/blocks", get(my_blocks))
         .route("/api/v1/blocks/{target}", put(block))
         .route("/api/v1/assets", get(catalog).post(upload))
         .route("/api/v1/assets/{id}", delete(remove_asset))
@@ -88,6 +92,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/assets/gc", post(collect_assets))
+        .route("/api/v1/admin/assets/{id}/enabled", post(set_asset_enabled))
         .layer(DefaultBodyLimit::max(
             (crate::uploads::MAX_PACKAGE_BYTES + 100_000) as usize,
         ))
@@ -187,12 +192,28 @@ async fn preferences(
         "UPDATE users SET preferences=? WHERE id=?",
         rusqlite::params![serde_json::to_string(&p).unwrap(), who.id],
     )?;
+    db::bump_policy_epoch();
     app.worlds.lock().unwrap().settings_changed(&who.id);
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
 struct Flags {
     flags: u32,
+}
+async fn my_blocks(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let who = auth::identity(&app, &headers)?;
+    let db = app.db.lock().unwrap();
+    let blocks: Vec<Value> = db::my_blocks(&db, &who.id)
+        .into_iter()
+        .map(|(target, flags)| {
+            json!({"target":target,"flags":flags,"voice":flags & 1 != 0,"text":flags & 2 != 0,
+                "touch":flags & 4 != 0,"avatar":flags & 8 != 0,"complete":flags & 16 != 0})
+        })
+        .collect();
+    Ok(Json(json!({"blocks":blocks})))
 }
 async fn block(
     State(app): State<Arc<App>>,
@@ -204,7 +225,19 @@ async fn block(
     if f.flags > 31 || target == who.id {
         return Err(ApiError::bad("Invalid block flags/target"));
     }
+    let exists: bool = app
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?)", [&target], |r| {
+            r.get(0)
+        })
+        .map_err(|_| ApiError::not_found("Unknown block target"))?;
+    if !exists {
+        return Err(ApiError::not_found("Unknown block target"));
+    }
     app.db.lock().unwrap().execute("INSERT INTO blocks VALUES(?,?,?) ON CONFLICT(owner,target) DO UPDATE SET flags=excluded.flags",rusqlite::params![who.id,target,f.flags])?;
+    db::bump_policy_epoch();
     let mut worlds = app.worlds.lock().unwrap();
     worlds.settings_changed(&who.id);
     worlds.settings_changed(&target);
@@ -224,8 +257,20 @@ async fn catalog(
 ) -> ApiResult<Json<Value>> {
     let who = auth::identity(&app, &headers)?;
     let db = app.db.lock().unwrap();
-    let mut stmt=db.prepare("SELECT id,owner,kind,name,description,version,enabled FROM assets WHERE (enabled=1 OR ?1) AND (kind='world' OR owner=?2 OR ?1) AND (?3='' OR kind=?3) AND instr(lower(name || ' ' || description),lower(?4))>0 ORDER BY created DESC LIMIT 200")?;
-    let rows=stmt.query_map(rusqlite::params![who.admin,who.id,q.kind,q.q],|r|Ok(json!({"id":r.get::<_,String>(0)?,"owner":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"name":r.get::<_,String>(3)?,"description":r.get::<_,String>(4)?,"version":r.get::<_,String>(5)?,"enabled":r.get::<_,bool>(6)?})))?.collect::<Result<Vec<_>,_>>()?;
+    let mut stmt=db.prepare("SELECT a.id,a.owner,a.kind,a.name,a.description,a.version,a.enabled,v.manifest FROM assets a LEFT JOIN asset_versions v ON a.version=v.hash WHERE (a.enabled=1 OR ?1) AND (a.kind='world' OR a.owner=?2 OR ?1) AND (?3='' OR a.kind=?3) AND instr(lower(a.name || ' ' || a.description),lower(?4))>0 ORDER BY a.created DESC LIMIT 200")?;
+    let rows=stmt.query_map(rusqlite::params![who.admin,who.id,q.kind,q.q],|r| {
+        let kind:String=r.get(2)?;
+        let manifest:Option<String>=r.get(7)?;
+        // Avatar rows expose their declared actions so clients can offer a
+        // picker instead of a free-text action field.
+        let actions:Vec<String>=if kind=="avatar" {
+            manifest.as_deref().and_then(|text| serde_json::from_str::<assets::Manifest>(text).ok())
+                .map(|m| m.actions.clone()).unwrap_or_default()
+        } else { Vec::new() };
+        let mut row=json!({"id":r.get::<_,String>(0)?,"owner":r.get::<_,String>(1)?,"kind":kind,"name":r.get::<_,String>(3)?,"description":r.get::<_,String>(4)?,"version":r.get::<_,String>(5)?,"enabled":r.get::<_,bool>(6)?});
+        if !actions.is_empty() { row["actions"]=json!(actions); }
+        Ok(row)
+    })?.collect::<Result<Vec<_>,_>>()?;
     Ok(Json(json!(rows)))
 }
 #[derive(Deserialize)]
@@ -461,7 +506,18 @@ async fn game_grant(
         return Err(ApiError::bad("Invalid network rate"));
     }
     let (world, version, manifest) = if join.instance.is_empty() {
-        let (version,manifest):(String,String)=app.db.lock().unwrap().query_row("SELECT a.version,v.manifest FROM assets a JOIN asset_versions v ON a.version=v.hash WHERE a.id=? AND a.kind='world' AND a.enabled=1",[&join.world],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        use rusqlite::OptionalExtension;
+        let found: Option<(String, String)> = {
+            let db = app.db.lock().unwrap();
+            db.query_row(
+                "SELECT a.version,v.manifest FROM assets a JOIN asset_versions v ON a.version=v.hash WHERE a.id=? AND a.kind='world' AND a.enabled=1",
+                [&join.world],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        let (version, manifest) =
+            found.ok_or_else(|| ApiError::bad("World not found or disabled"))?;
         (join.world.clone(), version, manifest)
     } else {
         let worlds = app.worlds.lock().unwrap();
@@ -494,7 +550,7 @@ async fn game_grant(
             .take(65537)
             .read_to_string(&mut text)
             .map_err(ApiError::internal)?;
-        sources.push(text);
+        sources.push((s.path.clone(), text));
     }
     let name =
         app.db
@@ -507,10 +563,16 @@ async fn game_grant(
     let secret = db::token();
     let game_token = db::token();
     let game_session = db::digest(&game_token);
-    app.db.lock().unwrap().execute(
-        "INSERT INTO sessions VALUES(?,?,?)",
-        rusqlite::params![game_session, who.id, db::now() + 86400],
-    )?;
+    {
+        let db = app.db.lock().unwrap();
+        // Expired web/game sessions accumulate without a sweep; grants are the
+        // natural bounded place to retire them.
+        db.execute("DELETE FROM sessions WHERE expires<=?", [db::now()])?;
+        db.execute(
+            "INSERT INTO sessions VALUES(?,?,?)",
+            rusqlite::params![game_session, who.id, db::now() + 86400],
+        )?;
+    }
     let mut grants = app.grants.lock().unwrap();
     grants.retain(|_, g| g.expires > db::now());
     if grants.len() >= 256 {
@@ -531,7 +593,7 @@ async fn game_grant(
         },
     );
     Ok(Json(
-        json!({"ticket":ticket,"secret":secret,"api_token":game_token,"api_url":app.config.public_url,"user":who.id,"expires_in":60,"port":app.config.enet.port(),"protocol":1,"tps":app.config.tps}),
+        json!({"ticket":ticket,"secret":secret,"api_token":game_token,"api_url":app.config.public_url,"user":who.id,"expires_in":60,"port":app.config.enet.port(),"protocol":2,"tps":app.config.tps}),
     ))
 }
 #[derive(Deserialize)]
@@ -548,8 +610,14 @@ async fn allow_user(
         return Err(ApiError::bad("Expected a Discord snowflake ID"));
     }
     app.db.lock().unwrap().execute(
-        "INSERT INTO users(id) VALUES(?) ON CONFLICT(id) DO UPDATE SET enabled=1",
-        [q.id],
+        "INSERT INTO users(id,world_slots,avatar_slots,world_bytes,avatar_bytes) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=1",
+        rusqlite::params![
+            q.id,
+            app.config.default_world_slots,
+            app.config.default_avatar_slots,
+            app.config.default_world_bytes as i64,
+            app.config.default_avatar_bytes as i64
+        ],
     )?;
     Ok(Json(json!({"ok":true})))
 }
@@ -571,6 +639,10 @@ async fn revoke_user(
     let db = app.db.lock().unwrap();
     db.execute("UPDATE users SET enabled=0 WHERE id=?", [&id])?;
     db.execute("DELETE FROM sessions WHERE user_id=?", [id])?;
+    drop(db);
+    // Suspended users lose live connections on the next authoritative tick,
+    // not after a cache TTL.
+    db::bump_policy_epoch();
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -604,14 +676,47 @@ async fn update_user(
             id
         ],
     )?;
+    let changed = app
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT changes()", [], |r| r.get::<_, i64>(0))?;
+    if changed == 0 {
+        return Err(ApiError::not_found("Unknown user"));
+    }
     Ok(Json(json!({"ok":true})))
 }
 async fn admin_health(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     auth::admin(&app, &headers)?;
     let w = app.worlds.lock().unwrap();
     Ok(Json(
-        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage(),"realtime_output":realtime::output_usage()}),
+        json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage(),"realtime_output":realtime::output_usage(),
+            "limits":{"instances":app.config.instance_limit,"instance_players":app.config.instance_players},
+            "defaults":{"world_slots":app.config.default_world_slots,"avatar_slots":app.config.default_avatar_slots,"world_bytes":app.config.default_world_bytes,"avatar_bytes":app.config.default_avatar_bytes}}),
     ))
+}
+
+#[derive(Deserialize)]
+struct Enabled {
+    enabled: bool,
+}
+async fn set_asset_enabled(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(q): Json<Enabled>,
+) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    let db = app.db.lock().unwrap();
+    db.execute(
+        "UPDATE assets SET enabled=? WHERE id=?",
+        rusqlite::params![q.enabled, id],
+    )?;
+    let changed = db.query_row("SELECT changes()", [], |r| r.get::<_, i64>(0))?;
+    if changed == 0 {
+        return Err(ApiError::not_found("Unknown asset"));
+    }
+    Ok(Json(json!({"ok":true,"enabled":q.enabled})))
 }
 
 async fn collect_assets(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {

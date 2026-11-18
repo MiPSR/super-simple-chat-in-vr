@@ -1,7 +1,6 @@
 use crate::{
     App,
     assets::{Contact, Manifest},
-    db,
     world::{Instance, Interaction},
 };
 use serde::Deserialize;
@@ -24,13 +23,9 @@ fn touch() -> String {
 fn head() -> String {
     "head".into()
 }
-fn allowed(db: &rusqlite::Connection, actor: &str, target: &str) -> bool {
-    db::preferences(db, actor).can_touch_others
-        && db::preferences(db, target).can_touch_me
-        && !db::blocked(db, actor, target, 4)
-}
 pub fn apply(
     app: &App,
+    cache: &mut super::DbCache,
     instance: &mut Instance,
     actor: &str,
     request: Request,
@@ -59,9 +54,8 @@ pub fn apply(
         matches!(request.action.as_str(), "touch" | "grab"),
         "Unknown contact action"
     );
-    let db = app.db.lock().unwrap();
     anyhow::ensure!(
-        allowed(&db, actor, &request.target),
+        cache.touch_allowed(app, actor, &request.target),
         "Contact permissions denied"
     );
     let target = instance
@@ -90,11 +84,15 @@ pub fn apply(
             .avatar_version
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No avatar collider"))?;
-        let text: String = db.query_row(
-            "SELECT manifest FROM asset_versions WHERE hash=?",
-            [version],
-            |r| r.get(0),
-        )?;
+        let text: String = app
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT manifest FROM asset_versions WHERE hash=?",
+                [version],
+                |r| r.get(0),
+            )?;
         let manifest: Manifest = serde_json::from_str(&text)?;
         manifest
             .contacts
@@ -164,21 +162,19 @@ pub fn apply(
         json!({"action":request.action,"kind":"avatar","actor":actor,"target":request.target,"segment":request.segment,"bone":collider.bone,"hand":request.hand}),
     )
 }
-pub fn prune(app: &App, instance: &mut Instance) {
+pub fn prune(app: &App, cache: &mut super::DbCache, instance: &mut Instance) {
     if instance.interactions.is_empty() {
         return;
     }
-    let db = app.db.lock().unwrap();
     let released = instance
         .interactions
         .iter()
         .filter(|(_, g)| {
-            !allowed(&db, &g.actor, &g.target)
+            !cache.touch_allowed(app, &g.actor, &g.target)
                 || !instance.players.contains_key(&g.actor)
                 || !instance.players.contains_key(&g.target)
         })
         .map(|(id, _)| id.clone())
         .collect();
-    drop(db);
     instance.release_contacts(released, "policy");
 }

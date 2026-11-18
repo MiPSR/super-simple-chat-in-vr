@@ -14,7 +14,7 @@ static func upscalers(method: String, xr: bool) -> Array:
 	# Temporal/stereo upscaling is not assumed to work on untested XR paths.
 	return ["bilinear", "fsr1"] if method == "forward_plus" and not xr else ["bilinear"]
 
-func configure(preferences: Dictionary) -> void:
+func configure(preferences: Dictionary, xr: bool = false) -> void:
 	for child in get_children():
 		child.queue_free()
 	controls.clear()
@@ -28,12 +28,22 @@ func configure(preferences: Dictionary) -> void:
 	_number("resolution_scale", "3D resolution scale", 0.5, 1.5, 0.05, preferences, 1)
 	_number("draw_distance", "Draw distance (metres; visuals only)", 10, 2000, 10, preferences, 250)
 	_choices("antialiasing", "Antialiasing", ["off","msaa_2x","msaa_4x","msaa_8x"], preferences)
-	_choices("upscaler", "Upscaling (unsupported choices fall back)", ["bilinear","fsr1"], preferences)
+	# fsr1 is hidden whenever XR is active or the renderer is Mobile; a saved
+	# fsr1 preference still loads and falls back at apply time.
+	_choices("upscaler", "Upscaling (unsupported choices fall back)", upscalers(RenderingServer.get_current_rendering_method(), xr), preferences)
 	_number("texture_lod_bias", "Texture LOD bias (not VRAM reduction)", 0, 3, 0.5, preferences, 0)
 	_choices("texture_reduction", "Texture dimensions (next world/avatar load)", [0,1,2,3], preferences, ["Original", "Half", "Quarter", "Eighth"])
 	_choices("send_divisor", "Network send divisor (next grant)", [1,2,4], preferences)
 	_choices("receive_divisor", "Network receive divisor (next grant)", [1,2,4], preferences)
 	_number("radial_hold_seconds", "Quick menu hold time (seconds)", 0.15, 1.5, 0.05, preferences, 0.45)
+	_label("Comfort and touch — account settings")
+	_check("can_touch_me", "Other players may touch me", preferences)
+	_check("can_touch_others", "I may touch other players", preferences)
+	_check("snap_turn", "Snap turning (smooth turning when off)", preferences, true)
+	_choices("turn_angle", "Snap turn angle", [15, 30, 45], preferences, [], 30)
+	_slider("move_speed", "Movement speed", 0.5, 3.0, 0.05, preferences, 1.5)
+	_choices("move_hand", "Movement hand", ["left", "right"], preferences, [], "right")
+	_choices("sleep_pose", "Sleeping pose", ["flat", "side"], preferences)
 	var bindings: Array = preferences.get("radial_actions", RadialMenu.DEFAULT_ACTIONS)
 	for index in 8:
 		var key := "radial_action_" + str(index)
@@ -51,7 +61,11 @@ func configure(preferences: Dictionary) -> void:
 				continue
 			if control is OptionButton:
 				updates[key] = control.get_item_metadata(control.selected)
+			elif control is CheckButton:
+				updates[key] = control.button_pressed
 			elif control is SpinBox:
+				updates[key] = control.value
+			elif control is HSlider:
 				updates[key] = control.value
 		updates.radial_actions = actions
 		changed.emit(updates)
@@ -68,7 +82,7 @@ func _label(text: String) -> void:
 	label.text = text
 	add_child(label)
 
-func _choices(key: String, title: String, values: Array, preferences: Dictionary, labels: Array = []) -> void:
+func _choices(key: String, title: String, values: Array, preferences: Dictionary, labels: Array = [], fallback: Variant = null) -> void:
 	_label(title)
 	if values.is_empty():
 		values = ["Default"]
@@ -76,9 +90,28 @@ func _choices(key: String, title: String, values: Array, preferences: Dictionary
 	for index in values.size():
 		select.add_item(str(labels[index] if labels.size() == values.size() else values[index]))
 		select.set_item_metadata(index, values[index])
-	select.select(maxi(0, values.find(preferences.get(key, values[0]))))
+	select.select(maxi(0, values.find(preferences.get(key, values[0] if fallback == null else fallback))))
 	controls[key] = select
 	add_child(select)
+
+func _check(key: String, title: String, preferences: Dictionary, fallback: bool = false) -> void:
+	var check := CheckButton.new()
+	check.text = title
+	check.button_pressed = bool(preferences.get(key, fallback))
+	controls[key] = check
+	add_child(check)
+
+func _slider(key: String, title: String, minimum: float, maximum: float, step: float, preferences: Dictionary, fallback: float) -> void:
+	_label(title)
+	var slide := HSlider.new()
+	slide.min_value = minimum
+	slide.max_value = maximum
+	slide.step = step
+	slide.value = clampf(float(preferences.get(key, fallback)), minimum, maximum)
+	slide.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	slide.custom_minimum_size.y = 32
+	controls[key] = slide
+	add_child(slide)
 
 func _number(key: String, title: String, minimum: float, maximum: float, step: float, preferences: Dictionary, fallback: float) -> void:
 	_label(title)

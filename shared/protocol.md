@@ -1,9 +1,11 @@
 # Experimental compatibility contracts
 
 Application, HTTP, package, and realtime versions currently start at 1 and are
-not declared stable. Unsupported envelope versions are rejected. Breaking
-changes will increment the relevant contract; creator examples must be updated
-together with their manifest/API definitions.
+not declared stable. Unsupported envelope versions are rejected. The realtime
+wire protocol is at version 2 (challenge-based admission, manifest-optional
+revision snapshots, visual replication). Breaking changes will increment the
+relevant contract; creator examples must be updated together with their
+manifest/API definitions.
 
 ## Realtime
 
@@ -14,16 +16,23 @@ channel 2 carries time-sensitive Opus audio. ENet compression and Godot-specific
 DTLS are not enabled.
 
 HTTPS issues a random one-use 60-second ticket and a random 32-byte master key.
-Only explicit loopback development may use HTTP. The first ENet packet is the
-64-byte ASCII ticket followed by an authenticated client envelope of kind 1.
-A malformed authenticated handshake does not consume another user's ticket.
+Only explicit loopback development may use HTTP. Admission is challenge-based:
+when the ENet connection opens, the server first sends a cleartext 17-byte
+packet (a 0 tag byte followed by a random 16-byte challenge). The client replies
+with the 64-byte ASCII ticket, the 16-byte challenge, and an authenticated
+envelope of kind 1 whose ciphertext payload is the ticket bytes. The server
+rejects the reply unless the echoed challenge matches this connection's pending
+value, so a captured handshake cannot be replayed onto a fresh connection and
+burn someone else's one-use ticket. A malformed authenticated handshake does
+not consume another user's ticket.
 
 Envelope bytes: version u8 (=1), channel u8, direction u8 (0 client, 1 server),
 monotonic per-direction/per-channel u64 LE sequence, random 16-byte IV,
 AES-256-CBC/PKCS#7 ciphertext, and 32-byte HMAC-SHA256 over every preceding
 envelope byte. Ciphertext begins with a u8 message kind. Independent keys are
-SHA256(master || direction-u8 || purpose-u8), purpose 0 encryption / 1 MAC.
-The MAC is checked before decryption, and replay/outdated sequences are rejected.
+SHA256([direction-u8, purpose-u8] || u32-LE(master length) || master ||
+"ssc-cipher-v2"), purpose 0 encryption / 1 MAC. The MAC is checked before
+decryption, and replay/outdated sequences are rejected.
 This provides application-payload confidentiality/authentication, not encrypted
 ENet headers, forward secrecy, traffic-analysis resistance, or DoS protection.
 
@@ -32,10 +41,21 @@ Kinds: 1 authenticate; 2 authoritative snapshot; 3 pose/transform sample;
 9 leave; 10 reliable fragment; 11 authoritative object events; 12 control action;
 13 declared avatar action; 14 body-tracker inputs; 20 Opus; 21 private calls;
 22 media command; 23 monotonic clock probe; 24 radio voice; 25 radio data;
+26 negotiated rate announce; 27 unreliable pose fragment; 28 input-focus state;
 255 error. Except client pose and
 voice samples, payloads are bounded UTF-8 JSON.
 This is an explicit binary envelope with JSON state, not a compact finalized
 binary state schema; bandwidth optimization remains work before release.
+
+The kind-2 snapshot carries `instance`, `world`, `version`, `revision`,
+`players`, `entities`, `visual`, `variables`, `scores`, `clock`,
+`interactions`, and `media`. `visual` maps entity IDs to
+`{tint?:[r,g,b], light?:[r,g,b,energy], animation?:string,
+animation_playing?:bool}` set by authoritative world scripts; late joiners
+observe the same overrides. Revision resnapshots (kind 2 without the
+join-negotiation fields) omit `manifest` whenever the peer already holds
+that exact `version`; a client must keep its current world definition when
+a snapshot carries none.
 
 Client kind-3 samples are exactly 84 bytes: head, left hand, right hand, each
 seven f32 LE values (position xyz and quaternion xyzw). Non-finite/excessive

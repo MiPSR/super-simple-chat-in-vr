@@ -5,13 +5,22 @@ const {readFileSync} = require("node:fs");
 const {join} = require("node:path");
 const {runInNewContext} = require("node:vm");
 
+// Minimal fake DOM: children/name are enough for the dynamically built forms.
+function findNamed(root, name) {
+  for (const child of root.children) {
+    if (child.name === name) return child;
+    const nested = findNamed(child, name);
+    if (nested) return nested;
+  }
+  return null;
+}
 class Element {
-  constructor() { this.value = ""; this.hidden = false; this.disabled = false; this.children = []; this.listeners = new Map(); this.elements = {namedItem: () => null}; }
+  constructor() { this.value = ""; this.hidden = false; this.disabled = false; this.children = []; this.listeners = new Map(); this.elements = {namedItem: name => findNamed(this, name)}; }
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   addEventListener(name, fn) { this.listeners.set(name, fn); }
 }
-async function page(preferences = {}) {
+async function page(preferences = {}, routes = {}) {
   const html = readFileSync(join(__dirname,"../index.html"),"utf8");
   const elements = new Map();
   for (const match of html.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) {
@@ -26,7 +35,12 @@ async function page(preferences = {}) {
       requests.push({path,options});
       if (options.headers.Authorization !== "Bearer " + "s".repeat(32)) return {ok:false,statusText:"Forbidden",json:async () => ({error:"Administrator authentication required"})};
       if (path === "/api/v1/admin/assets/gc") return gc();
-      const body = path === "/api/v1/me" ? {user:{id:"admin",admin:true},preferences} : path === "/api/v1/admin/health" ? {uploads:{active:0,reserved_bytes:0},creator_vms:{active:0,limit:64}} : [];
+      if (Object.prototype.hasOwnProperty.call(routes,path)) {
+        const route = routes[path];
+        if (typeof route === "function") return route(options);
+        return {ok:true,json:async () => route};
+      }
+      const body = path === "/api/v1/me" ? {user:{id:"admin",admin:true},preferences} : path === "/api/v1/admin/health" ? {uploads:{active:0,reserved_bytes:0},creator_vms:{active:0,limit:64},limits:{instances:64,instance_players:64},defaults:{world_slots:4,avatar_slots:8,world_bytes:1000000000,avatar_bytes:100000000}} : [];
       return {ok:true,json:async () => body};
     },
   };
@@ -90,4 +104,76 @@ test("draw distance saves as a number without discarding untouched account prefe
   assert.equal(payload.can_touch_me,true);
   assert.equal(payload.voice_volume,0.5);
   assert.equal(payload.radial_actions.length,8);
+});
+
+test("the quota form PUTs numeric quotas for the selected user",async () => {
+  const p = await page({},{
+    "/api/v1/admin/users":[{id:"42",name:"Alice",enabled:true,world_slots:2,avatar_slots:3,world_bytes:100000,avatar_bytes:200000}],
+  });
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  const card = p.elements.get("users").children[0];
+  const form = card.children.find(child => child.listeners.has("submit"));
+  assert.ok(form,"user card must contain a quota form");
+  for (const [name,expected] of [["world_slots",2],["avatar_slots",3],["world_bytes",100000],["avatar_bytes",200000]])
+    assert.equal(Number(form.elements.namedItem(name).value),expected,`prefilled ${name}`);
+  form.elements.namedItem("world_bytes").value = "111111";
+  const submitter = new Element();
+  let prevented = false;
+  await form.listeners.get("submit")({submitter,preventDefault() {prevented = true;}});
+  assert.ok(prevented);
+  assert.equal(submitter.disabled,false);
+  const request = p.requests.find(request => request.path === "/api/v1/admin/users/42");
+  assert.equal(request.options.method,"PUT");
+  assert.deepEqual(JSON.parse(request.options.body),{world_slots:2,avatar_slots:3,world_bytes:111111,avatar_bytes:200000});
+  assert.match(p.elements.get("status").textContent,/Quotas saved/);
+});
+
+test("admins can enable and disable asset listings, and a 404 is surfaced",async () => {
+  const assets = [
+    {id:"7",owner:"admin",kind:"world",name:"Quiet room",description:"",version:"a",enabled:true},
+    {id:"8",owner:"admin",kind:"avatar",name:"Reference avatar",description:"",version:"b",enabled:false},
+  ];
+  const p = await page({},{
+    "/api/v1/assets?q=":assets,
+    "/api/v1/admin/assets/7/enabled":() => ({ok:false,statusText:"Not Found",json:async () => ({error:"Unknown asset"})}),
+    "/api/v1/admin/assets/8/enabled":{ok:true,enabled:true},
+  });
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  const cards = p.elements.get("assets").children;
+  assert.equal(cards.length,2);
+  assert.equal(cards[0].children[0].textContent,"Quiet room");
+  assert.equal(cards[1].children[0].textContent,"Reference avatar (disabled)");
+  const listing = card => card.children.find(child => child.textContent === "Disable listing" || child.textContent === "Enable listing");
+  await listing(cards[1]).onclick();
+  assert.deepEqual(JSON.parse(p.requests.find(request => request.path === "/api/v1/admin/assets/8/enabled").options.body),{enabled:true});
+  await listing(cards[0]).onclick();
+  assert.deepEqual(JSON.parse(p.requests.find(request => request.path === "/api/v1/admin/assets/7/enabled").options.body),{enabled:false});
+  assert.match(p.elements.get("status").textContent,/Unknown asset/);
+});
+
+test("instance cards list roster names with a bounded count",async () => {
+  const roster = Array.from({length:15},(_,index) => ({id:`u${index}`,name:`Player ${index}`}));
+  const p = await page({},{
+    "/api/v1/instances":[{id:"i1",world:"w",version:"v",players:15,capacity:64,private:false,roster}],
+  });
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  const text = p.elements.get("instances").children[0].children[1].textContent;
+  assert.match(text,/15\/64 players/);
+  assert.match(text,/Player 0, Player 1, Player 2/);
+  assert.match(text,/\+3 more/);
+  assert.doesNotMatch(text,/Player 1[234]/);
+});
+
+test("the admin panel renders live-instance limits and new-account defaults",async () => {
+  const p = await page();
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  assert.match(p.elements.get("limits").textContent,/64 instances/);
+  assert.match(p.elements.get("limits").textContent,/64 players per instance/);
+  assert.match(p.elements.get("defaults").textContent,/4 world slots/);
+  assert.match(p.elements.get("defaults").textContent,/8 avatar slots/);
+  assert.match(p.elements.get("health").textContent,/reserved_bytes/);
 });

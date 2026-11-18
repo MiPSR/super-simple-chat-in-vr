@@ -1,5 +1,7 @@
 extends RefCounted
 ## AES-256-CBC + HMAC-SHA256 encrypt-then-MAC, independent directional keys.
+## Mirrors server/src/realtime/crypto.rs exactly; the KDF uses length-prefixed
+## domain separation ("ssc-cipher-v2").
 var secret: PackedByteArray
 var sent: Array[int] = [0, 0, 0]
 var received: Array[int] = [0, 0, 0]
@@ -11,8 +13,13 @@ func _init(master: PackedByteArray) -> void:
 func key(direction: int, purpose: int) -> PackedByteArray:
 	var hash := HashingContext.new()
 	hash.start(HashingContext.HASH_SHA256)
-	hash.update(secret)
+	var length := PackedByteArray()
+	length.resize(4)
+	length.encode_u32(0, secret.size())
 	hash.update(PackedByteArray([direction, purpose]))
+	hash.update(length)
+	hash.update(secret)
+	hash.update("ssc-cipher-v2".to_utf8_buffer())
 	return hash.finish()
 
 func mac(data: PackedByteArray, direction: int) -> PackedByteArray:

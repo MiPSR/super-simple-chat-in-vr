@@ -19,6 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use rand::RngCore;
 
 #[derive(Clone)]
 pub struct Grant {
@@ -28,7 +29,7 @@ pub struct Grant {
     pub join: Join,
     pub version: String,
     pub manifest: Manifest,
-    pub sources: Vec<String>,
+    pub sources: Vec<(String, String)>,
     pub secret: Vec<u8>,
     pub expires: i64,
 }
@@ -52,6 +53,106 @@ struct Session {
     voice_epoch: u64,
     input_suspended: bool,
     call_state: Value,
+    /// World version whose manifest this peer has already received; revision
+    /// resnapshots omit the immutable manifest when it has not changed.
+    sent_world: Option<String>,
+}
+/// Bounded TTL cache in front of SQLite for per-tick/per-frame reads on the
+/// authoritative thread. Writes (blocks, preferences, session revocation) bump
+/// the policy epoch, which invalidates every entry on the next lookup; the
+/// TTL is only a backstop. Nothing here changes access semantics.
+struct DbCache {
+    ttl: Duration,
+    sessions: HashMap<(String, String), (Instant, u64, bool)>,
+    call_modes: HashMap<String, (Instant, u64, String)>,
+    blocked: HashMap<(String, String, u32), (Instant, u64, bool)>,
+    touch: HashMap<(String, String), (Instant, u64, bool)>,
+}
+impl Default for DbCache {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(5),
+            sessions: HashMap::new(),
+            call_modes: HashMap::new(),
+            blocked: HashMap::new(),
+            touch: HashMap::new(),
+        }
+    }
+}
+impl DbCache {
+    fn fresh(&self, at: &Instant, epoch: &u64) -> bool {
+        *epoch == db::policy_epoch() && at.elapsed() < self.ttl
+    }
+    fn prune(&mut self) {
+        let epoch = db::policy_epoch();
+        if self.sessions.len() > 4096
+            || self.call_modes.len() > 4096
+            || self.blocked.len() > 4096
+            || self.touch.len() > 4096
+        {
+            *self = DbCache::default();
+            return;
+        }
+        let cutoff = Instant::now() - self.ttl;
+        self.sessions.retain(|_, (at, epoch_at, _)| *at > cutoff && *epoch_at == epoch);
+        self.call_modes.retain(|_, (at, epoch_at, _)| *at > cutoff && *epoch_at == epoch);
+        self.blocked.retain(|_, (at, epoch_at, _)| *at > cutoff && *epoch_at == epoch);
+        self.touch.retain(|_, (at, epoch_at, _)| *at > cutoff && *epoch_at == epoch);
+    }
+    fn session_valid(&mut self, app: &App, user: &str, session: &str) -> bool {
+        if let Some((at, epoch, valid)) = self.sessions.get(&(user.into(), session.into()))
+            && self.fresh(at, epoch)
+        {
+            return *valid;
+        }
+        let valid = auth::session_valid(app, user, session);
+        self.sessions.insert(
+            (user.into(), session.into()),
+            (Instant::now(), db::policy_epoch(), valid),
+        );
+        valid
+    }
+    fn call_mode(&mut self, app: &App, user: &str) -> String {
+        if let Some((at, epoch, mode)) = self.call_modes.get(user)
+            && self.fresh(at, epoch)
+        {
+            return mode.clone();
+        }
+        let mode = db::preferences(&app.db.lock().unwrap(), user).call_mode;
+        self.call_modes
+            .insert(user.into(), (Instant::now(), db::policy_epoch(), mode.clone()));
+        mode
+    }
+    fn blocked(&mut self, app: &App, a: &str, b: &str, flag: u32) -> bool {
+        if let Some((at, epoch, blocked)) = self.blocked.get(&(a.into(), b.into(), flag))
+            && self.fresh(at, epoch)
+        {
+            return *blocked;
+        }
+        let blocked = db::blocked(&app.db.lock().unwrap(), a, b, flag);
+        self.blocked.insert(
+            (a.into(), b.into(), flag),
+            (Instant::now(), db::policy_epoch(), blocked),
+        );
+        blocked
+    }
+    fn touch_allowed(&mut self, app: &App, actor: &str, target: &str) -> bool {
+        if let Some((at, epoch, allowed)) = self.touch.get(&(actor.into(), target.into()))
+            && self.fresh(at, epoch)
+        {
+            return *allowed;
+        }
+        let db = app.db.lock().unwrap();
+        let allowed = db::preferences(&db, actor).can_touch_others
+            && db::preferences(&db, target).can_touch_me
+            && !db::blocked(&db, actor, target, 4);
+        drop(db);
+        self.touch.insert(
+            (actor.into(), target.into()),
+            (Instant::now(), db::policy_epoch(), allowed),
+        );
+        allowed
+    }
 }
 fn filter_snapshot_players(snapshot: &mut Value, viewer: &str, db: &rusqlite::Connection) {
     if let Some(players) = snapshot["players"].as_object_mut() {
@@ -169,7 +270,9 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
     std::thread::Builder::new().name("authoritative-worlds".into()).spawn(move || {
         let mut sessions:HashMap<PeerID,Session>=HashMap::new();
         let mut next_voice_epoch=0u64;
-        let mut pending:HashMap<PeerID,Instant>=HashMap::new();
+        let mut pending:HashMap<PeerID,(Instant,[u8;16])>=HashMap::new();
+        let mut revisions:HashMap<PeerID,u64>=HashMap::new();
+        let mut cache=DbCache::default();
         let mut calls=calls::Calls::default();
         let mut radios=radio::Radios::default();
         let step=Duration::from_secs_f64(1.0/app.config.tps as f64);
@@ -179,7 +282,18 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
             for _ in 0..512 {
                 let event=match host.service() {Ok(Some(e))=>e,Ok(None)=>break,Err(e)=>{eprintln!("ENet: {e}");break;}};
                 match event {
-                    Event::Connect{peer,..}=>{pending.insert(peer.id(),Instant::now());}
+                    Event::Connect{peer,..}=>{
+                        // Unauthenticated greeting: a per-connection random challenge.
+                        // The client's first sealed packet must echo it inside the
+                        // MAC, so a captured handshake cannot be replayed onto a
+                        // fresh connection and burn someone else's one-use ticket.
+                        let mut challenge=[0u8;16];
+                        rand::rng().fill_bytes(&mut challenge);
+                        let mut greeting=vec![0u8];
+                        greeting.extend_from_slice(&challenge);
+                        let _=peer.send(0,&Packet::new(greeting,PacketKind::Reliable));
+                        pending.insert(peer.id(),(Instant::now(),challenge));
+                    }
                     Event::Disconnect{peer,..}=>{
                         pending.remove(&peer.id());
                         if let Some(s)=sessions.remove(&peer.id()) {app.worlds.lock().unwrap().leave(&s.user);calls.leave(&s.user);}
@@ -187,35 +301,41 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                     Event::Receive{peer,channel_id,packet}=>{
                         let id=peer.id();let data=packet.data();
                         if !sessions.contains_key(&id) {
-                            if channel_id!=0 || data.len()<64+75 || data.len()>2048 {peer.disconnect_now(1);pending.remove(&id);continue;}
+                            if channel_id!=0 || data.len()<64+16+75 || data.len()>2048 {peer.disconnect_now(1);pending.remove(&id);continue;}
                              let ticket=match std::str::from_utf8(&data[..64]) {Ok(s)=>s,Err(_)=>{peer.disconnect_now(1);continue;}};
-                            let _asset_gate=app.asset_gate.blocking_lock();
+                            let Some((_, challenge))=pending.get(&id) else {peer.disconnect_now(1);continue;};
+                            if data[64..80]!=*challenge {peer.disconnect_now(1);continue;}
                             let grant={app.grants.lock().unwrap().get(ticket).cloned()};
                             let Some(g)=grant else {peer.disconnect_now(1);continue;};
-                            if g.expires<=db::now() || !auth::session_valid(&app,&g.user,&g.session) {peer.disconnect_now(1);continue;}
+                            if g.expires<=db::now() || !cache.session_valid(&app,&g.user,&g.session) {peer.disconnect_now(1);continue;}
                             let mut cipher=crypto::Cipher::new(g.secret.clone());
-                            if !matches!(cipher.open(0,0,&data[64..]),Ok((1,_))) {peer.disconnect_now(1);continue;}
+                            // The sealed kind-1 payload must echo the ticket, so the
+                            // cleartext ticket is also MAC-covered end to end.
+                            if !matches!(cipher.open(0,0,&data[80..]),Ok((1,p)) if p==ticket.as_bytes()) {peer.disconnect_now(1);continue;}
                             app.grants.lock().unwrap().remove(ticket);
                             if next_voice_epoch>=i64::MAX as u64 {peer.disconnect_now(3);continue;}
                             // Retire an old connection only after admission succeeds.
                             // A rejected transition must leave its session/world intact.
                             let old:Vec<_>=sessions.iter().filter(|(_,s)|s.user==g.user).map(|(id,_)|*id).collect();
                             let result=app.worlds.lock().unwrap().admit(&g.join,&g.user,&g.name,&g.version,g.manifest,g.sources);
-                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:String::new(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,1,1),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:0,input_suspended:false,call_state:Value::Null};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
+                             let instance=match result {Ok(i)=>i,Err(e)=>{let mut s=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:String::new(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,1,1),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:0,input_suspended:false,call_state:Value::Null,sent_world:None};send(peer,&mut s,0,255,&json!({"error":e.to_string()}));peer.disconnect_later(2);continue;}};
                             // No leave here: admit already transitioned or resnapshotted
                             // membership, so a stale disconnect cannot remove the new one.
-                            for old in old {sessions.remove(&old);pending.insert(old,Instant::now()-Duration::from_secs(6));}
+                            for old in old {sessions.remove(&old);pending.insert(old,(Instant::now()-Duration::from_secs(6),[0u8;16]));}
                             next_voice_epoch+=1;
-                             let mut session=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:instance.clone(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,g.join.send_divisor,g.join.receive_divisor),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:next_voice_epoch,input_suspended:false,call_state:Value::Null};
+                             let mut session=Session {output:Default::default(),output_failed:false,user:g.user,session:g.session,instance:instance.clone(),cipher,rates:rates::Rates::new(app.config.network_rates,app.config.tps,g.join.send_divisor,g.join.receive_divisor),rate_sample:Instant::now(),pose_digest:None,last_output:Instant::now(),last_full_output:Instant::now(),last_seen:Instant::now(),window:Instant::now(),messages:0,input_bytes:0,voice_frames:0,voice_epoch:next_voice_epoch,input_suspended:false,call_state:Value::Null,sent_world:None};
                             let worlds=app.worlds.lock().unwrap();
-                            let mut snapshot=worlds.instances[&instance].snapshot(worlds.tick);
+                            let instance_state=&worlds.instances[&instance];
+                            let mut snapshot=instance_state.snapshot(worlds.tick);
+                            let admitted_revision=instance_state.revision;
+                            session.sent_world=Some(instance_state.version.clone());
                             filter_snapshot_players(&mut snapshot, &session.user, &app.db.lock().unwrap());
                             let user=session.user.clone();
                              let send_hz=app.config.tps as f64/session.rates.send as f64;
                              let receive_hz=app.config.tps as f64/session.rates.receive as f64;
                               send(peer,&mut session,0,2,&json!({"snapshot":snapshot,"user":user,"tps":app.config.tps,"send_hz":send_hz,"receive_hz":receive_hz,"network_policy":{"minimum_hz":app.config.network_rates.minimum_hz,"maximum_hz":app.config.network_rates.maximum_hz,"automatic":app.config.network_rates.automatic,"aggregation":if app.config.network_rates.suppress_unchanged {"suppress-unchanged"} else {"latest"}},"voice_bitrate":app.config.voice_bitrate,"audio_effect_max":app.config.audio_effect_max,"radio_bitrate":app.config.radio_bitrate,"radio_channels":app.config.radio_channels,"radio_policy":{"presets":app.config.radio_presets,"ft8_interval":app.config.radio_ft8_interval,"sstv_interval":app.config.radio_sstv_interval,"noise":app.config.radio_noise,"filter_hz":app.config.radio_filter_hz,"interference":app.config.radio_interference}}));
                              send(peer,&mut session,0,21,&calls.snapshot(&user));
-                             drop(worlds);pending.remove(&id);sessions.insert(id,session);
+                             drop(worlds);pending.remove(&id);sessions.insert(id,session);revisions.insert(id,admitted_revision);
                         } else if let Some(session)=sessions.get_mut(&id) {
                              if session.window.elapsed()>Duration::from_secs(1) {session.window=Instant::now();session.messages=0;session.input_bytes=0;session.voice_frames=0;}
                              session.messages+=1;
@@ -242,16 +362,16 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                 let max_bytes=app.config.voice_bitrate as usize/400+64;
                                 if session.voice_frames>55 || payload.len()<13 || payload.len()>12+max_bytes || opus::packet::get_nb_samples(&payload[12..],48000).ok()!=Some(960) {continue;}
                                 let sender=session.user.clone();let instance=session.instance.clone();let epoch=session.voice_epoch;
-                                let recipients={let worlds=app.worlds.lock().unwrap();let db=app.db.lock().unwrap();let mut routes=HashMap::new();
+                                let recipients={let worlds=app.worlds.lock().unwrap();let mut routes=HashMap::new();
                                     if let Some(i)=worlds.instances.get(&instance) && let Some(origin)=i.players.get(&sender) {
-                                        let mode=db::preferences(&db,&sender).call_mode;
+                                        let mode=cache.call_mode(&app,&sender);
                                         for (other,s) in &sessions {
-                                            if s.user==sender || db::blocked(&db,&sender,&s.user,1) {continue;}
+                                            if s.user==sender || cache.blocked(&app,&sender,&s.user,1) {continue;}
                                             let Some(destination)=worlds.instances.get(&s.instance) else {continue;};
                                             let Some(listener)=destination.players.get(&s.user) else {continue;};
                                             let distance=if s.instance==instance {(0..3).map(|j|(origin.pose[j]-listener.pose[j]).powi(2)).sum::<f32>()}else{f32::INFINITY};
                                             let together=calls.together(&sender,&s.user);
-                                            let receiver=db::preferences(&db,&s.user).call_mode;
+                                            let receiver=cache.call_mode(&app,&s.user);
                                             let private=calls.active(&sender) && mode!="spatial";
                                             if private {
                                                 if together && i.manifest.allow_voice_bypass && destination.manifest.allow_voice_bypass && receiver!="spatial" {
@@ -284,21 +404,21 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                         let sender=session.user.clone();
                                         let instance=session.instance.clone();
                                         let recipients:Vec<_>=sessions.iter().filter(|(_,s)|s.instance==instance).map(|(id,s)|(*id,s.user.clone())).collect();
-                                        for (other,user) in recipients {if !db::blocked(&app.db.lock().unwrap(),&sender,&user,2) && let Some(s)=sessions.get_mut(&other) {send(host.peer_mut(other),s,0,4,&json!({"user":sender,"text":text}));}}
+                                        for (other,user) in recipients {if !cache.blocked(&app,&sender,&user,2) && let Some(s)=sessions.get_mut(&other) {send(host.peer_mut(other),s,0,4,&json!({"user":sender,"text":text}));}}
                                     }
                                     5=>{if let Some(target)=value["target"].as_str() && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance) && let Err(e)=i.interact(&session.user,target) {send(peer,session,0,255,&json!({"error":e.to_string()}));}}
                                     6=>{
                                         let sender=session.user.clone();let instance=session.instance.clone();
                                         let event=serde_json::from_value::<contact::Request>(value).ok().and_then(|request| {
                                             let mut worlds=app.worlds.lock().unwrap();let i=worlds.instances.get_mut(&instance)?;
-                                            let event=contact::apply(&app,i,&sender,request).ok()?;
+                                            let event=contact::apply(&app,&mut cache,i,&sender,request).ok()?;
                                             i.dispatch(event["action"].as_str().unwrap_or("touch"),event.clone());
                                             Some(event)
                                         });
-                                        if let Some(event)=event {for (other,s) in &mut sessions {if s.instance==instance && !db::blocked(&app.db.lock().unwrap(),&s.user,&sender,16) && !db::blocked(&app.db.lock().unwrap(),&s.user,event["target"].as_str().unwrap_or(""),16) {send(host.peer_mut(*other),s,0,6,&event);}}}
+                                        if let Some(event)=event {for (other,s) in &mut sessions {if s.instance==instance && !cache.blocked(&app,&s.user,&sender,16) && !cache.blocked(&app,&s.user,event["target"].as_str().unwrap_or(""),16) {send(host.peer_mut(*other),s,0,6,&event);}}}
                                     }
                                     7=>{let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.sleeping=value["sleeping"].as_bool().unwrap_or(false);i.revision+=1;}}
-                                     8=>{let _asset_gate=app.asset_gate.blocking_lock();let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let result=app.worlds.lock().unwrap().select_avatar(&session.user,valid);if let Err(error)=result {send(peer,session,0,255,&json!({"error":error.to_string()}));}}
+                                     8=>{let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let result=app.worlds.lock().unwrap().select_avatar(&session.user,valid);if let Err(error)=result {send(peer,session,0,255,&json!({"error":error.to_string()}));}}
                                     9=>{peer.disconnect_later(0);}
                                     12=>{if let Ok(action)=serde_json::from_value::<crate::world::Action>(value)
                                         && let Some(i)=app.worlds.lock().unwrap().instances.get_mut(&session.instance)
@@ -350,13 +470,14 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
             }
             if Instant::now()>=next {
                 next+=step;if next<Instant::now()-step*4 {next=Instant::now()+step;}
-                let expired:Vec<_>=sessions.iter().filter(|(_,s)|s.output_failed || s.last_seen.elapsed()>Duration::from_secs(15) || !auth::session_valid(&app,&s.user,&s.session)).map(|(id,_)|*id).collect();
-                for id in expired {if let Some(s)=sessions.remove(&id) {app.worlds.lock().unwrap().leave(&s.user);calls.leave(&s.user);}host.peer_mut(id).disconnect_now(4);}
+                let expired:Vec<_>=sessions.iter().filter(|(_,s)|s.output_failed || s.last_seen.elapsed()>Duration::from_secs(15) || !cache.session_valid(&app,&s.user,&s.session)).map(|(id,_)|*id).collect();
+                for id in expired {if let Some(s)=sessions.remove(&id) {app.worlds.lock().unwrap().leave(&s.user);calls.leave(&s.user);revisions.remove(&id);}host.peer_mut(id).disconnect_now(4);}
                 calls.clean(&sessions.values().map(|s|s.user.clone()).collect());
                 radios.clean(&sessions.values().map(|s|s.user.clone()).collect());
-                pending.retain(|id,at|{if at.elapsed()>Duration::from_secs(5) {host.peer_mut(*id).disconnect_now(4);false}else{true}});
+                cache.prune();
+                pending.retain(|id,(at,_)|{if at.elapsed()>Duration::from_secs(5) {host.peer_mut(*id).disconnect_now(4);false}else{true}});
                 let mut worlds=app.worlds.lock().unwrap();worlds.step();
-                for i in worlds.instances.values_mut() {contact::prune(&app,i);}
+                for i in worlds.instances.values_mut() {contact::prune(&app,&mut cache,i);}
                 for (id,s) in &mut sessions {
                     if worlds.tick.is_multiple_of(app.config.tps as u64) {
                         let state=calls.snapshot(&s.user);
@@ -375,11 +496,14 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                     }
                     if worlds.tick.is_multiple_of(s.rates.receive as u64)
                         && let Some(i)=worlds.instances.get(&s.instance) {
-                             let db=app.db.lock().unwrap();
                              let full=!app.config.network_rates.suppress_unchanged || s.last_full_output.elapsed()>=Duration::from_secs(1);
-                             let players:Vec<_>=i.players.values().filter(|p|rates::recently_changed(full,i.clock,p.last_motion,app.config.tps) && !db::blocked(&db,&s.user,&p.id,8)).map(|p| {
-                                let mut value=json!(p);value["audio_allowed"]=json!(!db::blocked(&db,&s.user,&p.id,1));value
-                            }).collect();
+                             // Sequential lookups (not closure chains) keep the TTL
+                             // cache's mutable borrow sound on this hot path.
+                             let mut players=Vec::new();
+                             for p in i.players.values() {
+                                 if !rates::recently_changed(full,i.clock,p.last_motion,app.config.tps) || cache.blocked(&app,&s.user,&p.id,8) {continue;}
+                                 let mut value=json!(p);value["audio_allowed"]=json!(!cache.blocked(&app,&s.user,&p.id,1));players.push(value);
+                             }
                              let transforms:Vec<_>=i.entities.values().filter(|e|rates::recently_changed(full,i.clock,e.last_motion,app.config.tps)).map(|e|json!({"id":e.id,"position":e.position,"rotation":e.rotation})).collect();
                               let media:std::collections::BTreeMap<_,_>=i.media.iter().filter(|_|full).map(|(id,m)|(id,m.snapshot())).collect();
                              let unchanged=if app.config.network_rates.suppress_unchanged {
@@ -404,11 +528,17 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                     }
                 }
                 // Reliable shared state: at most once per tick, never downsampled.
-                static LAST:std::sync::OnceLock<std::sync::Mutex<HashMap<PeerID,u64>>>=std::sync::OnceLock::new();
-                let mut revisions=LAST.get_or_init(Default::default).lock().unwrap();
+                // `revisions` is connection-lifetime state keyed by PeerID; it is
+                // seeded at admission so a fresh join never receives a duplicate
+                // full snapshot one tick later.
                 revisions.retain(|id,_|sessions.contains_key(id));
                 for (id,s) in &mut sessions {if let Some(i)=worlds.instances.get(&s.instance) && revisions.get(id)!=Some(&i.revision) {
                     let mut snapshot=i.snapshot(worlds.tick);
+                    if s.sent_world.as_deref()==Some(&i.version) {
+                        // This peer already holds the immutable world definition;
+                        // revision bumps re-ship state only, not the manifest.
+                        if let Some(object)=snapshot.as_object_mut() {object.remove("manifest");}
+                    } else {s.sent_world=Some(i.version.clone());}
                     filter_snapshot_players(&mut snapshot, &s.user, &app.db.lock().unwrap());
                     send(host.peer_mut(*id),s,0,2,&json!({"snapshot":snapshot}));revisions.insert(*id,i.revision);
                 }}
