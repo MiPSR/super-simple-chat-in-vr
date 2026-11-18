@@ -64,6 +64,7 @@ pub struct Preferences {
     pub move_speed: f32,
     pub move_hand: String,
     pub sleep_pose: String,
+    pub shadows: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -107,6 +108,7 @@ impl Default for Preferences {
             move_speed: 1.5,
             move_hand: "right".into(),
             sleep_pose: "flat".into(),
+            shadows: true,
         }
     }
 }

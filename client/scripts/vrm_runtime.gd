@@ -39,6 +39,24 @@ func _init() -> void:
 func available() -> bool:
 	return extensions.size() > 2
 
+static func invalidate_skeletons(root: Node3D) -> void:
+	# Upstream godot-vrm #157: on Godot 4.7, runtime-imported skinned meshes can
+	# render distorted until something invalidates the Skeleton3D binding.
+	# Rebind every skinned mesh eagerly (deferred, after enter-tree) so real
+	# hardware rendering never depends on a later accidental invalidation.
+	if not is_instance_valid(root) or not root.is_inside_tree():
+		return
+	for child in root.find_children("*", "MeshInstance3D"):
+		var mesh: MeshInstance3D = child
+		var path := mesh.skeleton
+		if path == NodePath():
+			continue
+		mesh.skeleton = NodePath()
+		mesh.skeleton = path
+	for child in root.find_children("*", "Skeleton3D"):
+		var bones: Skeleton3D = child
+		bones.force_update_all_bone_transforms()
+
 func close() -> void:
 	for extension in extensions:
 		GLTFDocument.unregister_gltf_document_extension(extension)

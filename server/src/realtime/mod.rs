@@ -280,7 +280,7 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
         while alive.load(Ordering::Relaxed) {
             // Bound service work so a packet flood cannot starve the authoritative tick.
             for _ in 0..512 {
-                let event=match host.service() {Ok(Some(e))=>e,Ok(None)=>break,Err(e)=>{eprintln!("ENet: {e}");break;}};
+                let event=match host.service() {Ok(Some(e))=>e,Ok(None)=>break,Err(e)=>{crate::logs::record(format!("ENet: {e}"));break;}};
                 match event {
                     Event::Connect{peer,..}=>{
                         // Unauthenticated greeting: a per-connection random challenge.
@@ -460,6 +460,27 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                               session.input_suspended = !active;
                                              app.worlds.lock().unwrap().input_focus(&session.user,active);
                                          }
+                                     }
+                                     29=>{
+                                         // Mid-session rate renegotiation: the
+                                         // client may lower its own rates without
+                                         // rejoining; other sessions are unaffected.
+                                         // GDScript JSON round-trips numbers as
+                                         // floats, so integral floats are accepted.
+                                         let integral = |value: &Value| {
+                                            value
+                                                .as_f64()
+                                                .filter(|v| v.fract() == 0.0)
+                                                .and_then(|v| [1.0, 2.0, 4.0].contains(&v).then_some(v as u64))
+                                        };
+                                        let send_div=integral(&value["send_divisor"]);
+                                        let receive_div=integral(&value["receive_divisor"]);
+                                        if let (Some(send_div),Some(receive_div))=(send_div,receive_div) {
+                                            session.rates=rates::Rates::new(app.config.network_rates,app.config.tps,send_div as u32,receive_div as u32);
+                                            let send_hz=app.config.tps as f64/session.rates.send as f64;
+                                            let receive_hz=app.config.tps as f64/session.rates.receive as f64;
+                                            send(peer,session,0,26,&json!({"send_hz":send_hz,"receive_hz":receive_hz,"reason":"client-request"}));
+                                        }
                                      }
                                      _=>{}
                                 }

@@ -8,6 +8,7 @@ mod creator_objects;
 mod creator_state;
 mod db;
 mod http;
+pub mod logs;
 #[path = "../../shared/media_addresses.rs"]
 mod media_addresses;
 mod realtime;
@@ -47,6 +48,10 @@ async fn main() -> anyhow::Result<()> {
         config.instance_limit,
         config.instance_players,
     );
+    logs::record(format!(
+        "Super Simple Chat in VR starting: {} (ENet {}, {} TPS, instance limit {}, player cap {})",
+        config.public_url, config.enet, config.tps, config.instance_limit, config.instance_players
+    ));
     let app = Arc::new(App {
         asset_gate: Arc::new(tokio::sync::Mutex::new(())),
         uploads: Arc::new(uploads::Budget::default()),

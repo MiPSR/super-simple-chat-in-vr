@@ -61,6 +61,20 @@ full local `cargo test --locked --workspace --all-targets` run (clippy clean):
   the passing state they already had; the web admin quota editor is a real
   form rather than a JSON `prompt()`.
 
+- Mid-session rate renegotiation (kind 29): a live client may request new
+  send/receive divisors; the server clamps to policy and announces the
+  effective pair (kind 26, reason `client-request`) without affecting other
+  sessions. A "shadows" account preference now gates all dynamic shadows, and
+  a bounded administrator log ring (`GET /api/v1/admin/logs`) keeps the most
+  recent diagnostics and admin actions inspectable.
+- Upstream VRM pin: V-Sekai/godot-vrm master still ends at the pinned commit;
+  the open 4.7.2 runtime-import and MToon issues are unfixed upstream. The
+  loader now eagerly rebinds skinned meshes after runtime import
+  (`VRMRuntime.invalidate_skeletons`), implementing the documented
+  Skeleton3D-invalidation workaround for the skinned-mesh distortion issue.
+  The actively maintained AzPepoze fork remains the candidate for the first
+  real-hardware validation session; swapping without hardware would trade
+  documented upstream risk for unknown integration risk.
 Previously recorded verification notes follow unchanged; where they say
 "unverified" for items listed above, this pass supersedes them.
 
@@ -400,7 +414,7 @@ No row below waives any part of the corresponding scenario.
 | 5 | GLB and ephemeral instances tested; private invitation/search matrix needs expansion. |
 | 6 | Real peers exercise doors, tanks, projectiles, spawning, damage and scores. |
 | 7 | Real peers exercise late join, reconnect and last-player destruction. |
-| 8 | Full/quarter real-peer traffic and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; packet-loss/load acceptance remains. |
+| 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; packet-loss/load acceptance remains. |
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
 | 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |
@@ -408,11 +422,11 @@ No row below waives any part of the corresponding scenario.
 | 13 | Opus/text/calls/radio and native zone effects pass locally, including noise lifecycle, obstruction/exclusions, private dry routing and creator-call consent; real audio/headset and full policy acceptance remain. |
 | 14 | Cross-instance Opus/SSTV/FT8-style routing, blocking, channel denial and no-radio opt-out tested; client-world creator requests/presets locally tested; complete policy and real-audio checks remain. |
 | 15 | Historical two-peer public MP4/YouTube synchronization plus current isolated-helper YouTube and HTTP/failure recovery pass; long sessions and new-helper multi-peer/package revalidation remain. |
-| 16 | Hand-switchable phone and configurable eight-sector long-press radial menu have local persistence/gesture tests; XR usability remains. |
-| 17 | Persistent scale/MSAA, conservative upscalers, texture reduction, fixed advanced schema, tier persistence and ambient darkness pass headless tests; visual/GPU/XR acceptance remains. |
-| 18 | Voice/contact blocks tested; complete block/script capability matrix remains. |
+| 16 | Hand-switchable phone, Worlds/Instances/People tabs, in-VR keyboard, pointer ray and configurable eight-sector long-press radial menu have local persistence/gesture tests; XR usability remains. |
+| 17 | Persistent scale/MSAA, conservative upscalers, texture reduction, fixed advanced schema, tier persistence, ambient darkness and a shadows toggle pass headless tests; visual/GPU/XR acceptance remains. |
+| 18 | Five-level blocking is settable in-game (People tab) and enforced server-side for voice/text/touch/avatar/complete; real-hands and a complete script-capability matrix remain. |
 | 19 | Packet-owned queue bounds, isolated media helper/IPC, FIFO imports and 1,000 synthetic replacement cycles pass locally; importer isolation, aggregate descendant budgets and extended headset/RSS/leak acceptance remain. |
-| 20 | Real encrypted Godot↔Rust ENet suite covers reliable/sequenced/reduced-rate/reconnect traffic. |
+| 20 | Real encrypted Godot↔Rust ENet suite covers reliable/sequenced/reduced-rate/reconnect traffic; challenge admission and stale-handshake rejection are proven by a raw rusty_enet replay test. |
 
 Compilation/testing has resumed; see the current update above for new evidence.
 The following records **historical packaged snapshots**, not verification of

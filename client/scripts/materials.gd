@@ -241,6 +241,9 @@ static func apply_light_overrides(light: Light3D) -> void:
 
 static var shadow_signature := PackedInt64Array()
 static var shadow_scratch := PackedInt64Array()
+# Account-level "shadows" preference; false disables all dynamic shadows
+# without touching authored light state.
+static var shadows_enabled := true
 
 static func refresh_shadows() -> void:
 	# Walk only when the tracked set or a light's tier/visibility/request changed.
@@ -259,7 +262,7 @@ static func refresh_shadows() -> void:
 		if not is_instance_valid(light) or light.is_queued_for_deletion():
 			continue
 		shadow_scratch[index] = light.get_instance_id()
-		shadow_scratch[index + 1] = (1 if light.visible else 0) | (int(light.get_meta("ssc_quality", 1)) << 1) | ((1 if bool(light.get_meta("ssc_creator_shadow", light.get_meta("ssc_authored_shadow", false))) else 0) << 4)
+		shadow_scratch[index + 1] = (1 if light.visible else 0) | (int(light.get_meta("ssc_quality", 1)) << 1) | ((1 if bool(light.get_meta("ssc_creator_shadow", light.get_meta("ssc_authored_shadow", false))) else 0) << 4) | ((1 if shadows_enabled else 0) << 5)
 		index += 2
 	if shadow_scratch == shadow_signature:
 		return
@@ -272,7 +275,7 @@ static func refresh_shadows() -> void:
 			continue
 		retained.append(reference)
 		var requested: bool = bool(light.get_meta("ssc_creator_shadow",light.get_meta("ssc_authored_shadow",false)))
-		var enabled: bool = light.visible and int(light.get_meta("ssc_quality",1)) > 0 and requested and allocated < SHADOW_LIGHT_LIMIT
+		var enabled: bool = shadows_enabled and light.visible and int(light.get_meta("ssc_quality",1)) > 0 and requested and allocated < SHADOW_LIGHT_LIMIT
 		light.shadow_enabled = enabled
 		if enabled:
 			allocated += 1

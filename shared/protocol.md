@@ -42,6 +42,8 @@ Kinds: 1 authenticate; 2 authoritative snapshot; 3 pose/transform sample;
 13 declared avatar action; 14 body-tracker inputs; 20 Opus; 21 private calls;
 22 media command; 23 monotonic clock probe; 24 radio voice; 25 radio data;
 26 negotiated rate announce; 27 unreliable pose fragment; 28 input-focus state;
+29 mid-session rate request (`{send_divisor,receive_divisor}` in 1/2/4; the
+server clamps to policy and confirms with kind 26);
 255 error. Except client pose and
 voice samples, payloads are bounded UTF-8 JSON.
 This is an explicit binary envelope with JSON state, not a compact finalized

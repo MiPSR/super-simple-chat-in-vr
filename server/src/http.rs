@@ -1,4 +1,4 @@
-use crate::{App, assets, auth, db, realtime, world};
+use crate::{App, assets, auth, db, logs, realtime, world};
 use axum::{
     Json, Router,
     body::Body,
@@ -26,7 +26,7 @@ impl ApiError {
         Self(StatusCode::NOT_FOUND, s.into())
     }
     pub fn internal(e: impl std::fmt::Display) -> Self {
-        eprintln!("Request error: {e}");
+        logs::record(format!("Request error: {e}"));
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal error; see server logs".into(),
@@ -91,6 +91,7 @@ pub fn router(app: Arc<App>) -> Router {
             put(update_user).delete(revoke_user),
         )
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/logs", get(admin_logs))
         .route("/api/v1/admin/assets/gc", post(collect_assets))
         .route("/api/v1/admin/assets/{id}/enabled", post(set_asset_enabled))
         .layer(DefaultBodyLimit::max(
@@ -609,6 +610,7 @@ async fn allow_user(
     if !(5..=24).contains(&q.id.len()) || !q.id.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ApiError::bad("Expected a Discord snowflake ID"));
     }
+    logs::record(format!("Admin: allowlisted {}", q.id));
     app.db.lock().unwrap().execute(
         "INSERT INTO users(id,world_slots,avatar_slots,world_bytes,avatar_bytes) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=1",
         rusqlite::params![
@@ -638,11 +640,12 @@ async fn revoke_user(
     auth::admin(&app, &headers)?;
     let db = app.db.lock().unwrap();
     db.execute("UPDATE users SET enabled=0 WHERE id=?", [&id])?;
-    db.execute("DELETE FROM sessions WHERE user_id=?", [id])?;
+    db.execute("DELETE FROM sessions WHERE user_id=?", [id.as_str()])?;
     drop(db);
     // Suspended users lose live connections on the next authoritative tick,
     // not after a cache TTL.
     db::bump_policy_epoch();
+    logs::record(format!("Admin: suspended {id} and revoked sessions"));
     Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
@@ -688,12 +691,16 @@ async fn update_user(
 }
 async fn admin_health(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     auth::admin(&app, &headers)?;
-    let w = app.worlds.lock().unwrap();
-    Ok(Json(
+    let w = app.worlds.lock().unwrap();    Ok(Json(
         json!({"instances":w.instances.len(),"players":w.instances.values().map(|i|i.players.len()).sum::<usize>(),"tick":w.tick,"tps":app.config.tps,"uploads":app.uploads.usage(),"creator_vms":world::creator_vm_usage(),"realtime_output":realtime::output_usage(),
             "limits":{"instances":app.config.instance_limit,"instance_players":app.config.instance_players},
             "defaults":{"world_slots":app.config.default_world_slots,"avatar_slots":app.config.default_avatar_slots,"world_bytes":app.config.default_world_bytes,"avatar_bytes":app.config.default_avatar_bytes}}),
     ))
+}
+
+async fn admin_logs(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    Ok(Json(logs::snapshot()))
 }
 
 #[derive(Deserialize)]
@@ -716,6 +723,10 @@ async fn set_asset_enabled(
     if changed == 0 {
         return Err(ApiError::not_found("Unknown asset"));
     }
+    logs::record(format!(
+        "Admin: asset {id} listing {}",
+        if q.enabled { "enabled" } else { "disabled" }
+    ));
     Ok(Json(json!({"ok":true,"enabled":q.enabled})))
 }
 
@@ -724,5 +735,9 @@ async fn collect_assets(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiR
     let stats = crate::asset_store::collect_once(app)
         .await
         .map_err(ApiError::internal)?;
+    logs::record(format!(
+        "Admin: manual asset GC (scanned {}, removed {})",
+        stats.scanned, stats.files
+    ));
     Ok(Json(json!(stats)))
 }

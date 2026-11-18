@@ -25,6 +25,9 @@ func setup(model: Node3D, queries: bool = false) -> void:
 		query_nodes.append(model)
 		for node in model.find_children("*", "Node3D", true, false):
 			query_nodes.append(node as Node3D)
+	# Upstream godot-vrm #157 workaround (see vrm_runtime.gd): rebind skinned
+	# meshes once the model enters the tree and its skeleton binding settles.
+	model.ready.connect(func(): preload("res://scripts/vrm_runtime.gd").invalidate_skeletons(model))
 	add_child(model)
 	var found := model.find_children("*", "Skeleton3D", true, false)
 	if found.is_empty():

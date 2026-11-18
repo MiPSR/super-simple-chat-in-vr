@@ -480,12 +480,12 @@ impl Instance {
                 self.suppressed_script_diagnostics.saturating_add(1);
             return;
         }
-        eprintln!(
+        crate::logs::record(format!(
             "World {}: {} ({} similar diagnostics suppressed)",
             self.id,
             error_message::bounded(message),
             self.suppressed_script_diagnostics
-        );
+        ));
         self.last_script_diagnostic = Some(Instant::now());
         self.suppressed_script_diagnostics = 0;
     }
@@ -1573,8 +1573,7 @@ impl Instance {
             .collect();
         json!({"instance":self.id,"world":self.world,"version":self.version,"revision":self.revision,"tick":tick,"players":self.players,"entities":self.entities,"visual":self.visual,"variables":*self.variables.lock().unwrap(),"manifest":self.manifest,"scores":self.scores,"clock":self.clock,"interactions":self.interactions,"media":media})
     }
-    pub fn media_command(&mut self, actor: &str, request: media::Request) -> anyhow::Result<()> {
-        let surface = self
+    pub fn media_command(&mut self, actor: &str, request: media::Request) -> anyhow::Result<()> {        let surface = self
             .manifest
             .video_surfaces
             .iter()

@@ -23,6 +23,19 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+/// True when a user systemd manager can actually run scopes. Headless test
+/// machines often have none; the media worker's fail-closed confinement
+/// (Landlock/seccomp/rlimits) is independent of the optional cgroup scope.
+fn user_systemd() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
 
 struct Api {
     client: reqwest::Client,
@@ -93,13 +106,21 @@ impl Peer {
         let project = std::env::var_os("SSC_TEST_CLIENT")
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../client"));
-        let mut child = Command::new("godot4")
+        let mut command = Command::new("godot4");
+        command
             .args(["--headless", "--path"])
             .arg(project)
             .args(["--script", "res://tests/peer.gd", "--xr-mode", "off"])
             .env("SSC_TEST_CONFIG", config)
             .env_remove("no_proxy")
-            .env_remove("NO_PROXY")
+            .env_remove("NO_PROXY");
+        // Packaged launchers always set the scope runner, but headless test
+        // machines may have no user systemd manager; the media worker's own
+        // Landlock/seccomp/rlimit confinement does not depend on it.
+        if !user_systemd() {
+            command.env_remove("SSC_MEDIA_SCOPE");
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -639,12 +660,22 @@ async fn encrypted_godot_enet() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
+    let stress_cycles: u32 = std::env::var("SSC_STRESS_CYCLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|cycles| (1..=100_000).contains(cycles))
+        .unwrap_or(100);
+    let stress_timeout = 30u64.saturating_mul(u64::from((stress_cycles / 100).max(1)));
     let output = Command::new("timeout")
-        .args(["30", "godot4", "--headless", "--xr-mode", "off", "--path"])
+        .arg(stress_timeout.to_string())
+        .args(["godot4", "--headless", "--xr-mode", "off", "--path"])
         .arg(&project)
         .args(["--script", "res://tests/lifecycle_stress.gd"])
         .env("SSC_TEST_OPUS", &opus_file)
-        .env("SSC_STRESS_CYCLES", "100")
+        // The documented soak is reproducible: an outer SSC_STRESS_CYCLES
+        // raises it above the default 100-cycle regression count, with the
+        // deadline scaled so longer runs are not killed early.
+        .env("SSC_STRESS_CYCLES", stress_cycles.to_string())
         .output()?;
     ensure!(
         output.status.success()
@@ -709,11 +740,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     // Headless test machines may have no user systemd manager; the packaged
     // launcher always sets the scope runner, but the worker's own
     // Landlock/seccomp/rlimit confinement does not depend on it.
-    let scoped_media = Command::new("systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+    let scoped_media = user_systemd();
     let video_project = project.clone();
     let video_url = media_url.clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -961,6 +988,23 @@ async fn encrypted_godot_enet() -> Result<()> {
     println!(
         "PASS encrypted text/state, malformed packets, independent full/quarter pose rates: {counts:?}"
     );
+    // Mid-session renegotiation: a live client may lower its own rates without
+    // rejoining; the server announces the effective pair and other sessions
+    // keep their negotiated rates.
+    b.command(
+        json!({"action":"command","kind":29,"data":{"send_divisor":2,"receive_divisor":2}}),
+    )?;
+    b.wait(|e| {
+        e["kind"].as_f64() == Some(26.0)
+            && e["data"]["reason"] == "client-request"
+            && e["data"]["send_hz"].as_f64() == Some(30.0)
+            && e["data"]["receive_hz"].as_f64() == Some(30.0)
+    })
+    .await?;
+    a.command(json!({"action":"command","kind":4,"data":{"text":"rates changed"}}))?;
+    a.wait(|e| e["kind"].as_f64() == Some(4.0) && e["data"]["text"] == "rates changed").await?;
+    b.wait(|e| e["kind"].as_f64() == Some(4.0) && e["data"]["text"] == "rates changed").await?;
+    println!("PASS mid-session rate renegotiation without affecting other sessions");
     let grant = api
         .json(
             "/api/v1/game-grants",
@@ -1955,6 +1999,27 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
         )
         .await?;
     ensure!(grant["protocol"] == 2, "Grant did not advertise protocol 2");
+    // Bounded administrator log ring: authenticated-only, with recorded admin
+    // actions inspectable without a log shipper.
+    ensure!(
+        api.response("/api/v1/admin/logs", None, &tokens[0])
+            .await?
+            .status()
+            == 403
+    );
+    let logs = api.json("/api/v1/admin/logs", None, &api.admin).await?;
+    let entries = logs.as_array().unwrap();
+    ensure!(!entries.is_empty() && entries.len() <= 256);
+    ensure!(
+        entries
+            .iter()
+            .any(|entry| entry["line"].as_str().is_some_and(|line| line.contains("allowlisted")))
+    );
+    ensure!(
+        entries.iter().any(|entry| entry["line"]
+            .as_str()
+            .is_some_and(|line| line.contains("asset") && line.contains("disabled")))
+    );
     // Raw ENet admission: the server speaks first with a per-connection
     // challenge; a captured handshake from another connection must fail.
     let secret = hex::decode(grant["secret"].as_str().unwrap())?;

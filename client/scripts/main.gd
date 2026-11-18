@@ -166,6 +166,9 @@ func _ready() -> void:
 				world_root.get_meta("ssc_audio").clear()
 			world_root.queue_free()
 		world_root = root
+		# Upstream godot-vrm #157 workaround: skinned meshes can render distorted
+		# until the Skeleton3D is invalidated; rebind right after tree entry.
+		root.ready.connect(func(): VRMRuntime.invalidate_skeletons(root))
 		add_child(root)
 		var audio := PackagedAudio.new()
 		root.add_child(audio)
@@ -421,6 +424,9 @@ func _build_phone() -> void:
 		preferences.merge(updates, true)
 		_apply_preferences()
 		_save_preferences()
+		# Rate divisors apply immediately mid-session, not just at the next grant.
+		if network.joined and (updates.has("send_divisor") or updates.has("receive_divisor")):
+			network.request_rates(int(preferences.get("send_divisor", 1)), int(preferences.get("receive_divisor", 1)))
 	)
 	_button(column, "Disconnect", func(): network.close(); _clear_instance(); _status("Disconnected"))
 	var people_scroll := ScrollContainer.new()
@@ -1184,6 +1190,8 @@ func _preferences_received(result: int, code: int, _headers: PackedStringArray, 
 		_status("Preferences saved")
 
 func _apply_preferences() -> void:
+	Materials.shadows_enabled = bool(preferences.get("shadows", true))
+	Materials.refresh_shadows()
 	phone_hand = 0 if str(preferences.get("phone_hand", "right")) == "left" else 1
 	quality = int(preferences.get("quality", 1))
 	sleeping = bool(preferences.get("sleeping", false))

@@ -315,6 +315,12 @@ func command(kind: int, data: Dictionary) -> void:
 	if joined and (input_enabled or kind not in [5,6,12,13,25]):
 		peer.send(0, cipher.seal(0, 0, kind, JSON.stringify(data).to_utf8_buffer()), ENetPacketPeer.FLAG_RELIABLE)
 
+func request_rates(send_divisor: int, receive_divisor: int) -> void:
+	# Mid-session renegotiation (kind 29): the server clamps to policy and
+	# confirms with a kind-26 announce; other sessions are unaffected.
+	if joined and [1, 2, 4].has(send_divisor) and [1, 2, 4].has(receive_divisor):
+		command(29, {"send_divisor": send_divisor, "receive_divisor": receive_divisor})
+
 func media_timeline(state: Dictionary) -> Dictionary:
 	var adjusted := state.duplicate()
 	if clock_ready and bool(state.get("playing", false)):
