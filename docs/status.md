@@ -8,6 +8,21 @@ tests seed their own isolated temporary database sessions.
 
 ## Correction pass (2026-11-18)
 
+### World browser follow-up (2026-11-23)
+
+- The phone's Worlds tab searches the published catalog, creates invite-only
+  instances, lets instance owners invite a Discord ID, and redeems instance
+  IDs/tokens. Invitations still use the existing five-minute, account-bound,
+  one-use server flow. Failed grants do not switch the active game connection.
+- The website also exposes invitation redemption. Instance lists now provide
+  `can_invite` so both interfaces show invitation controls only to owners;
+  the server independently enforces ownership.
+- Verification: full workspace tests pass; website tests pass 11/11;
+  server Clippy passes with warnings denied. Real Godot peers exercise HTTP
+  private-instance creation, owner-only invitations, invited admission and
+  member discovery; phone tests cover search encoding, per-card targets,
+  rate preferences, token clearing and failed-response handling.
+
 ### Gameplay follow-up (2026-11-23)
 
 - Artificial locomotion now uses Godot's character collision/slide solver

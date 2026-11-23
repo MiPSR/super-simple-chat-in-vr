@@ -1625,10 +1625,11 @@ async fn encrypted_godot_enet() -> Result<()> {
     let grant = api
         .json(
             "/api/v1/game-grants",
-            Some(json!({"world":asset["id"]})),
+            Some(json!({"world":asset["id"],"private":true})),
             &tokens[0],
         )
         .await?;
+    // Start a private instance through the same grant API used by the browser.
     let mut fresh = Peer::start(directory.path(), "fresh", grant)?;
     let state = fresh.wait(|e| e["data"]["user"].is_string()).await?;
     ensure!(
@@ -1660,6 +1661,26 @@ async fn encrypted_godot_enet() -> Result<()> {
         "Snapshot lacked the replicated visual map"
     );
     println!("PASS manifest-optional revision resnapshots with replicated visual state");
+    let private_id = snapshot(&state)["instance"].as_str().unwrap();
+    let owner_list = api.json("/api/v1/instances", None, &tokens[0]).await?;
+    ensure!(owner_list.as_array().unwrap().iter().any(|i| i["id"] == private_id && i["can_invite"] == true));
+    let stranger_list = api.json("/api/v1/instances", None, &tokens[1]).await?;
+    ensure!(!stranger_list.as_array().unwrap().iter().any(|i| i["id"] == private_id));
+    let invite_path = format!("/api/v1/instances/{private_id}/invite");
+    ensure!(api.response(&invite_path, Some(json!({"user":users[2]})), &tokens[1]).await?.status() == 403);
+    let invitation = api.json(&invite_path, Some(json!({"user":users[1]})), &tokens[0]).await?;
+    ensure!(invitation["expires_in"] == 300);
+    let invited_grant = api.json("/api/v1/game-grants", Some(json!({
+        "instance":private_id, "invitation":invitation["invitation"],
+        "send_divisor":2,"receive_divisor":4
+    })), &tokens[1]).await?;
+    let mut invited = Peer::start(directory.path(), "invited", invited_grant)?;
+    let invited_state = invited.wait(|e| e["data"]["user"].is_string()).await?;
+    ensure!(snapshot(&invited_state)["instance"] == private_id);
+    let member_list = api.json("/api/v1/instances", None, &tokens[1]).await?;
+    ensure!(member_list.as_array().unwrap().iter().any(|i| i["id"] == private_id && i["can_invite"] == false));
+    invited.stop().await?;
+    println!("PASS HTTP private-instance creation, owner-only invitations, account-bound redemption and member discovery");
     let pending_gc_grant = api
         .json(
             "/api/v1/game-grants",

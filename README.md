@@ -45,6 +45,13 @@ default. The client has a desktop
 fallback if no XR runtime is available; explicitly disabling XR avoids runtime
 discovery errors during headset-free testing.
 
+After signing in, use the phone's **Worlds** tab to search worlds, join live
+instances, or create an invite-only instance. Instance owners can enter a
+friend's Discord ID to generate a five-minute invitation. Share its instance ID
+and invitation token with that person; they enter both under **Join an
+invitation** on the phone or website. Invitations are account-bound and used
+once; an empty instance disappears, including its invitations.
+
 ### With a headset later
 
 ```sh

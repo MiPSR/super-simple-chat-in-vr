@@ -99,7 +99,8 @@ async function refresh() {
     const names = roster.slice(0, 12).map(p => p.name || p.id);
     const extra = roster.length - names.length;
     const a = article(i.id, `${i.players}/${i.capacity} players · ${i.private ? "Invite-only" : "Public"}${names.length ? ` · ${names.join(", ")}${extra > 0 ? ` +${extra} more` : ""}` : ""}`);
-    a.append(button("Join", () => grant({ instance: i.id })), button("Invite user", async () => {
+    a.append(button("Join", () => grant({ instance: i.id })));
+    if (i.can_invite) a.append(button("Invite user", async () => {
       const user = prompt("Discord ID to invite"); if (!user) return;
       const invite = await api(`/instances/${i.id}/invite`, { method: "POST", body: { user } });
       status(`Invite: ${JSON.stringify({instance: i.id, ...invite})}`);
@@ -133,6 +134,10 @@ async function load() {
 }
 action("admin-login", async () => { adminSecret = $("admin-secret").value; $("admin-secret").value = ""; try { await load(); } catch(e) {adminSecret = ""; throw e;} });
 action("search", refresh);
+action("join-invitation", async () => {
+  await grant({instance:$("invite-instance").value.trim(),invitation:$("invite-token").value.trim()});
+  $("invite-token").value = "";
+});
 action("preferences", async () => {
   const p = { ...me.preferences };
     for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "draw_distance", "texture_lod_bias", "texture_reduction", "radial_hold_seconds", "turn_angle", "move_speed"].includes(key) ? Number(el.value) : el.value; }

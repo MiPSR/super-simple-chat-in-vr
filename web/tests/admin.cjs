@@ -64,6 +64,33 @@ test("admin logs display timestamps and untrusted content as plain text",async (
   assert.equal(request.options.headers.Authorization,"Bearer " + "s".repeat(32));
 });
 
+test("invitation redemption requests a grant with account rates and clears the token on success",async () => {
+  const p = await page({send_divisor:2,receive_divisor:4}, {"/api/v1/game-grants":{ticket:"ticket",secret:"secret"}});
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  p.elements.get("invite-instance").value = " instance1 ";
+  p.elements.get("invite-token").value = " token1 ";
+  p.elements.get("grant").select = () => {};
+  await p.submit("join-invitation");
+  const request = p.requests.find(request => request.path === "/api/v1/game-grants");
+  assert.deepEqual(JSON.parse(request.options.body),{instance:"instance1",invitation:"token1",send_divisor:2,receive_divisor:4});
+  assert.equal(p.elements.get("invite-token").value,"");
+  assert.equal(JSON.parse(p.elements.get("grant").value).host,"example.com");
+});
+
+test("failed invitation redemption preserves the token and does not replace the old grant",async () => {
+  const p = await page({send_divisor:1,receive_divisor:1}, {"/api/v1/game-grants":() => ({ok:false,json:async () => ({error:"Invitation expired"})})});
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  p.elements.get("invite-instance").value = "instance1";
+  p.elements.get("invite-token").value = "token1";
+  p.elements.get("grant").value = "old grant";
+  await p.submit("join-invitation");
+  assert.equal(p.elements.get("invite-token").value,"token1");
+  assert.equal(p.elements.get("grant").value,"old grant");
+  assert.match(p.elements.get("status").textContent,/Invitation expired/);
+});
+
 test("comfort controls save numeric values and preserve checkbox preferences",async () => {
   const p = await page({turn_angle:30,move_speed:1.5,shadows:true,snap_turn:true});
   const controls = {turn_angle:new Element(),move_speed:new Element(),shadows:new Element(),snap_turn:new Element()};

@@ -1964,7 +1964,7 @@ impl Registry {
         }
     }
     pub fn list(&self, user: &str) -> Value {
-        json!(self.instances.values().filter(|i|!i.private || i.owner==user || i.players.contains_key(user)).map(|i|json!({"id":i.id,"world":i.world,"version":i.version,"players":i.players.len(),"capacity":i.capacity,"private":i.private,
+        json!(self.instances.values().filter(|i|!i.private || i.owner==user || i.players.contains_key(user)).map(|i|json!({"id":i.id,"world":i.world,"version":i.version,"players":i.players.len(),"capacity":i.capacity,"private":i.private,"can_invite":i.owner==user,
             "roster":i.players.values().map(|p|json!({"id":p.id,"name":p.name})).collect::<Vec<_>>()})).collect::<Vec<_>>())
     }
 }
@@ -2485,6 +2485,8 @@ mod tests {
         let public = registry
             .admit(&base, "c", "C", "public", manifest(), vec![])
             .unwrap();
+        assert!(registry.list("a").as_array().unwrap().iter().any(|i| i["id"] == private && i["can_invite"] == true));
+        assert!(registry.list("b").as_array().unwrap().iter().any(|i| i["id"] == public && i["can_invite"] == false));
         assert!(
             !registry
                 .list("b")

@@ -12,6 +12,10 @@ var receive_divisor := 1
 var world_column: VBoxContainer
 var instance_column: VBoxContainer
 var pending := ""
+var search_input: LineEdit
+var invite_instance: LineEdit
+var invite_token: LineEdit
+var invitation_output: LineEdit
 
 func _ready() -> void:
 	request = HTTPRequest.new()
@@ -21,6 +25,8 @@ func _ready() -> void:
 	var title := Label.new()
 	title.text = "Worlds and instances available to your grant"
 	add_child(title)
+	search_input = _text_input("Search worlds", 120)
+	search_input.text_submitted.connect(func(_text: String): _refresh())
 	var refresh := Button.new()
 	refresh.text = "Refresh lists"
 	refresh.custom_minimum_size.y = 54
@@ -28,6 +34,24 @@ func _ready() -> void:
 	add_child(refresh)
 	world_column = _section("Worlds")
 	instance_column = _section("Instances")
+	_section("Join an invitation")
+	invite_instance = _text_input("Instance ID", 128)
+	invite_token = _text_input("Invitation token", 128)
+	var redeem := Button.new()
+	redeem.text = "Join invited instance"
+	redeem.custom_minimum_size.y = 54
+	redeem.pressed.connect(_redeem_invitation)
+	add_child(redeem)
+	invitation_output = _text_input("Created invitation (share with the invited person)", 512)
+	invitation_output.editable = false
+
+func _text_input(placeholder: String, length: int) -> LineEdit:
+	var input := LineEdit.new()
+	input.placeholder_text = placeholder
+	input.max_length = length
+	input.custom_minimum_size.y = 54
+	add_child(input)
+	return input
 
 func _section(title: String) -> VBoxContainer:
 	var label := Label.new()
@@ -40,6 +64,9 @@ func _section(title: String) -> VBoxContainer:
 	return column
 
 func configure(url: String, token: String, send: int, receive: int) -> void:
+	request.cancel_request()
+	pending = ""
+	invitation_output.clear()
 	base_url = url
 	credentials = token
 	send_divisor = send if [1, 2, 4].has(send) else 1
@@ -47,7 +74,7 @@ func configure(url: String, token: String, send: int, receive: int) -> void:
 	_refresh()
 
 func _refresh() -> void:
-	_load("/api/v1/assets?kind=world", "worlds")
+	_load("/api/v1/assets?kind=world&q=" + search_input.text.strip_edges().uri_encode(), "worlds")
 
 func _load(path: String, mode: String) -> void:
 	if base_url.is_empty() or credentials.is_empty():
@@ -61,17 +88,43 @@ func _load(path: String, mode: String) -> void:
 		pending = ""
 		status.emit("Could not reach the asset API")
 
-func _join(kind: String, id: String) -> void:
+func _post(path: String, mode: String, payload: Dictionary) -> void:
 	if base_url.is_empty() or credentials.is_empty():
 		return
 	if request.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
 		status.emit("Still waiting on the asset API; try again shortly")
 		return
-	pending = "join"
-	var error := request.request(base_url + "/api/v1/game-grants", PackedStringArray(["Authorization: Bearer " + credentials,"Content-Type: application/json"]), HTTPClient.METHOD_POST, JSON.stringify({kind: id, "send_divisor": send_divisor, "receive_divisor": receive_divisor}))
+	pending = mode
+	var error := request.request(base_url + path, PackedStringArray(["Authorization: Bearer " + credentials,"Content-Type: application/json"]), HTTPClient.METHOD_POST, JSON.stringify(payload))
 	if error != OK:
 		pending = ""
-		status.emit("Could not request a join grant")
+		status.emit("Could not send the instance request")
+
+func _join(kind: String, id: String, private_instance: bool = false, invitation: String = "") -> void:
+	var payload := {kind: id, "send_divisor": send_divisor, "receive_divisor": receive_divisor}
+	if private_instance:
+		payload.private = true
+	if not invitation.is_empty():
+		payload.invitation = invitation
+	_post("/api/v1/game-grants", "join", payload)
+
+func _redeem_invitation() -> void:
+	var instance := invite_instance.text.strip_edges()
+	var token := invite_token.text.strip_edges()
+	if instance.is_empty() or token.is_empty():
+		status.emit("Enter both the instance ID and invitation token")
+		return
+	_join("instance", instance, false, token)
+
+func _invite(instance: String, user: String) -> void:
+	user = user.strip_edges()
+	var digits := true
+	for byte in user.to_utf8_buffer():
+		digits = digits and byte >= 48 and byte <= 57
+	if user.length() < 5 or user.length() > 24 or not digits:
+		status.emit("Enter the invited person's Discord user ID")
+		return
+	_post("/api/v1/instances/" + instance.uri_encode() + "/invite", "invite:" + instance, {"user": user})
 
 func _completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	var mode := pending
@@ -83,6 +136,14 @@ func _completed(result: int, code: int, _headers: PackedStringArray, body: Packe
 		status.emit("Request failed (HTTP %s): %s" % [code, _http_note(code)])
 		return
 	var data = JSON.parse_string(body.get_string_from_utf8())
+	if mode.begins_with("invite:"):
+		if data is Dictionary and data.get("invitation") is String and not str(data.invitation).is_empty():
+			var instance := mode.trim_prefix("invite:")
+			invitation_output.text = JSON.stringify({"instance": instance, "invitation": data.invitation})
+			status.emit("Invitation created; share the instance ID and token with that person. Expires in five minutes.")
+		else:
+			status.emit("Malformed invitation response")
+		return
 	match mode:
 		"worlds":
 			_render_worlds(data if data is Array else [])
@@ -98,6 +159,7 @@ func _completed(result: int, code: int, _headers: PackedStringArray, body: Packe
 static func _http_note(code: int) -> String:
 	match code:
 		401: return "sign in again or paste a fresh grant"
+		403: return "not permitted; private instances require an invitation for your account"
 		404: return "world or instance is gone"
 		429: return "rate limited; wait before retrying"
 		_: return "unexpected response"
@@ -107,6 +169,7 @@ func _grant(data: Dictionary) -> void:
 		status.emit("Incomplete join grant response")
 		return
 	data.host = _host_from_url(str(data.api_url))
+	invite_token.clear()
 	join_requested.emit(data)
 
 static func _host_from_url(url: String) -> String:
@@ -135,6 +198,8 @@ func _render_worlds(list: Array) -> void:
 		description.custom_minimum_size = Vector2(500, 0)
 		card.add_child(description)
 		card.add_child(_join_button("Join world", "world", str(row.get("id", ""))))
+		var private_button := _join_button("Create invite-only instance", "world", str(row.get("id", "")), true)
+		card.add_child(private_button)
 		world_column.add_child(card)
 
 func _render_instances(list: Array) -> void:
@@ -152,11 +217,22 @@ func _render_instances(list: Array) -> void:
 		roster.text = ", ".join(names)
 		card.add_child(roster)
 		card.add_child(_join_button("Join instance", "instance", str(row.get("id", ""))))
+		if bool(row.get("can_invite", false)):
+			var user := LineEdit.new()
+			user.placeholder_text = "Discord user ID to invite"
+			user.max_length = 24
+			user.custom_minimum_size.y = 54
+			card.add_child(user)
+			var invite := Button.new()
+			invite.text = "Invite user (five minutes)"
+			invite.custom_minimum_size.y = 54
+			invite.pressed.connect(func(): _invite(str(row.id), user.text))
+			card.add_child(invite)
 		instance_column.add_child(card)
 
-func _join_button(label: String, kind: String, id: String) -> Button:
+func _join_button(label: String, kind: String, id: String, private_instance: bool = false) -> Button:
 	var button := Button.new()
 	button.text = label
 	button.custom_minimum_size.y = 54
-	button.pressed.connect(_join.bind(kind, id))
+	button.pressed.connect(_join.bind(kind, id, private_instance))
 	return button
