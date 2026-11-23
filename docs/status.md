@@ -15,6 +15,16 @@ tests seed their own isolated temporary database sessions.
   below-size quota rejection, and own-asset deletion. Catalog enable/disable
   and grant denial for disabled assets were already covered.
 
+### Packet-loss follow-up (2026-11-23)
+
+- Added a lossy-UDP-proxy acceptance test: every fourth packet per direction is
+  dropped between a raw encrypted client and the live server. Challenge
+  admission, the full admission snapshot, and sustained reliable commands all
+  complete through ENet's own retransmission; no session drop occurs.
+- The test cipher helper now honors the envelope's per-channel replay counter
+  (post-admission client sends continue past the admission sequence).
+- Remaining: multi-instance saturation/load balancing acceptance.
+
 ## Correction pass (2026-11-18)
 
 ### Creator-budget follow-up (2026-11-23)
@@ -491,7 +501,7 @@ No row below waives any part of the corresponding scenario.
 | 5 | GLB and ephemeral instances tested; private instances, owner-only invitations and account-bound redemption pass with real peers; broader multi-party invitation/search acceptance remains. |
 | 6 | Real peers exercise doors, tanks, projectiles, spawning, damage and scores. |
 | 7 | Real peers exercise late join, reconnect and last-player destruction. |
-| 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; packet-loss/load acceptance remains. |
+| 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; 25%-loss admission and reliable-command acceptance passes through a dropping UDP proxy; multi-instance load acceptance remains. |
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
 | 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |

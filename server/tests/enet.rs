@@ -1809,6 +1809,16 @@ fn test_key(secret: &[u8], direction: u8, purpose: u8) -> [u8; 32] {
     hash.finalize().into()
 }
 fn test_seal(secret: &[u8], channel: u8, direction: u8, kind: u8, payload: &[u8]) -> Vec<u8> {
+    test_seal_seq(secret, channel, direction, kind, payload, 1)
+}
+fn test_seal_seq(
+    secret: &[u8],
+    channel: u8,
+    direction: u8,
+    kind: u8,
+    payload: &[u8],
+    sequence: u64,
+) -> Vec<u8> {
     use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
     use hmac::{Hmac, Mac};
     let iv = rand::random::<[u8; 16]>();
@@ -1820,7 +1830,7 @@ fn test_seal(secret: &[u8], channel: u8, direction: u8, kind: u8, payload: &[u8]
     )
     .encrypt_padded_vec_mut::<Pkcs7>(&plain);
     let mut frame = vec![1u8, channel, direction];
-    frame.extend_from_slice(&1u64.to_le_bytes());
+    frame.extend_from_slice(&sequence.to_le_bytes());
     frame.extend_from_slice(&iv);
     frame.extend_from_slice(&sealed);
     let mut mac = Hmac::<Sha256>::new_from_slice(&test_key(secret, direction, 1)).unwrap();
@@ -2355,5 +2365,231 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     let accounts = api.json("/api/v1/admin/users", None, &api.admin).await?;
     ensure!(accounts.as_array().unwrap().iter().any(|user| user["id"] == "444444444" && user["world_slots"] == 7));
     println!("PASS validated administrator policy edits, rejected secret fields, unchanged live policies and SQLite persistence across restart");
+    Ok(())
+}
+
+/// A UDP proxy that drops every fourth packet per direction, so ENet's own
+/// retransmission must carry the encrypted session end to end.
+#[tokio::test]
+async fn encrypted_session_survives_packet_loss() -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("ssc-loss-")
+        .tempdir_in(std::env::temp_dir())?;
+    let http_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let http_address = http_socket.local_addr()?;
+    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let udp_address = udp_socket.local_addr()?;
+    let api = Api {
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+        base: format!("http://{http_address}"),
+        admin: token(),
+    };
+    drop(http_socket);
+    drop(udp_socket);
+    let _server = Process(
+        Command::new(env!("CARGO_BIN_EXE_super-simple-chat-server"))
+            .env("SSC_ADMIN_TOKEN", &api.admin)
+            .env("SSC_DATA", directory.path())
+            .env("SSC_LISTEN", http_address.to_string())
+            .env("SSC_ENET", udp_address.to_string())
+            .env("SSC_PUBLIC_URL", &api.base)
+            .env("SSC_TPS", "60")
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if api.json("/health", None, &api.admin).await.is_ok() {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "Backend did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let user = "123456789";
+    let session = token();
+    api.json("/api/v1/admin/users", Some(json!({"id":user})), &api.admin)
+        .await?;
+    {
+        let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            + 3600;
+        db.execute(
+            "INSERT INTO sessions VALUES(?,?,?)",
+            rusqlite::params![hex::encode(Sha256::digest(session.as_bytes())), user, expires],
+        )?;
+    }
+    let mut package = Cursor::new(Vec::new());
+    example_world::write(&mut package)?;
+    let asset = api
+        .upload("world", &package.into_inner(), &session)
+        .await?;
+    let grant = api
+        .json(
+            "/api/v1/game-grants",
+            Some(json!({"world":asset["id"]})),
+            &session,
+        )
+        .await?;
+    let secret = hex::decode(grant["secret"].as_str().unwrap())?;
+    let ticket = grant["ticket"].as_str().unwrap().as_bytes().to_vec();
+
+    // Lossy proxy: the client connects here instead of the server directly.
+    let proxy = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let proxy_address = proxy.local_addr()?;
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let stopped = stopped.clone();
+        let dropped = dropped.clone();
+        std::thread::spawn(move || {
+            let mut client: Option<std::net::SocketAddr> = None;
+            let mut counter = 0u64;
+            let mut buf = [0u8; 65536];
+            proxy
+                .set_read_timeout(Some(Duration::from_millis(25)))
+                .unwrap();
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((size, source)) = proxy.recv_from(&mut buf) else {
+                    continue;
+                };
+                counter += 1;
+                if counter.is_multiple_of(4) {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                if source == udp_address {
+                    if let Some(client) = client {
+                        let _ = proxy.send_to(&buf[..size], client);
+                    }
+                } else {
+                    client = Some(source);
+                    let _ = proxy.send_to(&buf[..size], udp_address);
+                }
+            }
+        });
+    }
+
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let mut host = rusty_enet::Host::new(
+        socket,
+        rusty_enet::HostSettings {
+            peer_limit: 1,
+            channel_limit: 3,
+            ..Default::default()
+        },
+    )?;
+    let peer = {
+        let peer = host.connect(proxy_address, 3, 0)?;
+        peer.id()
+    };
+    // Challenge admission must complete through the lossy path.
+    let mut challenge: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while challenge.is_empty() {
+        while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+            if let rusty_enet::Event::Receive { channel_id, packet, .. } = event
+                && channel_id == 0
+                && packet.data().len() == 17
+                && packet.data()[0] == 0
+            {
+                challenge = packet.data()[1..].to_vec();
+            }
+        }
+        ensure!(Instant::now() < deadline, "No challenge greeting through the lossy proxy");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut reply = ticket.clone();
+    reply.extend_from_slice(&challenge);
+    reply.extend_from_slice(&test_seal(&secret, 0, 0, 1, &ticket));
+    host.peer_mut(peer)
+        .send(0, &rusty_enet::Packet::new(reply, rusty_enet::PacketKind::Reliable))?;
+    let mut admitted = Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while admitted.is_null() {
+        while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+            if let rusty_enet::Event::Receive { channel_id, packet, .. } = event
+                && channel_id == 0
+                && let Some((2, payload)) = test_open(&secret, 0, packet.data())
+                && let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                && value["user"].is_string()
+            {
+                admitted = value;
+            }
+        }
+        ensure!(Instant::now() < deadline, "Admission never completed under packet loss");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ensure!(
+        admitted["snapshot"]["manifest"].is_object(),
+        "Lossy admission snapshot lacked the manifest"
+    );
+    // Sustained reliable traffic: every echo must eventually return. Admission
+    // consumed channel-0 sequence 1, so post-admission sends continue from 2;
+    // the cipher rejects replayed or outdated sequence numbers.
+    let mut echoes = 0u32;
+    let mut sent = 0u32;
+    let mut sequence = 2u64;
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut disconnected = false;
+    let start = Instant::now();
+    let mut next_send = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) {
+        if Instant::now() >= next_send {
+            sent += 1;
+            let payload = format!("{{\"sent\":{sent}}}");
+            host.peer_mut(peer).send(
+                0,
+                &rusty_enet::Packet::new(
+                    test_seal_seq(&secret, 0, 0, 23, payload.as_bytes(), sequence),
+                    rusty_enet::PacketKind::Reliable,
+                ),
+            )?;
+            sequence += 1;
+            next_send += Duration::from_millis(250);
+        }
+        while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+            match event {
+                rusty_enet::Event::Receive { channel_id, packet, .. } => {
+                    if channel_id != 0 {
+                        continue;
+                    }
+                    if let Some((23, payload)) = test_open(&secret, 0, packet.data()) {
+                        let value: Value = serde_json::from_slice(&payload)?;
+                        // The server echoes the request counter as a float;
+                        // replies may lag several sends behind.
+                        if let Some(number) = value["sent"].as_f64()
+                            && value["server"].is_number()
+                            && seen.insert(number.to_bits())
+                        {
+                            echoes += 1;
+                        }
+                    }
+                }
+                rusty_enet::Event::Disconnect { .. } => disconnected = true,
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    ensure!(dropped > 20, "Proxy dropped too few packets to be a loss test");
+    ensure!(!disconnected, "The server dropped the session under packet loss");
+    ensure!(
+        sent >= 20,
+        "Too few echo attempts completed in the window (sent {sent})"
+    );
+    ensure!(
+        echoes * 2 >= sent,
+        "Reliable echo delivery collapsed under loss: {echoes}/{sent}"
+    );
+    host.peer_mut(peer).disconnect_now(0);
+    stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "PASS encrypted admission and reliable commands survive {dropped} dropped packets (echoes {echoes}/{sent})"
+    );
     Ok(())
 }
