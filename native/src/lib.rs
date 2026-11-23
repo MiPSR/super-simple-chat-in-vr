@@ -13,6 +13,8 @@ mod audio_budget;
 mod cache_lock;
 #[path = "../../shared/creator_objects.rs"]
 mod creator_objects;
+#[path = "../../shared/creator_api.rs"]
+pub mod creator_api;
 mod creator_scene;
 #[path = "../../shared/creator_state.rs"]
 mod creator_state;
@@ -101,6 +103,9 @@ impl Vm {
         });
         let commands = Arc::new(Mutex::new(Vec::new()));
         let api = lua.create_table()?;
+        // Independently versioned creator API (docs/authoring.md): scripts may
+        // gate behavior on the host's capability level.
+        api.set("api_version", creator_api::VERSION)?;
         let state = lua.create_table()?;
         let state_scene = scene.clone();
         state.set(
@@ -683,6 +688,8 @@ mod tests {
     use super::*;
     #[test]
     fn bounded_visual_sandbox() {
+        // The independently versioned creator API is visible to scripts.
+        assert!(Vm::new("assert(world.api_version == 1 and avatar.api_version == 1)", &[]).is_ok());
         assert!(Vm::new("while true do end", &[]).is_err());
         assert!(
             Vm::new(

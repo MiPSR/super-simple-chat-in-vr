@@ -36,6 +36,18 @@ tests seed their own isolated temporary database sessions.
   acceptance rows are covered headlessly; Internet-scale latency/jitter
   acceptance remains a deployment concern.
 
+### Creator API versioning follow-up (2026-11-23)
+
+- The creator Luau API now advertises `world.api_version` (and
+  `avatar.api_version` on client avatar scripts) as level 1, from a single
+  shared constant used by both the Rust server sandbox and the native client
+  VM. Scripts can gate optional behavior on it.
+- `docs/authoring.md` now states the independent contract versions (HTTP
+  `/api/v1`, wire protocol 2, manifest schema 1, creator API 1), the
+  coordinate/unit/rotation/serialization/timing conventions, the accepted
+  component identifiers, and message limits, replacing the previous implicit
+  definitions.
+
 ## Correction pass (2026-11-18)
 
 ### Creator-budget follow-up (2026-11-23)
@@ -516,7 +528,7 @@ No row below waives any part of the corresponding scenario.
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
 | 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |
-| 12 | Both bounded Luau hosts tested; complete typed API/event coverage and security audit remain. |
+| 12 | Both bounded Luau hosts tested; the creator API level (`world.api_version`) is advertised and documented with its independent versions/conventions; complete typed API/event coverage and security audit remain. |
 | 13 | Opus/text/calls/radio and native zone effects pass locally, including noise lifecycle, obstruction/exclusions, private dry routing and creator-call consent; real audio/headset and full policy acceptance remain. |
 | 14 | Cross-instance Opus/SSTV/FT8-style routing, blocking, channel denial and no-radio opt-out tested; client-world creator requests/presets locally tested; complete policy and real-audio checks remain. |
 | 15 | Historical two-peer public MP4/YouTube synchronization plus current isolated-helper YouTube and HTTP/failure recovery pass; long sessions and new-helper multi-peer/package revalidation remain. |

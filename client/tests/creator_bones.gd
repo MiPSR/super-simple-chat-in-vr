@@ -24,6 +24,7 @@ static func run() -> void:
 	runtime.scope = humanoid
 	runtime.set_process(false)
 	var vm = ClassDB.instantiate("CreatorVm")
+	assert(vm.load_script("assert(avatar.api_version == 1 and world.api_version == 1)", PackedStringArray([])).is_empty())
 	assert(vm.load_script("avatar.on('action',function() avatar.bone_rotation('bone0',0,0.5,0,0.5) end); avatar.on('release',function() avatar.reset_bone('bone0') end)", PackedStringArray(["visual"])).is_empty())
 	runtime.scripts.append({"vm":vm,"attachment":"avatar","failed":false})
 	var errors: Array[String] = []

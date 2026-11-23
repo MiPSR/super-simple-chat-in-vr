@@ -4,6 +4,8 @@ mod auth;
 mod config;
 #[path = "../../shared/creator_objects.rs"]
 mod creator_objects;
+#[path = "../../shared/creator_api.rs"]
+mod creator_api;
 #[path = "../../shared/creator_state.rs"]
 mod creator_state;
 mod db;

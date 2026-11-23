@@ -5,6 +5,37 @@ GLB/VRM files. The server does not execute scripts during validation. The full
 repository specification remains authoritative. This document describes only
 the implemented subset; see `docs/status.md` for remaining acceptance gaps.
 
+## Versions and conventions
+
+Creator-facing contracts are versioned independently:
+
+| Contract | Version |
+|---|---|
+| HTTP API | `/api/v1` |
+| Realtime ENet protocol | 2 (advertised in the connection grant) |
+| World/avatar manifest schema | 1 (`"schema":1`) |
+| Creator Luau API | 1 (`world.api_version` / `avatar.api_version`) |
+
+The Luau API version is advertised to scripts so they can gate optional
+behavior. Additive commands, properties, and events keep the level; removing or
+changing a signature/semantics bumps it, and older packages continue to run with
+their documented subset. Built-in object components validated today are
+`static`, `switch`, `door`, `prop`, `radio`, `video`, and `vehicle`; prefab
+definitions may be `prop`, `vehicle`, or `projectile`. Unknown components are
+rejected at publication. Wire strings, IDs, and component names are the stable
+identifiers.
+
+Conventions: metres and seconds; Godot right-handed coordinates (+Y up,
+forward −Z); positions `[x,y,z]`; quaternions `[x,y,z,w]`; rotations applied
+right-handed. Server ticks advance the authoritative clock; `world.after`
+timers use seconds and represent the same clock on both hosts. Serialized
+creator values are JSON-compatible; non-finite numbers, cyclic tables, and
+deep structures are rejected or bounded. Message limits: text ≤ 512 bytes,
+pose samples are fixed 84-byte frames, reliable command payloads ≤ 8 KiB,
+tag queries return ≤ 256 IDs, and replication/event queues are bounded as
+described below. Creator scripts never receive unbounded arrays or tables.
+
+
 Publication verifies actual decompressed ZIP lengths and CRCs, a 256 KiB
 manifest limit, and UTF-8/64 KiB limits on all Luau files, including unused ones.
 GLB files must contain aligned JSON followed by at most one embedded BIN chunk,

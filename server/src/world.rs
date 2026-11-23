@@ -370,6 +370,7 @@ impl Sandbox {
             }
         });
         let world = lua.create_table()?;
+        world.set("api_version", crate::creator_api::VERSION)?;
         let timers = creator_timers::TimerQueue::install(&lua, &world)?;
         let handlers = lua.create_table()?;
         lua.set_named_registry_value("handlers", handlers)?;
@@ -3551,6 +3552,9 @@ mod tests {
             );
         }
         assert!(Sandbox::new("world.state.set('on', false)", vars.clone(), &[]).is_err());
+        // The creator API level is advertised to scripts and kept in lockstep
+        // with the documented version.
+        Sandbox::new("assert(world.api_version == 1)", vars, &[]).unwrap();
     }
     #[test]
     fn declared_defaults_are_ephemeral_instance_state() {

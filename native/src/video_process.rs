@@ -368,6 +368,9 @@ mod tests {
     }
     #[test]
     #[ignore = "isolated worker: installs terminal parent-death and sandbox policies"]
+    // The resolver is deliberately never waited on: if the client dies, the
+    // kernel parent-death guard must terminate this worker and its child.
+    #[allow(clippy::zombie_processes)]
     fn guarded_group_probe() {
         worker_parent_guard(unsafe { libc::getppid() }).unwrap();
         crate::process_sandbox::install().unwrap();
