@@ -5,7 +5,8 @@ pub fn recently_changed(full: bool, clock: u64, changed: u64, tps: u32) -> bool 
     full || clock.saturating_sub(changed) <= u64::from(tps)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub minimum_hz: u32,
     pub maximum_hz: u32,

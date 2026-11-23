@@ -12,6 +12,7 @@ pub mod logs;
 #[path = "../../shared/media_addresses.rs"]
 mod media_addresses;
 mod realtime;
+mod settings;
 mod uploads;
 mod world;
 
@@ -35,7 +36,7 @@ pub struct App {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     std::fs::create_dir_all(config.data.join("assets"))?;
     let _data_lock = asset_store::DataDirLock::acquire(&config.data)?;
     let (stale_uploads, stale_bytes) = uploads::recover(&config.data)?;
@@ -43,6 +44,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Recovered {stale_uploads} abandoned uploads ({stale_bytes} bytes)");
     }
     let db = db::open(&config.data.join("platform.sqlite"))?;
+    if let Some(saved) = settings::Settings::read(&db)? {
+        saved.validate(&config)?;
+        saved.apply(&mut config);
+    }
     let worlds = world::Registry::with_limits(
         config.tps,
         config.instance_limit,

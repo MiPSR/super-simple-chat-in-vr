@@ -91,6 +91,7 @@ pub fn router(app: Arc<App>) -> Router {
             put(update_user).delete(revoke_user),
         )
         .route("/api/v1/admin/health", get(admin_health))
+        .route("/api/v1/admin/settings", get(admin_settings).put(save_admin_settings))
         .route("/api/v1/admin/logs", get(admin_logs))
         .route("/api/v1/admin/assets/gc", post(collect_assets))
         .route("/api/v1/admin/assets/{id}/enabled", post(set_asset_enabled))
@@ -701,6 +702,28 @@ async fn admin_health(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiRes
 async fn admin_logs(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     auth::admin(&app, &headers)?;
     Ok(Json(logs::snapshot()))
+}
+
+async fn admin_settings(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    let active = crate::settings::Settings::from_config(&app.config);
+    let saved = crate::settings::Settings::read(&app.db.lock().unwrap())
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| active.clone());
+    Ok(Json(json!({"restart_required": saved != active, "active": active, "saved": saved})))
+}
+
+async fn save_admin_settings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(settings): Json<crate::settings::Settings>,
+) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    settings.validate(&app.config).map_err(|error| ApiError::bad(error.to_string()))?;
+    settings.save(&app.db.lock().unwrap()).map_err(ApiError::internal)?;
+    let restart_required = settings != crate::settings::Settings::from_config(&app.config);
+    logs::record("Admin: saved server policies (apply after restart)");
+    Ok(Json(json!({"ok": true, "restart_required": restart_required})))
 }
 
 #[derive(Deserialize)]

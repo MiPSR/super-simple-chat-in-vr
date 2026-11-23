@@ -2183,5 +2183,67 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
         "Replayed handshake was accepted or answered: {outcome}"
     );
     println!("PASS challenge admission, ticket binding, and stale-handshake rejection");
+    // Operator policies are persisted separately from live instances and
+    // explicitly take effect on restart, not halfway through a session.
+    let settings_path = "/api/v1/admin/settings";
+    ensure!(api.response(settings_path, None, &tokens[0]).await?.status() == 403);
+    let settings = api.json(settings_path, None, &api.admin).await?;
+    ensure!(settings["restart_required"] == false);
+    let mut saved = settings["saved"].clone();
+    saved["tps"] = json!(30);
+    saved["instance_limit"] = json!(3);
+    saved["instance_players"] = json!(8);
+    saved["default_world_slots"] = json!(7);
+    saved["voice_bitrate"] = json!(16000);
+    saved["radio_presets"] = json!(["narrow"]);
+    let put = |value: Value, token: String| {
+        api.client.put(format!("{}{settings_path}", api.base)).bearer_auth(token).json(&value).send()
+    };
+    ensure!(put(saved.clone(), tokens[0].clone()).await?.status() == 403);
+    let mut invalid = saved.clone();
+    invalid["network_rates"]["minimum_hz"] = json!(60);
+    ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
+    let mut invalid = saved.clone();
+    invalid["radio_presets"] = json!(["unknown"]);
+    ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
+    let mut invalid = saved.clone();
+    invalid["radio_presets"] = json!(["standard,narrow"]);
+    ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
+    let mut invalid = saved.clone();
+    invalid["admin_token"] = json!("must-not-be-configurable");
+    ensure!(put(invalid, api.admin.clone()).await?.status() == 422);
+    ensure!(api.json(settings_path, None, &api.admin).await?["saved"] == settings["saved"]);
+    let response: Value = put(saved.clone(), api.admin.clone()).await?.error_for_status()?.json().await?;
+    ensure!(response["restart_required"] == true);
+    let pending = api.json(settings_path, None, &api.admin).await?;
+    ensure!(pending["saved"] == saved && pending["active"]["tps"] == 60);
+    drop(host);
+    drop(_server);
+    let _restarted = Process(
+        Command::new(env!("CARGO_BIN_EXE_super-simple-chat-server"))
+            .env("SSC_ADMIN_TOKEN", &api.admin)
+            .env("SSC_DATA", directory.path())
+            .env("SSC_LISTEN", http_address.to_string())
+            .env("SSC_ENET", udp_address.to_string())
+            .env("SSC_PUBLIC_URL", &api.base)
+            .env("SSC_TPS", "60")
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(current) = api.json(settings_path, None, &api.admin).await {
+            ensure!(current["restart_required"] == false && current["active"] == saved);
+            break;
+        }
+        ensure!(Instant::now() < deadline, "Restarted server did not load saved policies");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+    ensure!(health["tps"] == 30 && health["limits"]["instances"] == 3 && health["limits"]["instance_players"] == 8);
+    ensure!(health["instances"] == 0 && health["defaults"]["world_slots"] == 7);
+    api.json("/api/v1/admin/users", Some(json!({"id":"444444444"})), &api.admin).await?;
+    let accounts = api.json("/api/v1/admin/users", None, &api.admin).await?;
+    ensure!(accounts.as_array().unwrap().iter().any(|user| user["id"] == "444444444" && user["world_slots"] == 7));
+    println!("PASS validated administrator policy edits, rejected secret fields, unchanged live policies and SQLite persistence across restart");
     Ok(())
 }

@@ -64,6 +64,52 @@ test("admin logs display timestamps and untrusted content as plain text",async (
   assert.equal(request.options.headers.Authorization,"Bearer " + "s".repeat(32));
 });
 
+test("administrator policy form preserves types, nested policies and unedited settings",async () => {
+  const saved = {tps:60,instance_limit:64,voice_bitrate:24000,network_rates:{minimum_hz:1,maximum_hz:120,automatic:true,suppress_unchanged:false},radio_channels:[1,2],radio_presets:["standard"],audio_effect_max:0.9};
+  let received;
+  const p = await page({}, {"/api/v1/admin/settings":options => {
+    if (options.method === "PUT") {
+      received = JSON.parse(options.body);
+      return {ok:true,json:async () => ({ok:true,restart_required:true})};
+    }
+    return {ok:true,json:async () => ({active:saved,saved,restart_required:false})};
+  }});
+  p.elements.get("server-settings").elements.namedItem = name => findNamed(p.elements.get("policy-fields"),name);
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  assert.equal(p.elements.get("server-policy").hidden,false);
+  const field = name => p.elements.get("server-settings").elements.namedItem(name);
+  field("tps").value = "30";
+  field("network_rates.minimum_hz").value = "5";
+  field("network_rates.automatic").checked = false;
+  field("radio_channels").value = "2, 7";
+  field("radio_presets").value = "narrow,weak";
+  await p.submit("server-settings");
+  assert.equal(received.tps,30);
+  assert.equal(received.network_rates.minimum_hz,5);
+  assert.equal(received.network_rates.automatic,false);
+  assert.deepEqual(received.radio_channels,[2,7]);
+  assert.deepEqual(received.radio_presets,["narrow","weak"]);
+  assert.equal(received.voice_bitrate,24000);
+  assert.match(p.elements.get("policy-status").textContent,/Restart the server/);
+});
+
+test("failed policy writes preserve edited controls and display the validation error",async () => {
+  const saved = {tps:60};
+  const p = await page({}, {"/api/v1/admin/settings":options => options.method === "PUT"
+    ? {ok:false,json:async () => ({error:"TPS must be 1..120"})}
+    : {ok:true,json:async () => ({saved,active:saved,restart_required:false})}});
+  p.elements.get("server-settings").elements.namedItem = name => findNamed(p.elements.get("policy-fields"),name);
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  const tps = p.elements.get("server-settings").elements.namedItem("tps");
+  tps.value = "999";
+  const button = await p.submit("server-settings");
+  assert.equal(button.disabled,false);
+  assert.equal(tps.value,"999");
+  assert.match(p.elements.get("status").textContent,/TPS must/);
+});
+
 test("invitation redemption requests a grant with account rates and clears the token on success",async () => {
   const p = await page({send_divisor:2,receive_divisor:4}, {"/api/v1/game-grants":{ticket:"ticket",secret:"secret"}});
   p.elements.get("admin-secret").value = "s".repeat(32);

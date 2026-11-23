@@ -73,7 +73,16 @@ impl Config {
             default_world_bytes: get("SSC_DEFAULT_WORLD_BYTES", "1000000000").parse()?,
             default_avatar_bytes: get("SSC_DEFAULT_AVATAR_BYTES", "100000000").parse()?,
         };
+        config.validate()?;
+        Ok(config)
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let config = self;
         anyhow::ensure!(config.admin_token.len() >= 32, "admin secret too short");
+        anyhow::ensure!(
+            radio_presets(&config.radio_presets.join(","))? == config.radio_presets,
+            "Radio preset names must be individual normalized values"
+        );
         anyhow::ensure!(
             config.radio_interference.is_finite()
                 && (0.0..=0.8).contains(&config.radio_interference),
@@ -133,7 +142,7 @@ impl Config {
                     && config.public_url.starts_with("http://127.0.0.1:")),
             "HTTPS public URL required except explicit loopback development"
         );
-        Ok(config)
+        Ok(())
     }
 }
 

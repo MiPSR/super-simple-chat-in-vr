@@ -1,6 +1,36 @@
 "use strict";
 let adminSecret = "";
 let me;
+let operatorSettings;
+const policyFields = [
+  ["tps","Simulation TPS",1,120],["instance_limit","Maximum instances",1,512],["instance_players","Players per instance",1,128],
+  ["network_rates.minimum_hz","Minimum network Hz",1,120],["network_rates.maximum_hz","Maximum network Hz",1,120],
+  ["network_rates.automatic","Adapt rates for poor connections","boolean"],["network_rates.suppress_unchanged","Suppress unchanged pose updates","boolean"],
+  ["default_world_slots","New-account world slots",1,1000],["default_avatar_slots","New-account avatar slots",1,1000],
+  ["default_world_bytes","Default world package bytes",0,1000000000],["default_avatar_bytes","Default avatar package bytes",0,1000000000],
+  ["voice_bitrate","Voice bitrate",8000,64000],["audio_effect_max","Audio effects ceiling",0,1,0.05],
+  ["radio_bitrate","Radio bitrate",8000,16000],["radio_channels","Radio channels (comma-separated; empty disables channels)","channels"],
+  ["radio_presets","Radio presets (standard, narrow, weak)","list"],
+  ["radio_noise","Radio noise",0,0.8,0.05],["radio_interference","Radio interference",0,0.8,0.05],
+  ["radio_filter_hz","Radio filter Hz",300,3000],["radio_ft8_interval","FT8-style interval (seconds)",1,120],["radio_sstv_interval","SSTV interval (seconds)",5,600]
+];
+const policyValue = (settings,path) => path.split(".").reduce((value,key) => value?.[key],settings);
+function renderPolicies(data) {
+  operatorSettings = data.saved;
+  const fields = $("policy-fields"); fields.replaceChildren();
+  for (const [path,title,min,max,step] of policyFields) {
+    const value = policyValue(operatorSettings,path);
+    if (value === undefined) continue;
+    const label = document.createElement("label"); label.textContent = title;
+    const input = document.createElement("input"); input.name = path;
+    input.type = min === "boolean" ? "checkbox" : typeof min === "number" ? "number" : "text";
+    if (input.type === "checkbox") input.checked = value;
+    else if (input.type === "number") { input.min = min; input.max = max; input.step = step || 1; input.required = true; input.value = value; }
+    else { input.value = value.join(","); input.maxLength = 256; }
+    label.append(input); fields.append(label);
+  }
+  $("policy-status").textContent = data.restart_required ? "Saved changes are pending a server restart." : "Saved policies match the running server.";
+}
 const $ = id => document.getElementById(id);
 const status = message => { $("status").textContent = message; };
 const radialActions = {microphone:"Mute / microphone",sleep:"Sleep",phone_hand:"Phone hand",interact:"Interact",avatar_action:"Avatar action",video_pause:"Video pause",phone:"Phone controls",leave:"Leave",none:"Disabled"};
@@ -119,11 +149,12 @@ async function refresh() {
     $("health").textContent = JSON.stringify(health, null, 2);
     const logs = await api("/admin/logs");
     $("logs").textContent = logs.map(entry => `${new Date(entry.time * 1000).toISOString()} ${entry.line}`).join("\n") || "No recent entries.";
+    renderPolicies(await api("/admin/settings"));
   }
 }
 async function load() {
   me = await api("/me");
-  $("account").hidden = false; $("admin").hidden = !me.user.admin;
+  $("account").hidden = false; $("admin").hidden = !me.user.admin; $("server-policy").hidden = !me.user.admin;
   $("identity").textContent = `Signed in as ${me.user.id}`;
   for (const [key,value] of Object.entries(me.preferences)) {
     if (key === "radial_actions") { value.forEach((action, index) => { $("preferences").elements.namedItem(`radial_action_${index}`).value = action; }); continue; }
@@ -134,6 +165,21 @@ async function load() {
 }
 action("admin-login", async () => { adminSecret = $("admin-secret").value; $("admin-secret").value = ""; try { await load(); } catch(e) {adminSecret = ""; throw e;} });
 action("search", refresh);
+action("server-settings", async () => {
+  if (!operatorSettings) throw new Error("Load administrator settings first.");
+  const saved = JSON.parse(JSON.stringify(operatorSettings));
+  for (const [path,,kind] of policyFields) {
+    const input = $("server-settings").elements.namedItem(path);
+    if (!input) continue;
+    const value = kind === "boolean" ? input.checked : kind === "channels" ? input.value.split(",").map(v => v.trim()).filter(Boolean).map(Number) : kind === "list" ? input.value.split(",").map(v => v.trim()) : Number(input.value);
+    const keys = path.split("."); const key = keys.pop();
+    keys.reduce((value,key) => value[key],saved)[key] = value;
+  }
+  const result = await api("/admin/settings", {method:"PUT",body:saved});
+  operatorSettings = saved;
+  $("policy-status").textContent = result.restart_required ? "Policies saved. Restart the server service to apply them." : "Policies saved; no restart needed.";
+  status("Server policies saved.");
+});
 action("join-invitation", async () => {
   await grant({instance:$("invite-instance").value.trim(),invitation:$("invite-token").value.trim()});
   $("invite-token").value = "";

@@ -8,6 +8,22 @@ tests seed their own isolated temporary database sessions.
 
 ## Correction pass (2026-11-18)
 
+### Administrator policy follow-up (2026-11-23)
+
+- Added a protected website policy editor and SQLite persistence for instance
+  ceilings, TPS/network policies, default quotas, and voice/audio/radio limits.
+  The API distinguishes running settings from saved settings and reports when
+  a restart is required. Saved policies apply before simulation initialization.
+- Policy writes share startup validation; they cannot configure credentials,
+  listeners or paths. Existing user quotas and active sessions remain unchanged
+  until the documented application boundary.
+- Script budgets and other hard resource ceilings are not made configurable by
+  this change.
+- Verification: workspace/all-target tests and strict server Clippy pass;
+  website tests pass 13/13. The HTTP acceptance test saves policies, rejects
+  invalid settings without altering saved data, restarts the actual server,
+  and checks applied TPS/capacity and new-account quotas.
+
 ### World browser follow-up (2026-11-23)
 
 - The phone's Worlds tab searches the published catalog, creates invite-only

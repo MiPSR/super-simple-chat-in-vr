@@ -90,3 +90,29 @@ missing-device mute/fallback, gain values and audio-bus cleanup. Server tests
 cover defaults, persistence and rejection of invalid updates. These do not
 validate physical microphone/output devices, audible gain quality, visual AA
 quality or headset comfort.
+
+## Administrator server policies
+
+The protected website's **Server policies** form edits instance/player ceilings,
+simulation TPS, network bounds/adaptation/aggregation, new-account quotas, voice
+bitrate, audio-effects ceiling, and radio channels/profiles/quality intervals.
+These are server policies, not creator-controlled preferences.
+
+`GET /api/v1/admin/settings` returns `active`, `saved`, and `restart_required`.
+`PUT` accepts the complete `saved` policy object, validates its ranges and
+cross-field constraints, and atomically replaces the `operator_policy_v1`
+record in SQLite's settings table. Invalid writes leave the previous record
+untouched. Credentials, OAuth configuration, listener addresses, and data paths
+are not accepted by this endpoint.
+
+Changes **do not hot-reconfigure live sessions**. Restart the backend service
+to apply them. The next startup loads saved policies before creating its
+simulation registry and listeners. Environment/NixOS policy options provide the
+initial defaults; the saved policy object takes precedence after that. Existing
+user slot/byte quotas remain unchanged; default quotas apply to newly added
+accounts. Restarting still destroys all ephemeral gameplay instances.
+
+For operator recovery, stop the service, back up the database, and remove the
+`operator_policy_v1` settings row to return to environment defaults, then start
+the service. Malformed or invalid persisted policy data fails startup with an
+error instead of silently running a different configuration.
