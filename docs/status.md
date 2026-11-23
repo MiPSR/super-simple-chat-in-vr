@@ -48,6 +48,16 @@ tests seed their own isolated temporary database sessions.
   component identifiers, and message limits, replacing the previous implicit
   definitions.
 
+### Access-management follow-up (2026-11-23)
+
+- Added an explicit administrator suspend/re-enable control (`POST
+  /api/v1/admin/users/{id}/enabled`). Suspension revokes the account's sessions,
+  invalidates the realtime read cache immediately, and logs the action;
+  re-enabling restores website and game access. The administrator account
+  cannot be suspended from this endpoint, and unknown users return 404.
+- The website now offers the inverse control on disabled accounts instead of a
+  one-way disable button.
+
 ## Correction pass (2026-11-18)
 
 ### Creator-budget follow-up (2026-11-23)

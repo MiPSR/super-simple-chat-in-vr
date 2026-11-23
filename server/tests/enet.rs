@@ -1966,6 +1966,89 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
             .status()
             == 404
     );
+    // Suspend/re-enable manages access: suspension revokes sessions, and the
+    // administrator account itself cannot be suspended.
+    let suspended = "555555555";
+    api.json("/api/v1/admin/users", Some(json!({"id":suspended})), &api.admin)
+        .await?;
+    let suspended_token = token();
+    {
+        let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            + 3600;
+        db.execute(
+            "INSERT INTO sessions VALUES(?,?,?)",
+            rusqlite::params![
+                hex::encode(Sha256::digest(suspended_token.as_bytes())),
+                suspended,
+                expires
+            ],
+        )?;
+    }
+    let toggle = |enabled: bool, token: String| {
+        api.client
+            .post(format!(
+                "{}/api/v1/admin/users/{suspended}/enabled",
+                api.base
+            ))
+            .bearer_auth(token)
+            .json(&json!({"enabled":enabled}))
+            .send()
+    };
+    ensure!(api.json("/api/v1/me", None, &suspended_token).await.is_ok());
+    ensure!(toggle(false, tokens[0].clone()).await?.status() == 403);
+    ensure!(toggle(false, api.admin.clone()).await?.status() == 200);
+    ensure!(
+        api.response("/api/v1/me", None, &suspended_token).await?.status() == 401,
+        "Suspension did not revoke the session"
+    );
+    ensure!(toggle(true, api.admin.clone()).await?.status() == 200);
+    {
+        let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            + 3600;
+        db.execute(
+            "INSERT INTO sessions VALUES(?,?,?)",
+            rusqlite::params![
+                hex::encode(Sha256::digest(suspended_token.as_bytes())),
+                suspended,
+                expires
+            ],
+        )?;
+    }
+    ensure!(
+        api.json("/api/v1/me", None, &suspended_token).await.is_ok(),
+        "Re-enabled account could not sign in again"
+    );
+    ensure!(
+        toggle(true, api.admin.clone()).await?.status() == 200
+            && api
+                .client
+                .post(format!("{}/api/v1/admin/users/admin/enabled", api.base))
+                .bearer_auth(&api.admin)
+                .json(&json!({"enabled":false}))
+                .send()
+                .await?
+                .status()
+                == 400
+    );    ensure!(
+        api.client
+            .post(format!(
+                "{}/api/v1/admin/users/000000000/enabled",
+                api.base
+            ))
+            .bearer_auth(&api.admin)
+            .json(&json!({"enabled":true}))
+            .send()
+            .await?
+            .status()
+            == 404
+    );
+    println!("PASS administrator suspend/re-enable with session revocation, account protection and 404s");
     // Instance limits and default quotas are visible to the administrator.
     let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
     ensure!(health["limits"]["instances"] == 64 && health["limits"]["instance_players"] == 64);

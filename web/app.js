@@ -143,7 +143,10 @@ async function refresh() {
     const users = await api("/admin/users");
     $("users").replaceChildren(...users.map(u => {
       const a = article(`${u.name || u.id} ${u.enabled ? "" : "(disabled)"}`, `${u.id}: ${u.world_slots} worlds / ${u.avatar_slots} avatars`);
-      if (u.id !== "admin") a.append(button("Disable & revoke sessions", async () => { await api(`/admin/users/${u.id}`, { method: "DELETE" }); await refresh(); }));
+      if (u.id !== "admin") a.append(button(u.enabled ? "Disable & revoke sessions" : "Re-enable account", async () => {
+        await api(`/admin/users/${u.id}/enabled`, { method: "POST", body: { enabled: !u.enabled } });
+        await refresh();
+      }));
       a.append(quotaForm(u)); return a;
     }));
     const health = await api("/admin/health");

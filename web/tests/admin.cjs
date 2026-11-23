@@ -54,6 +54,32 @@ async function page(preferences = {}, routes = {}) {
   return {elements,requests,submit,setGc(fn) {gc = fn;}};
 }
 
+test("admins can suspend and re-enable accounts, and failures surface",async () => {
+  let enabled = true;
+  let toggled;
+  const routes = {
+    "/api/v1/admin/users": () => ({ok:true,json:async () => ([{id:"123456789",name:"",enabled,world_slots:4,avatar_slots:8}])}),
+    "/api/v1/admin/assets/gc": {scanned:0,files:0,rows:0,bytes:0,errors:0},
+  };
+  routes["/api/v1/admin/users/123456789/enabled"] = options => {
+    toggled = JSON.parse(options.body);
+    enabled = toggled.enabled;
+    return {ok:true,json:async () => ({ok:true,enabled:toggled.enabled})};
+  };
+  const p = await page({},routes);
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  const users = p.elements.get("users");
+  const suspend = users.children[0].children.find(child => child.textContent === "Disable & revoke sessions");
+  assert.ok(suspend,"Missing suspend control");
+  await suspend.onclick();
+  assert.deepEqual(toggled,{enabled:false});
+  const reenable = users.children[0].children.find(child => child.textContent === "Re-enable account");
+  assert.ok(reenable,"A disabled account must offer re-enable");
+  await reenable.onclick();
+  assert.deepEqual(toggled,{enabled:true});
+});
+
 test("admin logs display timestamps and untrusted content as plain text",async () => {
   const line = "<script>alert('not markup')</script>";
   const p = await page({}, {"/api/v1/admin/logs":[{time:0,line}]});

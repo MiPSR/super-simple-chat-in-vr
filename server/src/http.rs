@@ -90,6 +90,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/api/v1/admin/users/{id}",
             put(update_user).delete(revoke_user),
         )
+        .route("/api/v1/admin/users/{id}/enabled", post(set_user_enabled))
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/settings", get(admin_settings).put(save_admin_settings))
         .route("/api/v1/admin/logs", get(admin_logs))
@@ -658,6 +659,39 @@ struct Quotas {
     world_bytes: u64,
     avatar_bytes: u64,
 }
+async fn set_user_enabled(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(q): Json<Enabled>,
+) -> ApiResult<Json<Value>> {
+    auth::admin(&app, &headers)?;
+    if id == "admin" {
+        return Err(ApiError::bad("The administrator account cannot be suspended"));
+    }
+    let db = app.db.lock().unwrap();
+    db.execute(
+        "UPDATE users SET enabled=? WHERE id=?",
+        rusqlite::params![q.enabled, &id],
+    )?;
+    let changed = db.query_row("SELECT changes()", [], |r| r.get::<_, i64>(0))?;
+    if changed == 0 {
+        return Err(ApiError::not_found("Unknown user"));
+    }
+    if !q.enabled {
+        db.execute("DELETE FROM sessions WHERE user_id=?", [id.as_str()])?;
+    }
+    drop(db);
+    // Realtime sessions re-check on the next tick; no cache TTL wait.
+    db::bump_policy_epoch();
+    logs::record(format!(
+        "Admin: {} {id}{}",
+        if q.enabled { "re-enabled" } else { "suspended" },
+        if q.enabled { "" } else { " and revoked sessions" }
+    ));
+    Ok(Json(json!({"ok":true,"enabled":q.enabled})))
+}
+
 async fn update_user(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
