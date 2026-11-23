@@ -98,6 +98,20 @@ simulation TPS, network bounds/adaptation/aggregation, new-account quotas, voice
 bitrate, audio-effects ceiling, and radio channels/profiles/quality intervals.
 These are server policies, not creator-controlled preferences.
 
+Server creator-script limits are in `script_policy`: `memory_bytes` (1–8 MiB
+per VM), `callback_millis` (1–5 ms of thread CPU time), and `scheduler_millis`
+(1–8 ms of aggregate scheduler wall time per tick, also limited to half the tick
+interval). Defaults remain 8 MiB / 5 ms / 8 ms. Administrators can lower these
+limits, not bypass the process ceilings. The 250 ms callback wall-time backstop,
+64-VM process limit, bounded event queues and other hard safeguards remain.
+These settings govern authoritative server scripts, not local client scripts.
+The health endpoint reports effective per-VM memory alongside its hard maximum.
+
+Environment defaults are `SSC_SCRIPT_MEMORY_BYTES`, `SSC_SCRIPT_CALLBACK_MS`
+and `SSC_SCRIPT_SCHEDULER_MS`; the NixOS options are `scriptMemoryBytes`,
+`scriptCallbackMillis` and `scriptSchedulerMillis`. Older saved policy records
+without `script_policy` load the original script-budget defaults.
+
 `GET /api/v1/admin/settings` returns `active`, `saved`, and `restart_required`.
 `PUT` accepts the complete `saved` policy object, validates its ranges and
 cross-field constraints, and atomically replaces the `operator_policy_v1`

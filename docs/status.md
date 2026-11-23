@@ -8,6 +8,25 @@ tests seed their own isolated temporary database sessions.
 
 ## Correction pass (2026-11-18)
 
+### Creator-budget follow-up (2026-11-23)
+
+- Added configurable authoritative-script memory, per-callback CPU time and
+  aggregate scheduler time within the existing hard maxima. Policies flow
+  from startup configuration through instance construction into every server
+  VM, and appear in the persistent admin website editor and NixOS module.
+- Existing policy records receive the original budget defaults when the new
+  field is absent. Health reports effective and maximum per-VM memory.
+- Client-side script limits, global VM/entity counts and bounded queue maxima
+  remain hard process limits, not arbitrary administrator-provided values.
+- Removed the shared physics cutoff, which could silently freeze later worlds
+  while advancing their clocks and leases. All active worlds now receive one
+  physics step per authoritative tick; overload can reduce achieved wall-clock
+  TPS, not selectively discard simulation work.
+- Verification: the combined policy/physics workspace suite passes, including real-server
+  restart persistence and legacy policy loading. The new three-world overload
+  regression passes, as do strict server Clippy, all 13 website tests and
+  NixOS evaluation of the new script-budget options.
+
 ### Administrator policy follow-up (2026-11-23)
 
 - Added a protected website policy editor and SQLite persistence for instance
@@ -17,8 +36,8 @@ tests seed their own isolated temporary database sessions.
 - Policy writes share startup validation; they cannot configure credentials,
   listeners or paths. Existing user quotas and active sessions remain unchanged
   until the documented application boundary.
-- Script budgets and other hard resource ceilings are not made configurable by
-  this change.
+- This first policy-editor pass left script budgets fixed; the creator-budget
+  follow-up above adds their bounded server-side controls.
 - Verification: workspace/all-target tests and strict server Clippy pass;
   website tests pass 13/13. The HTTP acceptance test saves policies, rejects
   invalid settings without altering saved data, restarts the actual server,

@@ -2196,9 +2196,14 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     saved["default_world_slots"] = json!(7);
     saved["voice_bitrate"] = json!(16000);
     saved["radio_presets"] = json!(["narrow"]);
+    saved["script_policy"] = json!({"memory_bytes":1048576,"callback_millis":1,"scheduler_millis":2});
     let put = |value: Value, token: String| {
         api.client.put(format!("{}{settings_path}", api.base)).bearer_auth(token).json(&value).send()
     };
+    let mut legacy = settings["saved"].clone();
+    legacy.as_object_mut().unwrap().remove("script_policy");
+    let legacy_response: Value = put(legacy, api.admin.clone()).await?.error_for_status()?.json().await?;
+    ensure!(legacy_response["restart_required"] == false);
     ensure!(put(saved.clone(), tokens[0].clone()).await?.status() == 403);
     let mut invalid = saved.clone();
     invalid["network_rates"]["minimum_hz"] = json!(60);
@@ -2208,6 +2213,9 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
     let mut invalid = saved.clone();
     invalid["radio_presets"] = json!(["standard,narrow"]);
+    ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
+    let mut invalid = saved.clone();
+    invalid["script_policy"]["callback_millis"] = json!(1000);
     ensure!(put(invalid, api.admin.clone()).await?.status() == 400);
     let mut invalid = saved.clone();
     invalid["admin_token"] = json!("must-not-be-configurable");
@@ -2241,6 +2249,8 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
     ensure!(health["tps"] == 30 && health["limits"]["instances"] == 3 && health["limits"]["instance_players"] == 8);
     ensure!(health["instances"] == 0 && health["defaults"]["world_slots"] == 7);
+    ensure!(health["script_policy"] == saved["script_policy"]);
+    ensure!(health["creator_vms"]["per_vm_bytes"] == 1048576);
     api.json("/api/v1/admin/users", Some(json!({"id":"444444444"})), &api.admin).await?;
     let accounts = api.json("/api/v1/admin/users", None, &api.admin).await?;
     ensure!(accounts.as_array().unwrap().iter().any(|user| user["id"] == "444444444" && user["world_slots"] == 7));

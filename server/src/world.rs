@@ -23,6 +23,26 @@ use creator::{Command, Context, Shared, Spawn};
 
 const MAX_CREATOR_VMS: usize = 64;
 const CREATOR_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptPolicy {
+    pub memory_bytes: usize,
+    pub callback_millis: u64,
+    pub scheduler_millis: u64,
+}
+impl Default for ScriptPolicy {
+    fn default() -> Self {
+        Self { memory_bytes: CREATOR_MEMORY_BYTES, callback_millis: 5, scheduler_millis: 8 }
+    }
+}
+impl ScriptPolicy {
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!((1024 * 1024..=CREATOR_MEMORY_BYTES).contains(&self.memory_bytes), "Script memory must be 1..8 MiB per VM");
+        anyhow::ensure!((1..=5).contains(&self.callback_millis), "Script callback budget must be 1..5 ms");
+        anyhow::ensure!((1..=8).contains(&self.scheduler_millis), "Script scheduler budget must be 1..8 ms per tick");
+        Ok(())
+    }
+}
 static CREATOR_VMS: AtomicUsize = AtomicUsize::new(0);
 const MAX_LIVE_ENTITIES: usize = 32768;
 static LIVE_ENTITIES: AtomicUsize = AtomicUsize::new(0);
@@ -69,8 +89,8 @@ impl Drop for VmSlot {
         CREATOR_VMS.fetch_sub(1, Ordering::AcqRel);
     }
 }
-pub fn creator_vm_usage() -> Value {
-    json!({"active":CREATOR_VMS.load(Ordering::Acquire),"limit":MAX_CREATOR_VMS,"per_vm_bytes":CREATOR_MEMORY_BYTES,"entities":{"active":LIVE_ENTITIES.load(Ordering::Acquire),"limit":MAX_LIVE_ENTITIES}})
+pub fn creator_vm_usage(policy: ScriptPolicy) -> Value {
+    json!({"active":CREATOR_VMS.load(Ordering::Acquire),"limit":MAX_CREATOR_VMS,"per_vm_bytes":policy.memory_bytes,"per_vm_hard_max_bytes":CREATOR_MEMORY_BYTES,"entities":{"active":LIVE_ENTITIES.load(Ordering::Acquire),"limit":MAX_LIVE_ENTITIES}})
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +332,7 @@ impl Sandbox {
             )])),
         )
     }
+    #[cfg(test)]
     fn with_context(
         source: &str,
         variables: Arc<Mutex<BTreeMap<String, Value>>>,
@@ -319,14 +340,25 @@ impl Sandbox {
         context: Shared,
         declarations: Arc<BTreeMap<String, crate::assets::StateVariable>>,
     ) -> anyhow::Result<Self> {
+        Self::with_context_policy(source, variables, capabilities, context, declarations, ScriptPolicy::default())
+    }
+    fn with_context_policy(
+        source: &str,
+        variables: Arc<Mutex<BTreeMap<String, Value>>>,
+        capabilities: &[String],
+        context: Shared,
+        declarations: Arc<BTreeMap<String, crate::assets::StateVariable>>,
+        policy: ScriptPolicy,
+    ) -> anyhow::Result<Self> {
+        policy.validate()?;
         let _slot = VmSlot::reserve()?;
         let lua = Lua::new();
-        lua.set_memory_limit(CREATOR_MEMORY_BYTES)?;
+        lua.set_memory_limit(policy.memory_bytes)?;
         for name in ["os", "io", "require", "loadstring", "collectgarbage"] {
             lua.globals().set(name, mlua::Value::Nil)?;
         }
         lua.sandbox(true)?;
-        let budget = Arc::new(Mutex::new(script_budget::ScriptBudget::new(5)));
+        let budget = Arc::new(Mutex::new(script_budget::ScriptBudget::new(policy.callback_millis)));
         let b = budget.clone();
         lua.set_interrupt(move |_| {
             if b.lock().unwrap().expired() {
@@ -490,6 +522,7 @@ impl Instance {
         self.suppressed_script_diagnostics = 0;
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn create(
         id: String,
         join: &Join,
@@ -499,6 +532,20 @@ impl Instance {
         sources: Vec<(String, String)>,
         tps: u32,
         player_cap: usize,
+    ) -> anyhow::Result<Self> {
+        Self::create_with_policy(id, join, version, owner, manifest, sources, tps, player_cap, ScriptPolicy::default())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_policy(
+        id: String,
+        join: &Join,
+        version: String,
+        owner: String,
+        manifest: Manifest,
+        sources: Vec<(String, String)>,
+        tps: u32,
+        player_cap: usize,
+        script_policy: ScriptPolicy,
     ) -> anyhow::Result<Self> {
         let mut instance = Self {
             id,
@@ -638,19 +685,20 @@ impl Instance {
             else {
                 continue;
             };
-            match Sandbox::with_context(
+            match Sandbox::with_context_policy(
                 &source,
                 instance.variables.clone(),
                 &decl.capabilities,
                 instance.context.clone(),
                 Arc::new(instance.manifest.variables.clone()),
+                script_policy,
             ) {
                 Ok(script) => instance.scripts.push(script),
                 Err(e) if e.is::<VmCapacityError>() => return Err(e),
-                Err(e) => eprintln!(
-                    "Script initialization failed: {}",
-                    error_message::bounded(e)
-                ),
+                Err(e) => crate::logs::record(format!(
+                    "World {} script {} initialization failed: {}",
+                    instance.id, path, error_message::bounded(e)
+                )),
             }
         }
         instance.apply_commands();
@@ -1455,12 +1503,7 @@ impl Instance {
         }
         Ok(())
     }
-#[cfg(test)]
     fn tick(&mut self) {
-        // Direct callers (tests, tooling) step physics without a shared cap.
-        self.tick_budgeted(Instant::now() + Duration::from_secs(3600));
-    }
-    fn tick_budgeted(&mut self, physics_until: Instant) {
         self.clock += 1;
         let expired: Vec<_> = self
             .entities
@@ -1492,14 +1535,10 @@ impl Instance {
                 }
             }
         }
-        // The authoritative tick stays responsive even if one pathological
-        // instance exhausts the shared physics budget: remaining instances
-        // freeze their bodies for a tick instead of stalling every player.
-        let contacts = if Instant::now() >= physics_until {
-            Vec::new()
-        } else {
-            self.scene.step(1.0 / self.tps as f32)
-        };
+        // Every authoritative clock tick includes one physics step. Dropping
+        // later worlds' steps on a shared deadline changes collisions, damage
+        // and lease semantics, and can starve worlds by map order.
+        let contacts = self.scene.step(1.0 / self.tps as f32);
         for (id, entity) in &mut self.entities {
             if let Some((position, rotation)) = self.scene.transform(id) {
                 if entity.position != position || entity.rotation != rotation {
@@ -1659,6 +1698,7 @@ pub enum Action {
     },
 }
 pub struct Registry {
+    pub script_policy: ScriptPolicy,
     pub instances: BTreeMap<String, Instance>,
     pub tick: u64,
     pub tps: u32,
@@ -1671,6 +1711,7 @@ pub struct Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self {
+            script_policy: ScriptPolicy::default(),
             instances: BTreeMap::new(),
             tick: 0,
             tps: 60,
@@ -1790,7 +1831,7 @@ impl Registry {
                     break candidate;
                 }
             };
-            let mut instance = Instance::create(
+            let mut instance = Instance::create_with_policy(
                 id.clone(),
                 join,
                 version.into(),
@@ -1799,6 +1840,7 @@ impl Registry {
                 sources,
                 self.tps,
                 self.player_cap,
+                self.script_policy,
             )?;
             instance.scheduled_scripts = self.scheduled_scripts;
             Some((id, instance))
@@ -1894,16 +1936,13 @@ impl Registry {
     }
     pub fn step(&mut self) {
         self.tick += 1;
-        // Shared per-tick physics budget: a pathological instance cannot stall
-        // the authoritative loop beyond this wall-clock allowance.
-        let physics_until = Instant::now() + Duration::from_millis(8);
         for instance in self.instances.values_mut() {
-            instance.tick_budgeted(physics_until);
+            instance.tick();
         }
         if self.scheduled_scripts {
             self.advance_scripts(
                 256,
-                Duration::from_secs_f64((0.5 / self.tps as f64).min(0.008)),
+                Duration::from_secs_f64((0.5 / self.tps as f64).min(self.script_policy.scheduler_millis as f64 / 1000.0)),
             );
         }
     }
@@ -1972,6 +2011,75 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_earlier_worlds_cannot_skip_later_worlds_physics() {
+        let mut registry = Registry::default();
+        let mut definition = manifest();
+        definition.objects = serde_json::from_value(json!([{
+            "id":"falling", "component":"prop", "position":[0,3,0],
+            "physics":{"dynamic":true,"size":[0.2,0.2,0.2]}
+        }])).unwrap();
+        definition.scripts = serde_json::from_value(json!([{
+            "path":"slow.luau","side":"server","attachment":"world","capabilities":[]
+        }])).unwrap();
+        for user in ["a", "b", "c"] {
+            registry.admit(
+                &Join {world:"world".into(), ..Default::default()}, user, user, "v1",
+                definition.clone(),
+                vec![("slow.luau".into(), "world.on('tick',function() while true do end end)".into())],
+            ).unwrap();
+        }
+        // Each earlier world's callback exhausts a 5-ms CPU watchdog. Under
+        // the old shared 8-ms deadline, the last world's physics was skipped.
+        registry.step();
+        let heights: Vec<_> = registry.instances.values().map(|i| {
+            assert_eq!(i.clock, 1);
+            i.entities["falling"].position[1]
+        }).collect();
+        assert!(heights[0] < 3.0);
+        assert!(heights.iter().all(|height| (*height - heights[0]).abs() < 0.00001), "{heights:?}");
+    }
+    #[test]
+    fn configurable_script_budgets_enforce_memory_and_reject_invalid_limits() {
+        let policy = ScriptPolicy { memory_bytes: 1024 * 1024, callback_millis: 1, scheduler_millis: 1 };
+        let sandbox = |policy| Sandbox::with_context_policy(
+            "", Arc::new(Mutex::new(BTreeMap::new())), &[],
+            Arc::new(Mutex::new(Context::default())), Arc::new(BTreeMap::new()), policy,
+        );
+        let vm = sandbox(policy).unwrap();
+        assert_eq!(vm.lua.set_memory_limit(policy.memory_bytes).unwrap(), policy.memory_bytes);
+        // Isolate allocation enforcement from the independent CPU watchdog:
+        // allocating/copying a large string may legitimately exhaust 1–5 ms.
+        vm.lua.set_interrupt(|_| Ok(mlua::VmState::Continue));
+        let error = vm.lua.load("return string.rep('x',2097152)").eval::<String>().unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("memory"), "{error}");
+        let vm = sandbox(ScriptPolicy::default()).unwrap();
+        vm.lua.set_interrupt(|_| Ok(mlua::VmState::Continue));
+        assert_eq!(vm.lua.load("return string.rep('x',2097152)").eval::<String>().unwrap().len(), 2097152);
+        let mut definition = manifest();
+        definition.scripts = serde_json::from_value(json!([{"path":"main.luau","side":"server","attachment":"world","capabilities":[]}])).unwrap();
+        let mut registry = Registry { script_policy: policy, ..Default::default() };
+        let id = registry.admit(&Join {world:"world".into(), ..Default::default()}, "a", "A", "v1", definition, vec![("main.luau".into(), "".into())]).unwrap();
+        let scripts = &registry.instances[&id].scripts;
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].lua.set_memory_limit(policy.memory_bytes).unwrap(), policy.memory_bytes);
+        let timed = Sandbox::with_context_policy(
+            "world.on('tick',function() while true do end end)",
+            Arc::new(Mutex::new(BTreeMap::new())), &[],
+            Arc::new(Mutex::new(Context::default())), Arc::new(BTreeMap::new()), policy,
+        ).unwrap();
+        assert!(timed.event("tick", &json!({"dt": 1.0 / 60.0})).unwrap_err().to_string().contains("Script time budget exceeded"));
+        for invalid in [
+            ScriptPolicy { memory_bytes: 0, ..policy },
+            ScriptPolicy { memory_bytes: CREATOR_MEMORY_BYTES + 1, ..policy },
+            ScriptPolicy { callback_millis: 0, ..policy },
+            ScriptPolicy { callback_millis: 6, ..policy },
+            ScriptPolicy { scheduler_millis: 0, ..policy },
+            ScriptPolicy { scheduler_millis: 9, ..policy },
+        ] {
+            assert!(sandbox(invalid).is_err());
+        }
+    }
     #[test]
     fn attachment_and_rotation_bindings_are_capability_gated_and_flat() {
         let variables = Arc::new(Mutex::new(BTreeMap::new()));

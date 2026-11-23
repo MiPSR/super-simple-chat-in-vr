@@ -10,6 +10,7 @@ pub struct Config {
     pub discord_id: String,
     pub discord_secret: String,
     pub tps: u32,
+    pub script_policy: crate::world::ScriptPolicy,
     pub network_rates: crate::realtime::rates::Policy,
     pub voice_bitrate: u32,
     pub audio_effect_max: f32,
@@ -42,6 +43,11 @@ impl Config {
             discord_id: get("SSC_DISCORD_ID", ""),
             discord_secret: get("SSC_DISCORD_SECRET", ""),
             tps: get("SSC_TPS", "60").parse()?,
+            script_policy: crate::world::ScriptPolicy {
+                memory_bytes: get("SSC_SCRIPT_MEMORY_BYTES", "8388608").parse()?,
+                callback_millis: get("SSC_SCRIPT_CALLBACK_MS", "5").parse()?,
+                scheduler_millis: get("SSC_SCRIPT_SCHEDULER_MS", "8").parse()?,
+            },
             network_rates: crate::realtime::rates::Policy {
                 minimum_hz: get("SSC_NETWORK_MIN_HZ", "1").parse()?,
                 maximum_hz: get("SSC_NETWORK_MAX_HZ", "120").parse()?,
@@ -78,6 +84,7 @@ impl Config {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         let config = self;
+        config.script_policy.validate()?;
         anyhow::ensure!(config.admin_token.len() >= 32, "admin secret too short");
         anyhow::ensure!(
             radio_presets(&config.radio_presets.join(","))? == config.radio_presets,

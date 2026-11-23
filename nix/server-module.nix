@@ -64,6 +64,21 @@ in
       default = 64;
       description = "Maximum live instances in one server process (SSC_INSTANCE_LIMIT).";
     };
+    scriptMemoryBytes = lib.mkOption {
+      type = lib.types.ints.between 1048576 8388608;
+      default = 8388608;
+      description = "Creator VM memory ceiling in bytes; saved administrator policies override this default.";
+    };
+    scriptCallbackMillis = lib.mkOption {
+      type = lib.types.ints.between 1 5;
+      default = 5;
+      description = "Creator callback CPU budget in milliseconds.";
+    };
+    scriptSchedulerMillis = lib.mkOption {
+      type = lib.types.ints.between 1 8;
+      default = 8;
+      description = "Aggregate creator scheduler wall-time allowance per simulation tick (also bounded by half the tick interval).";
+    };
     instancePlayers = lib.mkOption {
       type = lib.types.ints.between 1 128;
       default = 64;
@@ -101,6 +116,9 @@ in
         SSC_PUBLIC_URL = cfg.publicUrl;
         SSC_DATA = "/var/lib/${cfg.stateDirectory}";
         SSC_TPS = toString cfg.simulationTps;
+        SSC_SCRIPT_MEMORY_BYTES = toString cfg.scriptMemoryBytes;
+        SSC_SCRIPT_CALLBACK_MS = toString cfg.scriptCallbackMillis;
+        SSC_SCRIPT_SCHEDULER_MS = toString cfg.scriptSchedulerMillis;
         SSC_NETWORK_MIN_HZ = toString cfg.networkMinimumHz;
         SSC_NETWORK_MAX_HZ = toString cfg.networkMaximumHz;
         SSC_NETWORK_ADAPT = lib.boolToString cfg.networkAdaptation;

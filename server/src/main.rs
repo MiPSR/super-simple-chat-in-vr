@@ -48,11 +48,12 @@ async fn main() -> anyhow::Result<()> {
         saved.validate(&config)?;
         saved.apply(&mut config);
     }
-    let worlds = world::Registry::with_limits(
+    let mut worlds = world::Registry::with_limits(
         config.tps,
         config.instance_limit,
         config.instance_players,
     );
+    worlds.script_policy = config.script_policy;
     logs::record(format!(
         "Super Simple Chat in VR starting: {} (ENet {}, {} TPS, instance limit {}, player cap {})",
         config.public_url, config.enet, config.tps, config.instance_limit, config.instance_players

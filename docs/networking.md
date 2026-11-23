@@ -204,10 +204,13 @@ one TTL window; session revocation is rechecked each tick through the same
 cache and surfaces within 15 seconds worst case. Access semantics are
 unchanged.
 
-## Shared physics budget
+## Physics scheduling
 
-The authoritative tick carries one shared 8-millisecond physics budget across
-all instances. An instance that exhausts the shared allowance freezes its
-bodies for that tick — its scene step and contact resolution are skipped —
-rather than stalling every other player's tick. The budget resets each tick;
-creator/script work keeps its existing separate queues and watchdogs.
+Every authoritative tick advances every live instance's physics once. The
+previous shared 8-ms cutoff was removed: it could skip later worlds' physics
+while still advancing their clocks, leases and scripts, potentially starving
+them indefinitely by map order. Physics cannot be safely preempted by checking
+a deadline between scenes. Entity/admission ceilings bound supported load;
+an overloaded server may miss its target wall-clock TPS rather than silently
+dropping selected worlds' simulation steps. Creator callbacks and their
+aggregate scheduler retain separate, bounded execution budgets.

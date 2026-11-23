@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 const KEY: &str = "operator_policy_v1";
 
 macro_rules! policies {
-    ($($field:ident: $ty:ty),* $(,)?) => {
+    ($($(#[$meta:meta])* $field:ident: $ty:ty),* $(,)?) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(deny_unknown_fields)]
-        pub struct Settings { $(pub $field: $ty,)* }
+        pub struct Settings { $($(#[$meta])* pub $field: $ty,)* }
         impl Settings {
             // The generated field list intentionally mixes Copy and owned types.
             #[allow(clippy::clone_on_copy)]
@@ -25,6 +25,8 @@ macro_rules! policies {
 }
 policies! {
     tps: u32,
+    #[serde(default)]
+    script_policy: crate::world::ScriptPolicy,
     network_rates: crate::realtime::rates::Policy,
     instance_limit: usize,
     instance_players: usize,

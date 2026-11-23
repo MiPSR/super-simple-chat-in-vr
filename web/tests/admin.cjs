@@ -65,7 +65,7 @@ test("admin logs display timestamps and untrusted content as plain text",async (
 });
 
 test("administrator policy form preserves types, nested policies and unedited settings",async () => {
-  const saved = {tps:60,instance_limit:64,voice_bitrate:24000,network_rates:{minimum_hz:1,maximum_hz:120,automatic:true,suppress_unchanged:false},radio_channels:[1,2],radio_presets:["standard"],audio_effect_max:0.9};
+  const saved = {tps:60,instance_limit:64,voice_bitrate:24000,script_policy:{memory_bytes:8388608,callback_millis:5,scheduler_millis:8},network_rates:{minimum_hz:1,maximum_hz:120,automatic:true,suppress_unchanged:false},radio_channels:[1,2],radio_presets:["standard"],audio_effect_max:0.9};
   let received;
   const p = await page({}, {"/api/v1/admin/settings":options => {
     if (options.method === "PUT") {
@@ -80,12 +80,17 @@ test("administrator policy form preserves types, nested policies and unedited se
   assert.equal(p.elements.get("server-policy").hidden,false);
   const field = name => p.elements.get("server-settings").elements.namedItem(name);
   field("tps").value = "30";
+  field("script_policy.memory_bytes").value = "1048576";
+  field("script_policy.callback_millis").value = "1";
   field("network_rates.minimum_hz").value = "5";
   field("network_rates.automatic").checked = false;
   field("radio_channels").value = "2, 7";
   field("radio_presets").value = "narrow,weak";
   await p.submit("server-settings");
   assert.equal(received.tps,30);
+  assert.equal(received.script_policy.memory_bytes,1048576);
+  assert.equal(received.script_policy.callback_millis,1);
+  assert.equal(received.script_policy.scheduler_millis,8);
   assert.equal(received.network_rates.minimum_hz,5);
   assert.equal(received.network_rates.automatic,false);
   assert.deepEqual(received.radio_channels,[2,7]);

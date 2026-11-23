@@ -4,6 +4,9 @@ let me;
 let operatorSettings;
 const policyFields = [
   ["tps","Simulation TPS",1,120],["instance_limit","Maximum instances",1,512],["instance_players","Players per instance",1,128],
+  ["script_policy.memory_bytes","Creator VM memory bytes",1048576,8388608],
+  ["script_policy.callback_millis","Creator callback CPU budget (ms)",1,5],
+  ["script_policy.scheduler_millis","Creator scheduler budget per tick (ms)",1,8],
   ["network_rates.minimum_hz","Minimum network Hz",1,120],["network_rates.maximum_hz","Maximum network Hz",1,120],
   ["network_rates.automatic","Adapt rates for poor connections","boolean"],["network_rates.suppress_unchanged","Suppress unchanged pose updates","boolean"],
   ["default_world_slots","New-account world slots",1,1000],["default_avatar_slots","New-account avatar slots",1,1000],
