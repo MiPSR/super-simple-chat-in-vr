@@ -25,6 +25,17 @@ tests seed their own isolated temporary database sessions.
   (post-admission client sends continue past the admission sequence).
 - Remaining: multi-instance saturation/load balancing acceptance.
 
+### Load follow-up (2026-11-23)
+
+- Added multi-instance load acceptance: three concurrent instances carry six
+  encrypted raw clients streaming sequenced poses and reliable commands for a
+  sustained window. All sessions stay admitted, every client receives
+  other-player pose output, reliable delivery holds, and the authoritative
+  loop sustains ~60 TPS (361 ticks over six seconds).
+- Combined with the packet-loss test, the transport's loss and load
+  acceptance rows are covered headlessly; Internet-scale latency/jitter
+  acceptance remains a deployment concern.
+
 ## Correction pass (2026-11-18)
 
 ### Creator-budget follow-up (2026-11-23)
@@ -501,7 +512,7 @@ No row below waives any part of the corresponding scenario.
 | 5 | GLB and ephemeral instances tested; private instances, owner-only invitations and account-bound redemption pass with real peers; broader multi-party invitation/search acceptance remains. |
 | 6 | Real peers exercise doors, tanks, projectiles, spawning, damage and scores. |
 | 7 | Real peers exercise late join, reconnect and last-player destruction. |
-| 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; 25%-loss admission and reliable-command acceptance passes through a dropping UDP proxy; multi-instance load acceptance remains. |
+| 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; 25%-loss admission and reliable-command acceptance passes through a dropping UDP proxy; three concurrent instances with six sustained clients pass at the full 60-TPS authoritative rate. |
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
 | 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |

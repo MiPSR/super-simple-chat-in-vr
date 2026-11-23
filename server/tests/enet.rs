@@ -2368,6 +2368,282 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     Ok(())
 }
 
+/// Multi-instance load acceptance: several encrypted sessions across several
+/// live instances, sustained pose input and reliable commands.
+#[tokio::test]
+async fn multiple_instances_carry_concurrent_sessions_under_load() -> Result<()> {
+    let directory = tempfile::Builder::new()
+        .prefix("ssc-load-")
+        .tempdir_in(std::env::temp_dir())?;
+    let http_socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let http_address = http_socket.local_addr()?;
+    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let udp_address = udp_socket.local_addr()?;
+    let api = Api {
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+        base: format!("http://{http_address}"),
+        admin: token(),
+    };
+    drop(http_socket);
+    drop(udp_socket);
+    let _server = Process(
+        Command::new(env!("CARGO_BIN_EXE_super-simple-chat-server"))
+            .env("SSC_ADMIN_TOKEN", &api.admin)
+            .env("SSC_DATA", directory.path())
+            .env("SSC_LISTEN", http_address.to_string())
+            .env("SSC_ENET", udp_address.to_string())
+            .env("SSC_PUBLIC_URL", &api.base)
+            .env("SSC_TPS", "60")
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if api.json("/health", None, &api.admin).await.is_ok() {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "Backend did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let users: Vec<String> = (0..6)
+        .map(|index| format!("{:0>9}", 111111111 + index))
+        .collect();
+    let sessions: Vec<String> = (0..6).map(|_| token()).collect();
+    for user in &users {
+        api.json("/api/v1/admin/users", Some(json!({"id":user})), &api.admin)
+            .await?;
+    }
+    {
+        let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64
+            + 3600;
+        for (user, session) in users.iter().zip(&sessions) {
+            db.execute(
+                "INSERT INTO sessions VALUES(?,?,?)",
+                rusqlite::params![
+                    hex::encode(Sha256::digest(session.as_bytes())),
+                    user,
+                    expires
+                ],
+            )?;
+        }
+    }
+    let mut package = Cursor::new(Vec::new());
+    example_world::write(&mut package)?;
+    let asset = api
+        .upload("world", &package.into_inner(), &sessions[0])
+        .await?;
+
+    struct Client {
+        host: rusty_enet::Host<std::net::UdpSocket>,
+        peer: rusty_enet::PeerID,
+        secret: Vec<u8>,
+        sequence: u64,
+        sent: u32,
+        replies: u32,
+        received: u32,
+        disconnected: bool,
+    }
+    fn admit(
+        udp_address: std::net::SocketAddr,
+        grant: &Value,
+    ) -> Result<(rusty_enet::Host<std::net::UdpSocket>, rusty_enet::PeerID, Vec<u8>, Value)> {
+        let secret = hex::decode(grant["secret"].as_str().unwrap())?;
+        let ticket = grant["ticket"].as_str().unwrap().as_bytes().to_vec();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut host = rusty_enet::Host::new(
+            socket,
+            rusty_enet::HostSettings {
+                peer_limit: 1,
+                channel_limit: 3,
+                ..Default::default()
+            },
+        )?;
+        let peer = host.connect(udp_address, 3, 0)?.id();
+        let mut challenge: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while challenge.is_empty() {
+            while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+                if let rusty_enet::Event::Receive { channel_id, packet, .. } = event
+                    && channel_id == 0
+                    && packet.data().len() == 17
+                    && packet.data()[0] == 0
+                {
+                    challenge = packet.data()[1..].to_vec();
+                }
+            }
+            ensure!(Instant::now() < deadline, "No challenge greeting");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut reply = ticket.clone();
+        reply.extend_from_slice(&challenge);
+        reply.extend_from_slice(&test_seal(&secret, 0, 0, 1, &ticket));
+        host.peer_mut(peer)
+            .send(0, &rusty_enet::Packet::new(reply, rusty_enet::PacketKind::Reliable))?;
+        let mut admitted = Value::Null;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while admitted.is_null() {
+            while let Some(event) = host.service().map_err(|e| anyhow::anyhow!("{e}"))? {
+                if let rusty_enet::Event::Receive { channel_id, packet, .. } = event
+                    && channel_id == 0
+                    && let Some((2, payload)) = test_open(&secret, 0, packet.data())
+                    && let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                    && value["user"].is_string()
+                {
+                    admitted = value;
+                }
+            }
+            ensure!(Instant::now() < deadline, "Admission never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok((host, peer, secret, admitted))
+    }
+
+    // Three creators each start their own instance; three more clients join.
+    let mut clients: Vec<Client> = Vec::new();
+    let mut instances: Vec<String> = Vec::new();
+    for index in 0..3 {
+        let grant = api
+            .json(
+                "/api/v1/game-grants",
+                Some(json!({"world":asset["id"]})),
+                &sessions[index * 2],
+            )
+            .await?;
+        let (host, peer, secret, admitted) = admit(udp_address, &grant)?;
+        let instance = admitted["snapshot"]["instance"].as_str().unwrap().into();
+        instances.push(instance);
+        clients.push(Client {
+            host,
+            peer,
+            secret,
+            sequence: 2,
+            sent: 0,
+            replies: 0,
+            received: 0,
+            disconnected: false,
+        });
+    }
+    for index in 0..3 {
+        let grant = api
+            .json(
+                "/api/v1/game-grants",
+                Some(json!({"instance":instances[index]})),
+                &sessions[index * 2 + 1],
+            )
+            .await?;
+        let (host, peer, secret, _) = admit(udp_address, &grant)?;
+        clients.push(Client {
+            host,
+            peer,
+            secret,
+            sequence: 2,
+            sent: 0,
+            replies: 0,
+            received: 0,
+            disconnected: false,
+        });
+    }
+    let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+    ensure!(health["instances"] == 3, "Expected three live instances");
+    let start_tick = health["tick"].as_u64().unwrap_or(0);
+    // Sustained load: every client streams poses and reliable echo commands.
+    let start = Instant::now();
+    let mut next_pose = Instant::now();
+    let mut next_echo = Instant::now();
+    while start.elapsed() < Duration::from_secs(6) {
+        if Instant::now() >= next_pose {
+            next_pose += Duration::from_millis(16);
+            let mut pose = vec![0u8; 84];
+            for chunk in pose.chunks_mut(4) {
+                chunk.copy_from_slice(&0.0f32.to_le_bytes());
+            }
+            for client in &mut clients {
+                // Kind-3 pose on sequenced channel 1; the replay counter is
+                // per channel, so poses and commands count separately.
+                client.sequence += 1;
+                let _ = client.host.peer_mut(client.peer).send(
+                    1,
+                    &rusty_enet::Packet::new(
+                        test_seal_seq(&client.secret, 1, 0, 3, &pose, client.sequence),
+                        rusty_enet::PacketKind::AlwaysUnreliable { sequenced: true },
+                    ),
+                );
+            }
+        }
+        if Instant::now() >= next_echo {
+            next_echo += Duration::from_millis(250);
+            for client in &mut clients {
+                client.sent += 1;
+                client.sequence += 1;
+                let payload = format!("{{\"sent\":{}}}", client.sent);
+                client.host.peer_mut(client.peer).send(
+                    0,
+                    &rusty_enet::Packet::new(
+                        test_seal_seq(&client.secret, 0, 0, 23, payload.as_bytes(), client.sequence),
+                        rusty_enet::PacketKind::Reliable,
+                    ),
+                )?;
+            }
+        }
+        for client in &mut clients {
+            while let Some(event) = client
+                .host
+                .service()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                match event {
+                    rusty_enet::Event::Receive { channel_id, packet, .. } => {
+                        if channel_id == 1 {
+                            client.received += 1;
+                            continue;
+                        }
+                        if let Some((23, payload)) = test_open(&client.secret, 0, packet.data())
+                            && let Ok(value) = serde_json::from_slice::<Value>(&payload)
+                            && value["server"].is_number()
+                        {
+                            client.replies += 1;
+                        }
+                    }
+                    rusty_enet::Event::Disconnect { .. } => client.disconnected = true,
+                    _ => {}
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let health = api.json("/api/v1/admin/health", None, &api.admin).await?;
+    let ticks = health["tick"].as_u64().unwrap_or(0) - start_tick;
+    for (index, client) in clients.iter().enumerate() {
+        ensure!(
+            !client.disconnected,
+            "Client {index} disconnected under concurrent-instance load"
+        );
+        ensure!(
+            client.replies * 2 >= client.sent,
+            "Client {index} reliable delivery collapsed under load: {}/{}",
+            client.replies,
+            client.sent
+        );
+        ensure!(
+            client.received > 60,
+            "Client {index} received too little other-player pose output: {}",
+            client.received
+        );
+    }
+    ensure!(
+        (180..=420).contains(&ticks),
+        "Authoritative tick progressed {ticks} in six seconds (expected ~360)"
+    );
+    println!(
+        "PASS three concurrent instances, six clients, sustained pose/echo load with {ticks} authoritative ticks"
+    );
+    Ok(())
+}
 /// A UDP proxy that drops every fourth packet per direction, so ENet's own
 /// retransmission must carry the encrypted session end to end.
 #[tokio::test]
