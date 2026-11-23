@@ -116,6 +116,8 @@ async function refresh() {
     if (health.limits) $("limits").textContent = `Live-instance limits: ${health.limits.instances} instances · ${health.limits.instance_players} players per instance.`;
     if (health.defaults) $("defaults").textContent = `New-account quotas: ${health.defaults.world_slots} world slots / ${health.defaults.world_bytes} bytes · ${health.defaults.avatar_slots} avatar slots / ${health.defaults.avatar_bytes} bytes.`;
     $("health").textContent = JSON.stringify(health, null, 2);
+    const logs = await api("/admin/logs");
+    $("logs").textContent = logs.map(entry => `${new Date(entry.time * 1000).toISOString()} ${entry.line}`).join("\n") || "No recent entries.";
   }
 }
 async function load() {
@@ -133,7 +135,7 @@ action("admin-login", async () => { adminSecret = $("admin-secret").value; $("ad
 action("search", refresh);
 action("preferences", async () => {
   const p = { ...me.preferences };
-  for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "draw_distance", "texture_lod_bias", "texture_reduction", "radial_hold_seconds"].includes(key) ? Number(el.value) : el.value; }
+    for (const key of Object.keys(p)) { const el = $("preferences").elements.namedItem(key); if (!el) continue; p[key] = el.type === "checkbox" ? el.checked : ["quality", "send_divisor", "receive_divisor", "voice_volume", "microphone_gain", "resolution_scale", "draw_distance", "texture_lod_bias", "texture_reduction", "radial_hold_seconds", "turn_angle", "move_speed"].includes(key) ? Number(el.value) : el.value; }
   p.radial_actions = Array.from({length:8}, (_, index) => $("preferences").elements.namedItem(`radial_action_${index}`).value);
   await api("/preferences", {method:"PUT",body:p}); me.preferences = p; status("Preferences saved.");
 });

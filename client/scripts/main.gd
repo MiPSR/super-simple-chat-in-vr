@@ -19,6 +19,10 @@ const AmbientVisuals = preload("res://scripts/ambient_visuals.gd")
 const PeopleTab = preload("res://scripts/people_tab.gd")
 const WorldsTab = preload("res://scripts/worlds_tab.gd")
 const Visuals = preload("res://scripts/visual_overrides.gd")
+const Locomotion = preload("res://scripts/locomotion.gd")
+var locomotion: CharacterBody3D
+var lobby_floor: MeshInstance3D
+var lobby_collider: CollisionShape3D
 var ambient_visuals := AmbientVisuals.new()
 var network: Node
 var loader: Node
@@ -225,6 +229,10 @@ func _build_rig() -> void:
 		camera.position = Vector3(0, 1.65, 3)
 		camera.current = true
 	origin.add_child(camera)
+	locomotion = Locomotion.new()
+	locomotion.rig = origin
+	locomotion.head = camera
+	add_child(locomotion)
 	for i in 2:
 		var controller := XRController3D.new()
 		controller.tracker = &"left_hand" if i == 0 else &"right_hand"
@@ -235,11 +243,19 @@ func _build_rig() -> void:
 
 func _build_lobby() -> void:
 	var floor_mesh := MeshInstance3D.new()
+	lobby_floor = floor_mesh
 	var box := BoxMesh.new()
 	box.size = Vector3(20, 0.1, 20)
 	floor_mesh.mesh = box
 	floor_mesh.position.y = -0.08
 	add_child(floor_mesh)
+	var floor_body := StaticBody3D.new()
+	floor_mesh.add_child(floor_body)
+	lobby_collider = CollisionShape3D.new()
+	var floor_shape := BoxShape3D.new()
+	floor_shape.size = box.size
+	lobby_collider.shape = floor_shape
+	floor_body.add_child(lobby_collider)
 	var light := DirectionalLight3D.new()
 	light.rotation_degrees = Vector3(-50, -30, 0)
 	add_child(light)
@@ -590,6 +606,8 @@ func _apply_grant(grant: Dictionary) -> void:
 		_status(error_string(result))
 
 func _clear_instance() -> void:
+	locomotion.active = false
+	locomotion.reset()
 	ambient_visuals.clear()
 	loader.cancel()
 	for avatar in avatars.values():
@@ -628,6 +646,13 @@ func _clear_instance() -> void:
 	current_version = ""
 	current_instance = ""
 
+func _turn_about_head(angle: float) -> void:
+	var before := camera.global_position
+	origin.rotate_y(angle)
+	var correction := before - camera.global_position
+	correction.y = 0
+	origin.global_position += correction
+
 func _message(kind: int, data: Dictionary) -> void:
 	if kind == 2 and data.has("user"):
 		radios.bind_actor(str(data.user))
@@ -654,6 +679,7 @@ func _message(kind: int, data: Dictionary) -> void:
 			loader.load_world(snapshot)
 			var spawn: Array = snapshot.manifest.get("spawn", [0, 1, 3])
 			origin.position = Vector3(float(spawn[0]), float(spawn[1]), float(spawn[2]))
+			locomotion.reset()
 		var tick := int(snapshot.get("tick", latest_tick))
 		_update_players(snapshot.get("players", {}).values(), tick, true)
 		people_tab.players(snapshot.get("players", {}).values(), network.user)
@@ -889,6 +915,12 @@ func _process(delta: float) -> void:
 		for constraint in constraints.get(user, []):
 			list.append(constraint)
 		avatars[user].grabs(list)
+	var in_world := is_instance_valid(world_root)
+	lobby_floor.visible = not in_world
+	lobby_collider.set_deferred("disabled", in_world)
+	# Keep lobby controls usable, but don't fall through a loading world.
+	locomotion.active = in_world or not network.joined
+	locomotion.desired_velocity = Vector3.ZERO
 	if not input_focused:
 		return
 	if xr_active:
@@ -898,25 +930,27 @@ func _process(delta: float) -> void:
 		_update_pointer_ray()
 		if not menu_pressed:
 			var stick := controllers[move_hand_index].get_vector2("primary")
-			var direction := camera.global_basis * Vector3(stick.x, 0, -stick.y)
-			direction.y = 0
-			origin.position += direction * delta * move_speed_value
+			var forward := -camera.global_basis.z
+			forward.y = 0
+			forward = forward.normalized()
+			var direction := forward.cross(Vector3.UP) * stick.x + forward * stick.y
+			locomotion.desired_velocity = direction.limit_length(1.0) * move_speed_value
 			var turn := controllers[1 - move_hand_index].get_vector2("primary").x
 			if snap_turn_on:
 				# Discrete comfort turning: one step per flick, re-armed when
 				# the stick returns below the hysteresis threshold.
 				if absf(turn) > 0.75 and not turn_armed:
-					origin.rotate_y(-deg_to_rad(turn_angle_deg))
+					_turn_about_head(-deg_to_rad(turn_angle_deg) * signf(turn))
 					turn_armed = true
 				elif absf(turn) < 0.5:
 					turn_armed = false
 			elif absf(turn) > 0.15:
-				origin.rotate_y(-turn * delta * deg_to_rad(90.0))
+				_turn_about_head(-turn * delta * deg_to_rad(90.0))
 	else:
 		var direction := Vector3.ZERO
 		if not _text_typing():
 			direction = Vector3(float(Input.is_physical_key_pressed(KEY_D)) - float(Input.is_physical_key_pressed(KEY_A)), 0, float(Input.is_physical_key_pressed(KEY_S)) - float(Input.is_physical_key_pressed(KEY_W)))
-		origin.position += origin.basis * direction * delta * 2
+		locomotion.desired_velocity = origin.basis * direction.limit_length(1.0) * move_speed_value
 	if network.joined and not selected_entity.is_empty():
 		drive_elapsed += delta
 		if drive_elapsed >= 1.0 / network.send_hz and entity_data.has(selected_entity):

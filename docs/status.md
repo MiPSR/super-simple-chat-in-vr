@@ -8,6 +8,24 @@ tests seed their own isolated temporary database sessions.
 
 ## Correction pass (2026-11-18)
 
+### Gameplay follow-up (2026-11-23)
+
+- Artificial locomotion now uses Godot's character collision/slide solver
+  against world entity collision proxies, with gravity, floor snapping and
+  a head-height-adjusted capsule. This is local comfort movement, not
+  authoritative shared-object physics or a server-driven camera correction.
+  Physical room-scale headset movement is deliberately not pushed by walls.
+- Snap turns respect both stick directions; smooth and snap turns pivot
+  around the headset's horizontal position instead of orbiting the rig origin.
+  Movement speed is shared by desktop/XR and diagonal input is bounded.
+- The website exposes existing comfort/shadow preferences and displays the
+  bounded administrator log endpoint as plain text with timestamps.
+- Hardware comfort, step/stair traversal, moving-platform riding, and
+  fall recovery are not established by these changes.
+- Verification: full workspace/all-target tests pass, including real Godot
+  peers and the new grounded movement/wall sliding/crouching checks; website
+  tests pass 9/9. These are not a substitute for headset acceptance.
+
 The following gaps from the previous status were implemented and verified by a
 full local `cargo test --locked --workspace --all-targets` run (clippy clean):
 

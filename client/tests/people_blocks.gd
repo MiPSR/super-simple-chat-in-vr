@@ -8,6 +8,12 @@ static func run() -> void:
 	var tree: SceneTree = Engine.get_main_loop()
 	var app: Node = load("res://main.tscn").instantiate()
 	tree.root.add_child(app)
+	app.camera.position = Vector3(0.7, 1.65, 0.4)
+	var head_position: Vector3 = app.camera.global_position
+	app._turn_about_head(deg_to_rad(30))
+	assert(app.camera.global_position.is_equal_approx(head_position), "Comfort turns must pivot around the headset")
+	app._turn_about_head(deg_to_rad(-30))
+	assert(app.origin.basis.is_equal_approx(Basis.IDENTITY), "Opposite turns must cancel")
 	var failures: Array = []
 	app.loader.failed.connect(func(message: String): failures.append(message))
 	# (a) Revision resnapshots omit "manifest"; the loaded world must survive.

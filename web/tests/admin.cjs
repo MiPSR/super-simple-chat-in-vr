@@ -54,6 +54,36 @@ async function page(preferences = {}, routes = {}) {
   return {elements,requests,submit,setGc(fn) {gc = fn;}};
 }
 
+test("admin logs display timestamps and untrusted content as plain text",async () => {
+  const line = "<script>alert('not markup')</script>";
+  const p = await page({}, {"/api/v1/admin/logs":[{time:0,line}]});
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  assert.equal(p.elements.get("logs").textContent,`1970-01-01T00:00:00.000Z ${line}`);
+  const request = p.requests.find(request => request.path === "/api/v1/admin/logs");
+  assert.equal(request.options.headers.Authorization,"Bearer " + "s".repeat(32));
+});
+
+test("comfort controls save numeric values and preserve checkbox preferences",async () => {
+  const p = await page({turn_angle:30,move_speed:1.5,shadows:true,snap_turn:true});
+  const controls = {turn_angle:new Element(),move_speed:new Element(),shadows:new Element(),snap_turn:new Element()};
+  controls.shadows.type = controls.snap_turn.type = "checkbox";
+  const radial = Array.from({length:8},() => { const el = new Element(); el.value = "none"; return el; });
+  p.elements.get("preferences").elements.namedItem = name => controls[name] || (name.startsWith("radial_action_") ? radial[Number(name.slice(14))] : null);
+  p.elements.get("admin-secret").value = "s".repeat(32);
+  await p.submit("admin-login");
+  controls.turn_angle.value = "45";
+  controls.move_speed.value = "0.8";
+  controls.shadows.checked = false;
+  await p.submit("preferences");
+  const request = p.requests.find(request => request.path === "/api/v1/preferences");
+  const saved = JSON.parse(request.options.body);
+  assert.equal(saved.turn_angle,45);
+  assert.equal(saved.move_speed,0.8);
+  assert.equal(saved.shadows,false);
+  assert.equal(saved.snap_turn,true);
+});
+
 test("admin GC form uses the authenticated bounded API and shows its result",async () => {
   const p = await page();
   assert.equal(p.elements.get("admin").hidden,true);
