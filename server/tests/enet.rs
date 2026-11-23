@@ -2043,6 +2043,106 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     );
     // Raw ENet admission: the server speaks first with a per-connection
     // challenge; a captured handshake from another connection must fail.
+    // Upload ownership/quota/slot/replacement boundaries: one matrix.
+    {
+        let mut package = Cursor::new(Vec::new());
+        example_world::write(&mut package)?;
+        let world = package.into_inner();
+        let put = |kind: &str, replace: Option<&str>, token: &str, bytes: &[u8]| {
+            let mut body = b"--ssc-upload\r\nContent-Disposition: form-data; name=\"package\"; filename=\"package.zip\"\r\nContent-Type: application/zip\r\n\r\n".to_vec();
+            body.extend(bytes);
+            body.extend(b"\r\n--ssc-upload--\r\n");
+            let query = match replace {
+                Some(id) => format!("?kind={kind}&replace={id}"),
+                None => format!("?kind={kind}"),
+            };
+            api.client
+                .post(format!("{}/api/v1/assets{query}", api.base))
+                .bearer_auth(token)
+                .header("Content-Type", "multipart/form-data; boundary=ssc-upload")
+                .body(body)
+                .send()
+        };
+        // Unknown replacement target is a 404, not an internal error.
+        ensure!(
+            put("world", Some("nonexistent000"), &tokens[0], &world).await?.status() == 404,
+            "Unknown replacement asset did not return 404"
+        );
+        // Replacing another user's asset or the wrong kind is forbidden.
+        let stranger = api.upload("world", &world, &tokens[1]).await?;
+        ensure!(
+            put("world", Some(stranger["id"].as_str().unwrap()), &tokens[0], &world)
+                .await?
+                .status()
+                == 403,
+            "Replacing another user's asset was not forbidden"
+        );
+        let avatar_package;
+        {
+            let mut avatar = Cursor::new(Vec::new());
+            example_world::write_avatar(&mut avatar)?;
+            avatar_package = avatar.into_inner();
+        }
+        let owned_avatar = api.upload("avatar", &avatar_package, &tokens[0]).await?;
+        ensure!(
+            put("world", Some(owned_avatar["id"].as_str().unwrap()), &tokens[0], &world)
+                .await?
+                .status()
+                == 403,
+            "Replacing with the wrong kind was not forbidden"
+        );
+        // Slot and byte ceilings: one world slot, 1000 world bytes.
+        let quota = |slots: i64, bytes: i64| {
+            api.client
+                .put(format!("{}/api/v1/admin/users/{}", api.base, users[0]))
+                .bearer_auth(&api.admin)
+                .json(&json!({"world_slots":slots,"avatar_slots":8,"world_bytes":bytes,"avatar_bytes":100000000}))
+                .send()
+        };
+        quota(1, 1000).await?.error_for_status()?;
+        ensure!(world.len() > 1000, "Fixture world must exceed the test byte quota");
+        ensure!(
+            put("world", None, &tokens[0], &world).await?.status() == 413,
+            "An over-quota world upload was not rejected with 413"
+        );
+        // Slot exhaustion at the cap; replacing an owned asset stays possible.
+        quota(1, 1_000_000_000).await?.error_for_status()?;
+        let second = put("world", None, &tokens[0], &world).await?;
+        ensure!(second.status() == 400, "Slot exhaustion returned {}", second.status());
+        let replaced = put("world", Some(asset["id"].as_str().unwrap()), &tokens[0], &world)
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        ensure!(replaced["id"] == asset["id"], "Replacement changed the asset ID");
+        // Deleting another user's asset fails without leaking its existence.
+        ensure!(
+            api.client
+                .delete(format!("{}/api/v1/assets/{}", api.base, stranger["id"].as_str().unwrap()))
+                .bearer_auth(&tokens[0])
+                .send()
+                .await?
+                .status()
+                == 400
+        );
+        // A byte quota cut below the package size rejects replacement too.
+        quota(1, 10).await?.error_for_status()?;
+        ensure!(
+            put("world", Some(asset["id"].as_str().unwrap()), &tokens[0], &world)
+                .await?
+                .status()
+                == 413,
+            "A below-size byte quota did not reject the replacement"
+        );
+        quota(4, 1_000_000_000).await?.error_for_status()?;
+        api.client
+            .delete(format!("{}/api/v1/assets/{}", api.base, owned_avatar["id"].as_str().unwrap()))
+            .bearer_auth(&tokens[0])
+            .send()
+            .await?
+            .error_for_status()?;
+        println!("PASS upload ownership, slot, byte-quota, replacement and deletion boundaries");
+    }
     let secret = hex::decode(grant["secret"].as_str().unwrap())?;
     let ticket = grant["ticket"].as_str().unwrap().as_bytes();
     let drain = |host: &mut rusty_enet::Host<std::net::UdpSocket>| -> Result<Vec<Value>> {

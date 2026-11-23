@@ -6,6 +6,15 @@ Headless tests establish integration behavior, not headset comfort or complete
 production security. There is no development account-login bypass in the app;
 tests seed their own isolated temporary database sessions.
 
+### Upload boundary follow-up (2026-11-23)
+
+- Replacing an unknown asset ID now returns 404 instead of an internal error.
+- A real-HTTP matrix now covers: unknown replacement 404, foreign-asset and
+  wrong-kind replacement 403, over-quota uploads 413, slot exhaustion 400
+  (with owned replacement still allowed at the cap), foreign deletion 400,
+  below-size quota rejection, and own-asset deletion. Catalog enable/disable
+  and grant denial for disabled assets were already covered.
+
 ## Correction pass (2026-11-18)
 
 ### Creator-budget follow-up (2026-11-23)
@@ -477,9 +486,9 @@ No row below waives any part of the corresponding scenario.
 |---|---|
 | 1 | Packaged headless client launched; full NixOS service/deployment and PCVR checks remain. |
 | 2 | OAuth/allowlist implementation and isolated auth rejection tests; live Discord login remains. |
-| 3 | Upload/catalog tests; complete replace/delete/quota/slot boundary matrix remains. |
+| 3 | Upload/catalog tests plus the real-HTTP ownership, slot, byte-quota, replacement and deletion boundary matrix pass; concurrent-upload and interrupted-transfer acceptance remain. |
 | 4 | Procedural VRM fixture covers expressions/springs/IK/actions; representative uploaded avatars and XR remain. |
-| 5 | GLB and ephemeral instances tested; private invitation/search matrix needs expansion. |
+| 5 | GLB and ephemeral instances tested; private instances, owner-only invitations and account-bound redemption pass with real peers; broader multi-party invitation/search acceptance remains. |
 | 6 | Real peers exercise doors, tanks, projectiles, spawning, damage and scores. |
 | 7 | Real peers exercise late join, reconnect and last-player destruction. |
 | 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; packet-loss/load acceptance remains. |

@@ -348,7 +348,9 @@ async fn upload(
             if !who.admin && !enabled {return Err(ApiError(StatusCode::FORBIDDEN,"Upload account was disabled".into()));}
             if current_budget<0 || size>current_budget as u64 {return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE,"Upload quota changed before publication".into()));}
             let id=if let Some(id)=q.replace {
-                let (owner,kind):(String,String)=tx.query_row("SELECT owner,kind FROM assets WHERE id=?",[&id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                use rusqlite::OptionalExtension;
+                let found:Option<(String,String)>=tx.query_row("SELECT owner,kind FROM assets WHERE id=?",[&id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let Some((owner,kind))=found else {return Err(ApiError::not_found("Unknown replacement asset"));};
                 if (owner!=who.id && !who.admin) || kind!=q.kind {return Err(ApiError(StatusCode::FORBIDDEN,"Not your asset or wrong kind".into()));} id
             } else {
                 let count:i64=tx.query_row("SELECT COUNT(*) FROM assets WHERE owner=? AND kind=?",rusqlite::params![who.id,q.kind],|r|r.get(0))?;
