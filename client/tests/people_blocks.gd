@@ -14,6 +14,13 @@ static func run() -> void:
 	assert(app.camera.global_position.is_equal_approx(head_position), "Comfort turns must pivot around the headset")
 	app._turn_about_head(deg_to_rad(-30))
 	assert(app.origin.basis.is_equal_approx(Basis.IDENTITY), "Opposite turns must cancel")
+	var remote = preload("res://scripts/avatar.gd").new()
+	tree.root.add_child(remote)
+	remote.sample({"pose":[], "sleeping":true, "sleep_pose":"side"}, 1)
+	assert(remote.sleeping and remote.sleep_pose == "side")
+	remote.sample({"pose":[], "sleeping":false}, 2)
+	assert(not remote.sleeping and remote.sleep_pose == "flat")
+	remote.free()
 	var failures: Array = []
 	app.loader.failed.connect(func(message: String): failures.append(message))
 	# (a) Revision resnapshots omit "manifest"; the loaded world must survive.
@@ -33,7 +40,8 @@ static func run() -> void:
 	var fresh := {"instance":"i1", "world":"w", "version":"v3", "tick":8, "players":{}, "entities":{}, "manifest":{"spawn":[5, 1, 2], "scripts":[]}}
 	app._message(2, {"user":"u1", "snapshot":fresh})
 	assert(app.current_version == "v3" and failures.size() == 1)
-	assert(app.origin.position.is_equal_approx(Vector3(5, 1, 2)))
+	assert(is_equal_approx(app.origin.position.y, 1))
+	assert(is_equal_approx(app.camera.global_position.x, 5) and is_equal_approx(app.camera.global_position.z, 2))
 	# A snapshot carrying no fields at all only clears the instance; guarded
 	# access keeps the client state consistent without errors.
 	app._message(2, {"user":"u2"})

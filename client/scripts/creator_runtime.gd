@@ -64,6 +64,8 @@ func _prepare_frame(delta: float) -> void:
 		var event := {"dt":tick_elapsed}
 		if scope.has_method("creator_tracking"):
 			event.tracking = scope.creator_tracking()
+		if scope.has_method("creator_posture"):
+			event.posture = scope.creator_posture()
 		if _enqueue("tick",event):
 			tick_elapsed = 0
 			tick_queued = true

@@ -122,10 +122,12 @@ and physics allocation budgets are separate resource limits.
 
 ## Authoritative Luau
 
-Each server script has an independent 8 MiB sandbox and a 5 ms thread-CPU
+Each server script defaults to an independent 8 MiB sandbox and a 5 ms thread-CPU
 execution watchdog (3 ms for client scripts), with a separate 250 ms wall-time
 backstop. Scheduler stalls do not consume its CPU allowance. If the thread
 clock is unavailable, the watchdog fails back to the stricter wall-time limit.
+Administrators may lower server memory/callback/scheduler limits through the
+persistent policy editor; see [settings.md](settings.md).
 The server caps creator VMs at 64 across all instances (512 MiB of configured
 Lua heap ceilings, not a whole-process memory budget). Capacity failure rejects
 new-instance admission without leaving the player's previous instance; partial
@@ -493,7 +495,15 @@ Stored local positions/quaternions and node visibility are sampled before each
 dispatch that has an active query-enabled script. Singular node transforms use
 identity rotation. These are local presentation snapshots, not authoritative
 world poses or a promise to expose final post-modifier rendered skin matrices.
-The normalized tracked/estimated input-source data remains in tick `tracking`.
+Tick `tracking` reports `tracked`, `estimated`, or `animation` for available
+normalized humanoid joints. An active supplied bone clip or creator bone
+override takes ownership of its affected limb instead of being overwritten by
+fallback IK. Stopping the clip restores estimated/tracked IK. Discrete action
+state remains server-replicated; animated bones themselves are not streamed.
+Tick `posture` reports `standing`, `crouching`, `sitting`, `sleeping_flat`, or
+`sleeping_side`. Non-sleeping posture labels are estimates from head height
+relative to sampled collision floors, not a promise to detect every real pose.
+Sleeping choice is explicit and replicated, while head/hand tracking stays live.
 Limits are 4096 combined node/bone/alias objects, 2 MiB per JSON update, and
 64 KiB of tags. Invalid/oversized contexts clear and report an error rather than
 exposing partial Godot objects. Avatar scripts without `queries` get an empty

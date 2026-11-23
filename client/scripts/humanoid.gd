@@ -1,6 +1,7 @@
 extends Node3D
 const CosmeticGrab = preload("res://scripts/cosmetic_grab.gd")
 const CreatorBones = preload("res://scripts/creator_bones.gd")
+const BodyPose = preload("res://scripts/body_pose.gd")
 ## Native Godot limb IK over the importer's normalized humanoid bone mapping.
 var skeleton: Skeleton3D
 var targets: Dictionary = {}
@@ -16,6 +17,12 @@ var grab_modifier: SkeletonModifier3D
 var bone_modifier: SkeletonModifier3D
 var query_nodes: Array[Node3D] = []
 var query_bones: Array[Dictionary] = []
+var last_head := Vector3(0, 1.65, 0)
+var posture := "standing"
+var limb_bones: Dictionary = {}
+var animation_players: Array[Node] = []
+var animation_bones: Dictionary = {}
+var humanoid_bones: Dictionary = {}
 
 func setup(model: Node3D, queries: bool = false) -> void:
 	model_root = model
@@ -33,6 +40,7 @@ func setup(model: Node3D, queries: bool = false) -> void:
 	if found.is_empty():
 		return
 	skeleton = found[0]
+	animation_players = model.find_children("*", "AnimationPlayer", true, false)
 	var meta = model.get("vrm_meta")
 	if meta:
 		bone_map = meta.get("humanoid_bone_mapping")
@@ -46,6 +54,10 @@ func setup(model: Node3D, queries: bool = false) -> void:
 	head_bone = bone("Head")
 	if head_bone >= 0:
 		rest_head = skeleton.get_bone_global_rest(head_bone).origin
+	for name in ["Hips", "Spine", "Chest", "UpperChest", "Neck", "Head", "LeftShoulder", "LeftUpperArm", "LeftLowerArm", "LeftHand", "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightShoulder", "RightUpperArm", "RightLowerArm", "RightHand", "RightUpperLeg", "RightLowerLeg", "RightFoot"]:
+		var index := bone(name)
+		if index >= 0:
+			humanoid_bones[name] = index
 	for side in ["Left", "Right"]:
 		_limb(side + "UpperArm", side + "Hand")
 		_limb(side + "UpperLeg", side + "Foot")
@@ -80,20 +92,55 @@ func _limb(root_name: String, tip_name: String) -> void:
 	solver.start()
 	solvers.append(solver)
 	limb_solvers[tip_name] = solver
+	var chain: Array[int] = []
+	var index := tip
+	while index >= 0:
+		chain.append(index)
+		if index == root:
+			break
+		index = skeleton.get_bone_parent(index)
+	limb_bones[tip_name] = chain
+
+func _animated_bones() -> Dictionary:
+	var active: Dictionary = {}
+	for node in animation_players:
+		var player := node as AnimationPlayer
+		if not is_instance_valid(player) or not player.is_playing() or not player.has_animation(player.current_animation):
+			continue
+		var clip: Animation = player.get_animation(player.current_animation)
+		var key := clip.get_instance_id()
+		if not animation_bones.has(key):
+			var indices: Array[int] = []
+			var root: Node = player.get_node_or_null(player.root_node)
+			for track in clip.get_track_count():
+				if not clip.track_is_enabled(track) or clip.track_get_type(track) not in [Animation.TYPE_POSITION_3D, Animation.TYPE_ROTATION_3D, Animation.TYPE_SCALE_3D]:
+					continue
+				var path := clip.track_get_path(track)
+				if root and path.get_subname_count() == 1 and root.get_node_or_null(NodePath(path.get_concatenated_names())) == skeleton:
+					var index := skeleton.find_bone(path.get_subname(0))
+					if index >= 0:
+						indices.append(index)
+			animation_bones[key] = indices
+		for index in animation_bones[key]:
+			active[index] = true
+	if bone_modifier:
+		for index in bone_modifier.rotations:
+			active[index] = true
+	return active
 
 func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary = {}, sleep_pose: String = "flat") -> void:
 	if not skeleton or poses.size() < 3:
 		return
 	var head := poses[0]
-	var yaw := head.basis.get_euler().y
-	global_basis = Basis(Vector3.UP, yaw)
-	if sleeping:
-		global_basis *= Basis(Vector3.RIGHT, PI / 2)
-		if sleep_pose == "side":
-			# Flat rests on the back; the side variant rolls about the spine.
-			global_basis *= Basis(Vector3.UP, PI / 2)
-	global_position = head.origin - global_basis * rest_head
+	last_head = head.origin
+	var body := BodyPose.estimate(head, rest_head, floor_heights, sleeping, sleep_pose)
+	global_basis = body.basis
+	global_position = body.root
+	posture = str(body.posture)
+	var animated := _animated_bones()
 	sources.clear()
+	for name in humanoid_bones:
+		sources[name] = "animation" if animated.has(humanoid_bones[name]) else "estimated"
 	for name in ["Hips", "Chest"]:
 		var index := bone(name)
 		if tracked.has(name) and index >= 0:
@@ -103,6 +150,8 @@ func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary 
 			skeleton.set_bone_pose_position(index, pose.origin)
 			skeleton.set_bone_pose_rotation(index, pose.basis.get_rotation_quaternion())
 			sources[name] = str(tracked[name].source)
+		elif animated.has(index):
+			sources[name] = "animation"
 		else:
 			sources[name] = "estimated"
 			if index >= 0:
@@ -110,31 +159,45 @@ func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary 
 				skeleton.set_bone_pose_rotation(index, skeleton.get_bone_rest(index).basis.get_rotation_quaternion())
 	for pair in [["LeftHand", 1], ["RightHand", 2]]:
 		if targets.has(pair[0]):
+			var animation_driven: bool = limb_bones[pair[0]].any(func(index): return animated.has(index))
+			limb_solvers[pair[0]].interpolation = 0.0 if animation_driven else 1.0
 			targets[pair[0]].global_transform = poses[pair[1]]
-			sources[pair[0]] = "tracked"
+			sources[pair[0]] = "animation" if animation_driven else "tracked"
+			if animation_driven:
+				for name in humanoid_bones:
+					if humanoid_bones[name] in limb_bones[pair[0]]:
+						sources[name] = "animation"
 	for side in ["Left", "Right"]:
 		var name: String = side + "Foot"
 		if not targets.has(name):
+			continue
+		var animation_driven: bool = limb_bones[name].any(func(index): return animated.has(index))
+		limb_solvers[name].interpolation = 0.0 if animation_driven else 1.0
+		if animation_driven:
+			sources[name] = "animation"
+			sources[side + "LowerLeg"] = "animation"
+			for canonical in humanoid_bones:
+				if humanoid_bones[canonical] in limb_bones[name]:
+					sources[canonical] = "animation"
 			continue
 		if tracked.has(name):
 			targets[name].global_transform = tracked[name].transform
 			sources[name] = str(tracked[name].source)
 		else:
-			var offset := Vector3(-0.14 if side == "Left" else 0.14, -1.5, 0)
-			var foot := head.origin + global_basis * offset
-			if not sleeping:
-				foot.y = float(floor_heights.get(name, 0.0)) + 0.05
-			targets[name].global_transform = Transform3D(global_basis, foot)
+			targets[name].global_transform = body.feet[name]
 			sources[name] = "estimated"
 		var knee: String = side + "LowerLeg"
 		if limb_solvers.has(name):
-			limb_solvers[name].use_magnet = tracked.has(knee)
+			limb_solvers[name].use_magnet = true
 			if tracked.has(knee):
 				limb_solvers[name].magnet = skeleton.to_local(tracked[knee].transform.origin)
 				sources[knee] = str(tracked[knee].source)
 			else:
+				limb_solvers[name].magnet = skeleton.to_local(body.knees[knee])
 				sources[knee] = "estimated"
-	if head_bone >= 0:
+	if head_bone >= 0 and animated.has(head_bone):
+		sources.Head = "animation"
+	elif head_bone >= 0:
 		var parent := skeleton.get_bone_parent(head_bone)
 		var parent_pose := skeleton.get_bone_global_pose(parent) if parent >= 0 else Transform3D.IDENTITY
 		var local := (skeleton.global_transform * parent_pose).basis.inverse() * head.basis
@@ -142,13 +205,11 @@ func update_pose(poses: Array[Transform3D], sleeping: bool, tracked: Dictionary 
 		sources.Head = "tracked"
 
 func _physics_process(_delta: float) -> void:
+	var feet: Dictionary = {}
 	for name in targets:
 		if str(name).ends_with("Foot"):
-			var foot: Vector3 = targets[name].global_position
-			var query := PhysicsRayQueryParameters3D.create(foot + Vector3.UP * 1.5, foot - Vector3.UP * 2)
-			var hit := get_world_3d().direct_space_state.intersect_ray(query)
-			if not hit.is_empty():
-				floor_heights[name] = float(hit.position.y)
+			feet[name] = targets[name].global_transform
+	floor_heights = BodyPose.ground(get_world_3d().direct_space_state, feet, last_head, rest_head.y)
 
 func creator_visual_root() -> Node3D:
 	return model_root
@@ -242,6 +303,9 @@ func creator_spring_gravity(multiplier: float) -> String:
 
 func creator_tracking() -> Dictionary:
 	return sources.duplicate()
+
+func creator_posture() -> String:
+	return posture
 
 func grabs(constraints: Array[Dictionary]) -> void:
 	if grab_modifier:

@@ -4,6 +4,7 @@ const Humanoid = preload("res://scripts/humanoid.gd")
 const CreatorRuntime = preload("res://scripts/creator_runtime.gd")
 const PackagedAudio = preload("res://scripts/packaged_audio.gd")
 const BodyTracking = preload("res://scripts/body_tracking.gd")
+const BodyPose = preload("res://scripts/body_pose.gd")
 ## Bounded interpolation of received samples only. No extrapolation or rollback.
 var samples: Array[Dictionary] = []
 var head: MeshInstance3D
@@ -21,6 +22,7 @@ var actions: Dictionary = {}
 var creator: Node
 var audio_allowed := true
 var colliders: Array = []
+var floor_heights: Dictionary = {}
 
 func set_audio_allowed(value: bool) -> void:
 	if audio_allowed == value:
@@ -43,6 +45,8 @@ func _ready() -> void:
 	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	label.font_size = 48
 	label.pixel_size = 0.002
+	label.width = 420
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	label.no_depth_test = false
 	add_child(label)
 
@@ -67,6 +71,7 @@ func sample(player: Dictionary, tick: int) -> void:
 	while samples.size() > 8:
 		samples.pop_front()
 	sleeping = player.get("sleeping", false)
+	sleep_pose = "side" if player.get("sleep_pose", "flat") == "side" else "flat"
 
 func _process(delta: float) -> void:
 	if is_local or samples.is_empty():
@@ -99,16 +104,27 @@ func _render_pose(delta: float, transforms: Array[Transform3D], tracking: Dictio
 	for i in 2:
 		hands[i].transform = transforms[i + 1]
 	var h := head.position
-	torso.position = h - Vector3(0, 0.45 if not sleeping else 0.12, 0)
-	torso.rotation.x = PI / 2 if sleeping else 0.0
+	var body := BodyPose.estimate(transforms[0], Vector3(0, 1.65, 0), floor_heights, sleeping, sleep_pose)
+	var torso_pose := Transform3D(body.basis, body.root + body.basis * Vector3(0, 1.2, 0))
+	if tracking.has("Chest"):
+		torso_pose = tracking.Chest.transform
+	elif tracking.has("Hips"):
+		torso_pose = tracking.Hips.transform.translated_local(Vector3(0, 0.25, 0))
+	torso.transform = Transform3D(torso_pose.basis * Basis.from_scale(Vector3(1, 1.8, 0.7)), torso_pose.origin)
 	for i in 2:
-		legs[i].position = h + Vector3(-0.13 if i == 0 else 0.13, -1.4 if not sleeping else -0.2, 0.8 if sleeping else 0.0)
+		var name := "LeftFoot" if i == 0 else "RightFoot"
+		legs[i].transform = tracking[name].transform if tracking.has(name) else body.feet[name]
 	label.position = h + Vector3(0, 0.3, 0)
 	if model:
 		model.update_pose(transforms, sleeping, tracking, sleep_pose)
 	text_timeout -= delta
 	if text_timeout <= 0:
 		label.text = ""
+
+func _physics_process(_delta: float) -> void:
+	if not model:
+		var feet := {"LeftFoot":legs[0].global_transform, "RightFoot":legs[1].global_transform}
+		floor_heights = BodyPose.ground(get_world_3d().direct_space_state, feet, head.global_position, 1.65)
 
 func pose_transform(values: Array, index: int) -> Transform3D:
 	var i := index * 7

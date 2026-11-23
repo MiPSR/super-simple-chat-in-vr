@@ -105,10 +105,11 @@ impl DbCache {
         {
             return *valid;
         }
+        let epoch = db::policy_epoch();
         let valid = auth::session_valid(app, user, session);
         self.sessions.insert(
             (user.into(), session.into()),
-            (Instant::now(), db::policy_epoch(), valid),
+            (Instant::now(), epoch, valid),
         );
         valid
     }
@@ -118,9 +119,10 @@ impl DbCache {
         {
             return mode.clone();
         }
+        let epoch = db::policy_epoch();
         let mode = db::preferences(&app.db.lock().unwrap(), user).call_mode;
         self.call_modes
-            .insert(user.into(), (Instant::now(), db::policy_epoch(), mode.clone()));
+            .insert(user.into(), (Instant::now(), epoch, mode.clone()));
         mode
     }
     fn blocked(&mut self, app: &App, a: &str, b: &str, flag: u32) -> bool {
@@ -129,10 +131,11 @@ impl DbCache {
         {
             return *blocked;
         }
+        let epoch = db::policy_epoch();
         let blocked = db::blocked(&app.db.lock().unwrap(), a, b, flag);
         self.blocked.insert(
             (a.into(), b.into(), flag),
-            (Instant::now(), db::policy_epoch(), blocked),
+            (Instant::now(), epoch, blocked),
         );
         blocked
     }
@@ -142,6 +145,7 @@ impl DbCache {
         {
             return *allowed;
         }
+        let epoch = db::policy_epoch();
         let db = app.db.lock().unwrap();
         let allowed = db::preferences(&db, actor).can_touch_others
             && db::preferences(&db, target).can_touch_me
@@ -149,7 +153,7 @@ impl DbCache {
         drop(db);
         self.touch.insert(
             (actor.into(), target.into()),
-            (Instant::now(), db::policy_epoch(), allowed),
+            (Instant::now(), epoch, allowed),
         );
         allowed
     }
@@ -417,7 +421,15 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
                                         });
                                         if let Some(event)=event {for (other,s) in &mut sessions {if s.instance==instance && !cache.blocked(&app,&s.user,&sender,16) && !cache.blocked(&app,&s.user,event["target"].as_str().unwrap_or(""),16) {send(host.peer_mut(*other),s,0,6,&event);}}}
                                     }
-                                    7=>{let mut worlds=app.worlds.lock().unwrap();if let Some(i)=worlds.instances.get_mut(&session.instance) && let Some(p)=i.players.get_mut(&session.user) {p.sleeping=value["sleeping"].as_bool().unwrap_or(false);i.revision+=1;}}
+                                     7=>{
+                                         if let Some(sleeping)=value["sleeping"].as_bool() {
+                                             let mut worlds=app.worlds.lock().unwrap();
+                                             if let Some(i)=worlds.instances.get_mut(&session.instance)
+                                                 && let Err(error)=i.set_sleeping(&session.user,sleeping,value.get("sleep_pose").and_then(Value::as_str)) {
+                                                 send(peer,session,0,255,&json!({"error":error.to_string()}));
+                                             }
+                                         }
+                                     }
                                      8=>{let valid=value["avatar"].as_str().and_then(|a| app.db.lock().unwrap().query_row("SELECT id,version FROM assets WHERE id=? AND owner=? AND kind='avatar' AND enabled=1",rusqlite::params![a,session.user],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).ok());let result=app.worlds.lock().unwrap().select_avatar(&session.user,valid);if let Err(error)=result {send(peer,session,0,255,&json!({"error":error.to_string()}));}}
                                     9=>{peer.disconnect_later(0);}
                                     12=>{if let Ok(action)=serde_json::from_value::<crate::world::Action>(value)
@@ -606,6 +618,19 @@ pub fn start(app: Arc<App>) -> anyhow::Result<Arc<AtomicBool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_changes_during_a_database_read_cannot_refresh_stale_entries() {
+        let mut cache = DbCache::default();
+        let epoch_before_read = db::policy_epoch();
+        // Model a completed old-policy DB read followed by an HTTP write
+        // before the realtime thread inserts that read into its cache.
+        db::bump_policy_epoch();
+        cache.sessions.insert(("user".into(), "session".into()), (Instant::now(), epoch_before_read, true));
+        let (at, epoch, _) = &cache.sessions[&("user".into(), "session".into())];
+        assert!(!cache.fresh(at, epoch));
+        cache.prune();
+        assert!(cache.sessions.is_empty());
+    }
     #[test]
     fn bounded_fragment_envelopes_are_never_recursively_fragmented() {
         for (channel, kind, output) in [(0, 2, 10), (1, 3, 27)] {

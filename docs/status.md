@@ -6,6 +6,43 @@ Headless tests establish integration behavior, not headset comfort or complete
 production security. There is no development account-login bypass in the app;
 tests seed their own isolated temporary database sessions.
 
+## Body/posture and consistency follow-up (2026-11-23)
+
+- Replicated the selected flat/side sleeping pose; remote avatars no longer
+  always fall back to flat. Identical sleep-state messages do not churn world
+  revisions; bad pose names leave the current state intact.
+- Added shared head/controller posture estimation for standing, crouching,
+  sitting and both sleeping variants; fallback feet and native leg IK use
+  elevated collision floors and forward knee poles. Missing floor rays clear
+  stale platform heights. The lightweight fallback also follows tracked hips,
+  chest and feet.
+- Merged partial body trackers, preferring tracked over estimated joints, and
+  rejected malformed/non-finite joint samples before constructing transforms.
+- Preserved supplied bone animations instead of resetting hips/chest or
+  overriding their limbs with IK. Creator tick events distinguish animation,
+  tracked and estimated joint sources and expose the estimated posture.
+- Unified legacy and new suspension endpoints, including administrator-account
+  protection and unknown-user 404s; fixed quota update row-count reporting and
+  stale cache insertions racing policy changes.
+- Hardware comfort, gait quality, calibration across representative avatars and
+  physical tracker/runtime validation still require real devices.
+- Verification: strict workspace Clippy, full workspace/all-target tests
+  (including real-peer side-pose replication), all 14 web tests, and Nix client
+  and server builds pass.
+
+## Phone input and recovery follow-up (2026-11-23)
+
+- Virtual keyboard input now respects the caret, text selections and length
+  limits; it supports shift and URL punctuation and cannot edit read-only
+  invitation fields. Chat rejects over-512-byte UTF-8 messages visibly instead
+  of silently losing them, and avatar bubbles wrap to a readable width.
+- Added an explicit phone respawn control for recovering from voids/stuck
+  locations. It releases the selected prop/vehicle, clears falling velocity,
+  and aligns the tracked head with the world's spawn without rewriting local
+  tracking transforms. Joining also accounts for physical room-scale offsets.
+- Both new client regression groups pass headlessly. Full-body comfort and
+  phone usability on actual controllers remain hardware acceptance.
+
 ### Upload boundary follow-up (2026-11-23)
 
 - Replacing an unknown asset ID now returns 404 instead of an internal error.
@@ -537,7 +574,7 @@ No row below waives any part of the corresponding scenario.
 | 8 | Full/quarter real-peer traffic, mid-session renegotiation and unit nondefault-TPS/asymmetric/adaptive/aggregation policies pass; 25%-loss admission and reliable-command acceptance passes through a dropping UDP proxy; three concurrent instances with six sustained clients pass at the full 60-TPS authoritative rate. |
 | 9 | Received-sample interpolation/hold tested; real OpenXR responsiveness remains. |
 | 10 | Permission/ownership/block release tested; real hand contact and cosmetic appearance remain. |
-| 11 | Synthetic native body tracker/fallback tested; actual devices and complete posture matrix remain. |
+| 11 | Synthetic tracker merging, standing/crouching/sitting/flat/side sleeping, elevated/retired floors and animation-driven joint sources have headless tests; actual devices, gait quality and calibration/comfort acceptance remain. |
 | 12 | Both bounded Luau hosts tested; the creator API level (`world.api_version`) is advertised and documented with its independent versions/conventions; complete typed API/event coverage and security audit remain. |
 | 13 | Opus/text/calls/radio and native zone effects pass locally, including noise lifecycle, obstruction/exclusions, private dry routing and creator-call consent; real audio/headset and full policy acceptance remain. |
 | 14 | Cross-instance Opus/SSTV/FT8-style routing, blocking, channel denial and no-radio opt-out tested; client-world creator requests/presets locally tested; complete policy and real-audio checks remain. |

@@ -65,6 +65,13 @@ values are rejected. Server messages identify tick and state revision; clients
 interpolate only known samples and hold the last pose when samples run out.
 Local headset and controller tracking never waits for these samples.
 
+Kind 7 carries `{sleeping:bool, sleep_pose?:"flat"|"side"}`. The selected pose
+is included in player snapshots for late joiners and other players. Omitting
+`sleep_pose` preserves the previous choice (older clients default to flat);
+invalid pose names do not mutate the current state. Repeating the same posture
+does not advance the revision. Camera/head/hand transforms remain local tracking
+inputs, independent of the displayed sleeping-body pose.
+
 Kind-12 actions: `lease`, `release`, `grab` (hand 0 left / 1 right), `drive`
 (throttle and turn in [-1,1]), and `fire`, each naming a `target` object ID.
 Drive uses channel 1; discrete transitions use channel 0. Clients do not submit

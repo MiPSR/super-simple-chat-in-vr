@@ -625,6 +625,7 @@ async fn allow_user(
             app.config.default_avatar_bytes as i64
         ],
     )?;
+    db::bump_policy_epoch();
     Ok(Json(json!({"ok":true})))
 }
 async fn users(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -641,16 +642,7 @@ async fn revoke_user(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    auth::admin(&app, &headers)?;
-    let db = app.db.lock().unwrap();
-    db.execute("UPDATE users SET enabled=0 WHERE id=?", [&id])?;
-    db.execute("DELETE FROM sessions WHERE user_id=?", [id.as_str()])?;
-    drop(db);
-    // Suspended users lose live connections on the next authoritative tick,
-    // not after a cache TTL.
-    db::bump_policy_epoch();
-    logs::record(format!("Admin: suspended {id} and revoked sessions"));
-    Ok(Json(json!({"ok":true})))
+    set_user_enabled(State(app), headers, Path(id), Json(Enabled { enabled: false })).await
 }
 #[derive(Deserialize)]
 struct Quotas {
@@ -706,7 +698,7 @@ async fn update_user(
     {
         return Err(ApiError::bad("Quota exceeds process resource ceiling"));
     }
-    app.db.lock().unwrap().execute(
+    let changed = app.db.lock().unwrap().execute(
         "UPDATE users SET world_slots=?,avatar_slots=?,world_bytes=?,avatar_bytes=? WHERE id=?",
         rusqlite::params![
             q.world_slots,
@@ -716,11 +708,6 @@ async fn update_user(
             id
         ],
     )?;
-    let changed = app
-        .db
-        .lock()
-        .unwrap()
-        .query_row("SELECT changes()", [], |r| r.get::<_, i64>(0))?;
     if changed == 0 {
         return Err(ApiError::not_found("Unknown user"));
     }

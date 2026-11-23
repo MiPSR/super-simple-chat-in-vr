@@ -1376,7 +1376,7 @@ async fn encrypted_godot_enet() -> Result<()> {
     b.command(json!({"action":"command","kind":8,"data":{"avatar":avatar_asset["id"]}}))?;
     // Idempotent selection no longer changes revisions/actions. A subsequent
     // ordered benign state change provides a fresh authoritative observation.
-    b.command(json!({"action":"command","kind":7,"data":{"sleeping":true}}))?;
+    b.command(json!({"action":"command","kind":7,"data":{"sleeping":true,"sleep_pose":"side"}}))?;
     let same_avatar = a
         .wait(|e| {
             snapshot(e)["revision"]
@@ -1384,6 +1384,7 @@ async fn encrypted_godot_enet() -> Result<()> {
                 .is_some_and(|r| r > first_grab_revision)
                 && snapshot(e)["players"][users[1]]["avatar_actions"]["happy"].as_f64() == Some(1.0)
                 && snapshot(e)["players"][users[1]]["sleeping"] == true
+                && snapshot(e)["players"][users[1]]["sleep_pose"] == "side"
                 && snapshot(e)["interactions"]
                     .as_object()
                     .is_some_and(|grabs| !grabs.is_empty())
@@ -1999,12 +2000,15 @@ async fn challenge_handshake_blocks_and_admin_endpoints() -> Result<()> {
     };
     ensure!(api.json("/api/v1/me", None, &suspended_token).await.is_ok());
     ensure!(toggle(false, tokens[0].clone()).await?.status() == 403);
+    ensure!(api.client.delete(format!("{}/api/v1/admin/users/admin", api.base)).bearer_auth(&api.admin).send().await?.status() == 400);
+    ensure!(api.client.delete(format!("{}/api/v1/admin/users/000000000", api.base)).bearer_auth(&api.admin).send().await?.status() == 404);
     ensure!(toggle(false, api.admin.clone()).await?.status() == 200);
     ensure!(
         api.response("/api/v1/me", None, &suspended_token).await?.status() == 401,
         "Suspension did not revoke the session"
     );
     ensure!(toggle(true, api.admin.clone()).await?.status() == 200);
+    ensure!(api.response("/api/v1/me", None, &suspended_token).await?.status() == 401, "Re-enabling resurrected a revoked session");
     {
         let db = rusqlite::Connection::open(directory.path().join("platform.sqlite"))?;
         let expires = std::time::SystemTime::now()

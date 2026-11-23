@@ -94,6 +94,8 @@ var worlds_tab: VBoxContainer
 var visual_states: Dictionary = {}
 var keyboard_panel: PanelContainer
 var keyboard_target: LineEdit
+var keyboard_shift := false
+var keyboard_letters: Array[Button] = []
 var pointer_ray: MeshInstance3D
 var phone_hit := Vector3.ZERO
 var turn_armed := false
@@ -379,9 +381,10 @@ func _build_phone() -> void:
 	)
 	chat_input = LineEdit.new()
 	chat_input.placeholder_text = "Text above your head (Enter to send)"
-	chat_input.max_length = 256
+	chat_input.max_length = 512
 	column.add_child(chat_input)
-	chat_input.text_submitted.connect(func(text: String): network.command(4, {"text": text}); chat_input.clear())
+	chat_input.text_submitted.connect(_send_chat)
+	_button(column, "Respawn at world spawn", _respawn)
 	_button(column, "Interact with nearest switch / door", _interact)
 	_button(column, "Claim nearest vehicle", func(): _claim("vehicle"))
 	_button(column, "Grab nearest prop", func(): _claim("prop"))
@@ -521,7 +524,7 @@ func _build_keyboard() -> void:
 	var rows := VBoxContainer.new()
 	rows.add_theme_constant_override("separation", 6)
 	keyboard_panel.add_child(rows)
-	for line in [["1","2","3","4","5","6","7","8","9","0"],["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["z","x","c","v","b","n","m",",",".","-"]]:
+	for line in [["1","2","3","4","5","6","7","8","9","0"],["q","w","e","r","t","y","u","i","o","p"],["a","s","d","f","g","h","j","k","l"],["z","x","c","v","b","n","m",",",".","-"],["/",":","?","&","=","_","%","#","@","+"]]:
 		var grid := GridContainer.new()
 		grid.columns = line.size()
 		grid.add_theme_constant_override("h_separation", 4)
@@ -530,13 +533,14 @@ func _build_keyboard() -> void:
 		for key in line:
 			_key_button(grid, key, key)
 	var actions := GridContainer.new()
-	actions.columns = 4
+	actions.columns = 5
 	actions.add_theme_constant_override("h_separation", 4)
 	rows.add_child(actions)
 	_key_button(actions, "Space", "space")
 	_key_button(actions, "Backspace", "backspace")
 	_key_button(actions, "Clear", "clear")
 	_key_button(actions, "Enter", "enter")
+	_key_button(actions, "Shift", "shift")
 
 func _key_button(parent: Node, text: String, action: String) -> void:
 	var button := Button.new()
@@ -544,30 +548,54 @@ func _key_button(parent: Node, text: String, action: String) -> void:
 	button.custom_minimum_size = Vector2(44, 40)
 	button.focus_mode = Control.FOCUS_NONE
 	button.pressed.connect(_key_pressed.bind(action, text))
+	if text.length() == 1 and text.to_upper() != text.to_lower():
+		button.set_meta("ssc_key", text)
+		keyboard_letters.append(button)
 	parent.add_child(button)
 
 func _key_pressed(action: String, text: String) -> void:
-	if not is_instance_valid(keyboard_target):
+	if action == "shift":
+		keyboard_shift = not keyboard_shift
+		for button in keyboard_letters:
+			var key := str(button.get_meta("ssc_key"))
+			button.text = key.to_upper() if keyboard_shift else key
+		return
+	if not is_instance_valid(keyboard_target) or not keyboard_target.editable:
 		return
 	var line := keyboard_target
 	match action:
 		"space":
-			if line.max_length <= 0 or line.text.length() < line.max_length:
-				line.text += " "
+			_insert_keyboard_text(line, " ")
 		"backspace":
-			if not line.text.is_empty():
-				line.text = line.text.substr(0, line.text.length() - 1)
+			if line.has_selection():
+				var start := line.get_selection_from_column()
+				line.delete_text(start, line.get_selection_to_column())
+				line.deselect()
+				line.caret_column = start
+			elif line.caret_column > 0:
+				var caret := line.caret_column
+				line.delete_text(caret - 1, caret)
+				line.caret_column = caret - 1
 		"clear":
 			line.clear()
 		"enter":
 			if not line.text.is_empty():
 				line.text_submitted.emit(line.text)
 		_:
-			if line.max_length <= 0 or line.text.length() < line.max_length:
-				line.text += text
+			_insert_keyboard_text(line, text.to_upper() if keyboard_shift else text)
+
+func _insert_keyboard_text(line: LineEdit, text: String) -> void:
+	if line.has_selection():
+		var start := line.get_selection_from_column()
+		line.delete_text(start, line.get_selection_to_column())
+		line.deselect()
+		line.caret_column = start
+	line.insert_text_at_caret(text)
 
 func _phone_focus_changed(control: Control) -> void:
 	keyboard_target = control as LineEdit
+	if keyboard_target and not keyboard_target.editable:
+		keyboard_target = null
 
 func _update_keyboard() -> void:
 	if keyboard_panel:
@@ -653,6 +681,36 @@ func _turn_about_head(angle: float) -> void:
 	correction.y = 0
 	origin.global_position += correction
 
+func _teleport_to_spawn(spawn: Vector3) -> void:
+	# Align the tracked head horizontally with the requested spawn without
+	# rewriting its local tracking transform or physical head height.
+	var offset := camera.global_position - origin.global_position
+	offset.y = 0
+	origin.global_position = spawn - offset
+	locomotion.reset()
+
+func _respawn() -> void:
+	if not network.joined or not is_instance_valid(world_root):
+		_status("Join and finish loading a world before respawning")
+		return
+	_release()
+	var spawn: Array = loader.manifest.get("spawn", [0, 1, 3])
+	_teleport_to_spawn(Vector3(float(spawn[0]), float(spawn[1]), float(spawn[2])))
+	_status("Returned to world spawn")
+
+func _send_chat(text: String) -> void:
+	var message := text.strip_edges()
+	if message.is_empty():
+		return
+	if message.to_utf8_buffer().size() > 512:
+		_status("Chat messages must fit in 512 UTF-8 bytes; shorten this message")
+		return
+	if not network.joined:
+		_status("Join an instance before sending chat")
+		return
+	network.command(4, {"text":message})
+	chat_input.clear()
+
 func _message(kind: int, data: Dictionary) -> void:
 	if kind == 2 and data.has("user"):
 		radios.bind_actor(str(data.user))
@@ -678,8 +736,7 @@ func _message(kind: int, data: Dictionary) -> void:
 			loader.quality = quality
 			loader.load_world(snapshot)
 			var spawn: Array = snapshot.manifest.get("spawn", [0, 1, 3])
-			origin.position = Vector3(float(spawn[0]), float(spawn[1]), float(spawn[2]))
-			locomotion.reset()
+			_teleport_to_spawn(Vector3(float(spawn[0]), float(spawn[1]), float(spawn[2])))
 		var tick := int(snapshot.get("tick", latest_tick))
 		_update_players(snapshot.get("players", {}).values(), tick, true)
 		people_tab.players(snapshot.get("players", {}).values(), network.user)
@@ -1123,7 +1180,7 @@ func _text_typing() -> bool:
 
 func _sleep() -> void:
 	sleeping = not sleeping
-	network.command(7, {"sleeping": sleeping})
+	network.command(7, {"sleeping": sleeping, "sleep_pose": sleep_pose})
 	if not preferences.is_empty():
 		preferences.sleeping = sleeping
 		_save_preferences()
@@ -1219,7 +1276,6 @@ func _preferences_received(result: int, code: int, _headers: PackedStringArray, 
 			if not preferences.has(key):
 				preferences[key] = comfort_defaults[key]
 		_apply_preferences()
-		network.command(7, {"sleeping":sleeping})
 	else:
 		_status("Preferences saved")
 
@@ -1235,6 +1291,10 @@ func _apply_preferences() -> void:
 	move_speed_value = clampf(float(preferences.get("move_speed", 1.5)), 0.5, 3.0)
 	move_hand_index = 0 if str(preferences.get("move_hand", "right")) == "left" else 1
 	sleep_pose = str(preferences.get("sleep_pose", "flat"))
+	if avatars.has(network.user):
+		avatars[network.user].sleep_pose = sleep_pose
+	if network.joined:
+		network.command(7, {"sleeping": sleeping, "sleep_pose": sleep_pose})
 	_apply_radio_preset()
 	loader.quality = quality
 	loader.texture_reduction = int(preferences.get("texture_reduction", 0))

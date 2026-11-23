@@ -45,6 +45,11 @@ default. The client has a desktop
 fallback if no XR runtime is available; explicitly disabling XR avoids runtime
 discovery errors during headset-free testing.
 
+The phone's **Respawn at world spawn** control recovers from falls or stuck
+locations and releases any selected prop/vehicle. It is an explicit local
+teleport, not a server correction of the tracked headset. The phone keyboard
+supports shift, URL punctuation, and caret/selection editing.
+
 After signing in, use the phone's **Worlds** tab to search worlds, join live
 instances, or create an invite-only instance. Instance owners can enter a
 friend's Discord ID to generate a five-minute invitation. Share its instance ID

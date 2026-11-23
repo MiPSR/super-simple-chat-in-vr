@@ -36,6 +36,8 @@ func _run() -> void:
 	await preload("res://tests/people_blocks.gd").run()
 	await preload("res://tests/locomotion.gd").run()
 	await preload("res://tests/worlds_browser.gd").run()
+	await preload("res://tests/body_postures.gd").run()
+	preload("res://tests/phone_input.gd").run()
 	assert(Settings.upscalers("mobile", false) == ["bilinear"])
 	assert(Settings.upscalers("forward_plus", true) == ["bilinear"])
 	assert(Settings.upscalers("forward_plus", false) == ["bilinear", "fsr1"])

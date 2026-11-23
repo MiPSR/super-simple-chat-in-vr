@@ -137,6 +137,7 @@ pub struct Player {
     pub avatar_actions: BTreeMap<String, f32>,
     pub tracking: BTreeMap<String, TrackedJoint>,
     pub sleeping: bool,
+    pub sleep_pose: String,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1605,6 +1606,19 @@ impl Instance {
             self.dispatch("tick", json!({"dt":1.0/self.tps as f32,"clock":self.clock}));
         }
     }
+    pub fn set_sleeping(&mut self, user: &str, sleeping: bool, pose: Option<&str>) -> anyhow::Result<()> {
+        if let Some(pose) = pose {
+            anyhow::ensure!(matches!(pose, "flat" | "side"), "Unknown sleeping pose");
+        }
+        let player = self.players.get_mut(user).ok_or_else(|| anyhow::anyhow!("Not joined"))?;
+        let pose = pose.unwrap_or(&player.sleep_pose).to_owned();
+        if player.sleeping != sleeping || player.sleep_pose != pose {
+            player.sleeping = sleeping;
+            player.sleep_pose = pose;
+            self.revision += 1;
+        }
+        Ok(())
+    }
     pub fn snapshot(&self, tick: u64) -> Value {
         let media: BTreeMap<_, _> = self
             .media
@@ -1898,6 +1912,7 @@ impl Registry {
                 avatar_actions: BTreeMap::new(),
                 tracking: BTreeMap::new(),
                 sleeping: false,
+                sleep_pose: "flat".into(),
             },
         );
         instance.revision += 1;
@@ -2012,6 +2027,23 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sleeping_pose_is_replicated_validated_and_idempotent() {
+        let mut registry = Registry::default();
+        let id = registry.admit(&Join {world: "w".into(), ..Default::default()}, "a", "A", "v1", manifest(), vec![]).unwrap();
+        let instance = registry.instances.get_mut(&id).unwrap();
+        instance.set_sleeping("a", true, Some("side")).unwrap();
+        let revision = instance.revision;
+        let snapshot = instance.snapshot(0);
+        assert_eq!(snapshot["players"]["a"]["sleep_pose"], "side");
+        assert_eq!(snapshot["players"]["a"]["sleeping"], true);
+        instance.set_sleeping("a", true, Some("side")).unwrap();
+        assert_eq!(instance.revision, revision);
+        assert!(instance.set_sleeping("a", false, Some("invalid")).is_err());
+        assert!(instance.players["a"].sleeping);
+        instance.set_sleeping("a", false, None).unwrap();
+        assert_eq!(instance.players["a"].sleep_pose, "side");
+    }
     #[test]
     fn slow_earlier_worlds_cannot_skip_later_worlds_physics() {
         let mut registry = Registry::default();
